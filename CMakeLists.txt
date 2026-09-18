@@ -474,6 +474,15 @@ add_executable(dsv4_bind_check apps/dsv4_bind_check.cpp)
 target_link_libraries(dsv4_bind_check PRIVATE dgpp_models_dsv4 dgpp_loaders)
 dgpp_set_common(dsv4_bind_check)
 
+# The DeepSeek-V4-Flash real-checkpoint load gate (the dsv41_load_check
+# analogue): the resident loader at one rank's world-2 geometry against
+# /data/models/DeepSeek-V4-Flash-0731 — the per-layer byte formulas, the
+# per-class source plan against the G0 census, the resident digest, the
+# mapped tid2eid tables, and the refusal gates. No bus, no forward.
+add_executable(dsv4_load_check apps/dsv4_load_check.cpp)
+target_link_libraries(dsv4_load_check PRIVATE dgpp_models_dsv4_loader dgpp_loaders CUDA::cudart Threads::Threads)
+dgpp_set_common(dsv4_load_check)
+
 # M5 d4 at real scale: the shard-parity gate (loader-vs-bind bitwise +
 # replicated digest + byte reconcile) as a deployment command — the same
 # driver the CI glm_tp_test pins at the fixture, against the real
