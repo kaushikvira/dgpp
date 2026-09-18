@@ -74,3 +74,43 @@ the kernels.
 ## Abort / restore
 - `make down` the v4 stack, then restore the live stack (`make up` in the
   lane's repo). The v4 boot is additive; nothing about Lane D/Q is changed.
+
+## Concrete commands for this kit (as run 2026-09-18)
+
+### Stop the live stack (frees the GPU)
+```bash
+cd /home/kv/work/q-dgx-gateway
+export DGPP_ENV_FILE="$PWD/.env.dgpp"
+python3 /home/kv/work/dgpp/scripts/dgpp-cluster down \
+  --config config/dgpp-qwen-w2-yarn512k.json      # the LIVE config's id
+```
+(`make down-dgpp` uses the default config id and would miss the yarn512k
+deployment — pass the config explicitly.)
+
+### Checkpoint resolution (done, both nodes)
+The v4 checkpoint is local at `/data/models/DeepSeek-V4-Flash-0731` but the
+engine resolves model ids through the HF cache. Symlinked (both nodes):
+```bash
+ln -sfn /data/models/DeepSeek-V4-Flash-0731 \
+  /data/hf/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/local
+```
+(a single snapshot, so no `refs/main` is needed; `model_dir_name` maps
+`deepseek-ai/DeepSeek-V4-Flash-0731` → `models--deepseek-ai--DeepSeek-V4-Flash-0731`).
+
+### Boot world 2 (needs the serve family — see the plan's G7)
+```bash
+cd /home/kv/work/q-dgx-gateway
+export DGPP_ENV_FILE="$PWD/.env.dgpp"
+python3 /home/kv/work/dgpp/scripts/dgpp-cluster up \
+  --config config/dgpp-dsv4-w2.json          # model deepseek-ai/DeepSeek-V4-Flash-0731
+```
+The qwen-only wrapper `launch/dgpp-start.sh` rejects non-qwen configs, so
+call `dgpp-cluster` directly for the v4 lane. `--model`/`--checkpoint-dir`
+also work for a one-off.
+
+### Smoke
+```bash
+curl -s http://127.0.0.1:8888/v1/models | head -c 300
+curl -s http://127.0.0.1:8888/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"Say OK."}],"max_tokens":16}'
+```
