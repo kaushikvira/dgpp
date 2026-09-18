@@ -908,14 +908,20 @@ target_link_libraries(dsv41_engram_layer_test PRIVATE dgpp_models_dsv41_layers C
 dgpp_set_common(dsv41_engram_layer_test)
 add_test(NAME dsv41_engram_layer_test COMMAND dsv41_engram_layer_test)
 
+# These real-harness targets link dgpp_bus, which only exists with
+# DGPP_ENABLE_IBV: gate them the same way dgpp_bus is gated so an
+# IBV=OFF build ("no serving/RDMA targets") links cleanly.
+if(DGPP_ENABLE_IBV)
 add_executable(dsv41_model_test tests/cuda/dsv41_model_test.cpp)
 target_include_directories(dsv41_model_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(dsv41_model_test PRIVATE dgpp_models_dsv41_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
 dgpp_set_common(dsv41_model_test)
 add_test(NAME dsv41_model_test COMMAND dsv41_model_test)
+endif()
 
 # The forward against the python reference dump (numpy: the repo's .venv
 # when present, else the system python).
+if(DGPP_ENABLE_IBV)
 add_executable(dsv41_forward_test tests/cuda/dsv41_forward_test.cpp)
 target_include_directories(dsv41_forward_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(dsv41_forward_test PRIVATE dgpp_models_dsv41_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
@@ -973,7 +979,9 @@ add_test(NAME dsv41_forward_test_bounded
   COMMAND dsv41_forward_test --checkpoint-dir ${DSV41_FORWARD_FIXTURE}
           --dump-file ${CMAKE_CURRENT_BINARY_DIR}/dsv41_teacher_bounded_ref.dump --bounded)
 set_tests_properties(dsv41_forward_test_bounded PROPERTIES DEPENDS dsv41_forward_generate_teacher_bounded)
+endif()
 
+if(DGPP_ENABLE_IBV)
 # The DeepSeek-V4.1 session surface: decode vs the re-forward, interleaved
 # slots, the chunked prefill, the prefix snapshots, the eager DSpark speculator.
 add_executable(dsv41_decode_test tests/cuda/dsv41_decode_test.cpp)
@@ -982,6 +990,7 @@ target_link_libraries(dsv41_decode_test PRIVATE dgpp_models_dsv41_layers dgpp_bu
 dgpp_set_common(dsv41_decode_test)
 add_test(NAME dsv41_decode_test COMMAND dsv41_decode_test --fixture ${DSV41_FORWARD_FIXTURE})
 set_tests_properties(dsv41_decode_test PROPERTIES DEPENDS dsv41_forward_fixture)
+endif()
 
 add_executable(dsv41_engram_test tests/cuda/dsv41_engram_test.cu)
 target_include_directories(dsv41_engram_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
@@ -1078,13 +1087,16 @@ add_test(NAME glm_dsa_decode_test COMMAND glm_dsa_decode_test --fixture ${GLM_DS
 set_tests_properties(glm_dsa_decode_test PROPERTIES DEPENDS glm_dsa_forward_fixture)
 
 # The full GLM-5.3 TP forwards: loopback worlds 2 and 4 (ports 29952/29953).
+if(DGPP_ENABLE_IBV)
 add_executable(glm_dsa_tp_test tests/cuda/glm_dsa_tp_test.cpp)
 target_include_directories(glm_dsa_tp_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(glm_dsa_tp_test PRIVATE dgpp_models_glm_dsa_layers dgpp_bus dgpp_loaders CUDA::cudart Threads::Threads)
 dgpp_set_common(glm_dsa_tp_test)
 add_test(NAME glm_dsa_tp_test COMMAND glm_dsa_tp_test)
+endif()
 
 # The full GLM-5.3 decode engines: eager and graph, world 2 (ports 29954-29956).
+if(DGPP_ENABLE_IBV)
 add_executable(glm_dsa_engine_test tests/cuda/glm_dsa_engine_test.cpp)
 target_include_directories(glm_dsa_engine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(glm_dsa_engine_test PRIVATE dgpp_models_glm_dsa_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
@@ -1094,6 +1106,7 @@ add_test(NAME glm_dsa_engine_test COMMAND glm_dsa_engine_test)
 add_executable(glm_dsa_forward_check apps/glm_dsa_forward_check.cpp)
 target_link_libraries(glm_dsa_forward_check PRIVATE dgpp_models_glm_dsa_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
 dgpp_set_common(glm_dsa_forward_check)
+endif()
 
 # The GLM-4.7 session surface: incremental decode vs the re-forward, the
 # prefix snapshots, the eager speculator through the draft block.
@@ -1105,19 +1118,23 @@ add_test(NAME glm4_decode_test COMMAND glm4_decode_test --fixture ${GLM4_FORWARD
 set_tests_properties(glm4_decode_test PROPERTIES DEPENDS glm4_forward_fixture)
 
 # The GLM-4.7 TP forwards: loopback worlds 2 and 4 vs world 1 (ports 29946, 29947).
+if(DGPP_ENABLE_IBV)
 add_executable(glm4_tp_test tests/cuda/glm4_tp_test.cpp)
 target_include_directories(glm4_tp_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(glm4_tp_test PRIVATE dgpp_models_glm4_layers dgpp_bus dgpp_loaders CUDA::cudart Threads::Threads)
 dgpp_set_common(glm4_tp_test)
 add_test(NAME glm4_tp_test COMMAND glm4_tp_test)
+endif()
 
 # The GLM-4.7 engines: the graph engine's scalar, row-batched and MTP
 # replays against the eager engine over a loopback world of 2 (ports 29948, 29949).
+if(DGPP_ENABLE_IBV)
 add_executable(glm4_engine_test tests/cuda/glm4_engine_test.cpp)
 target_include_directories(glm4_engine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(glm4_engine_test PRIVATE dgpp_models_glm4_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
 dgpp_set_common(glm4_engine_test)
 add_test(NAME glm4_engine_test COMMAND glm4_engine_test)
+endif()
 
 add_executable(glm4_load_check apps/glm4_load_check.cpp)
 target_link_libraries(glm4_load_check PRIVATE dgpp_models_glm4_loader dgpp_loaders CUDA::cudart Threads::Threads)
@@ -1164,42 +1181,53 @@ add_executable(dsv41_load_check apps/dsv41_load_check.cpp)
 target_link_libraries(dsv41_load_check PRIVATE dgpp_models_dsv41_loader dgpp_loaders CUDA::cudart Threads::Threads)
 dgpp_set_common(dsv41_load_check)
 # The per-layer dump on the real checkpoint for the torch cross-check.
+if(DGPP_ENABLE_IBV)
 add_executable(dsv41_forward_check apps/dsv41_forward_check.cpp)
 target_link_libraries(dsv41_forward_check PRIVATE dgpp_models_dsv41_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
 dgpp_set_common(dsv41_forward_check)
+endif()
 
 # The DeepSeek-V4.1 TP forwards: loopback worlds 2 and 4 vs world 1 (ports 29958/29959).
+if(DGPP_ENABLE_IBV)
 add_executable(dsv41_tp_test tests/cuda/dsv41_tp_test.cpp)
 target_include_directories(dsv41_tp_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(dsv41_tp_test PRIVATE dgpp_models_dsv41_layers dgpp_bus dgpp_loaders CUDA::cudart Threads::Threads)
 dgpp_set_common(dsv41_tp_test)
 add_test(NAME dsv41_tp_test COMMAND dsv41_tp_test)
+endif()
 
 # The DeepSeek-V4.1 decode engines: the graph engine's scalar and row-batched
 # replays (the Engram host node inside the walk) against the eager engine
 # over a loopback world of 2 (ports 29961-29964: plain, the DSpark block, depth 2, the scheduled depth).
+if(DGPP_ENABLE_IBV)
 add_executable(dsv41_engine_test tests/cuda/dsv41_engine_test.cpp)
 target_include_directories(dsv41_engine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(dsv41_engine_test PRIVATE dgpp_models_dsv41_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
 dgpp_set_common(dsv41_engine_test)
 add_test(NAME dsv41_engine_test COMMAND dsv41_engine_test)
+endif()
 
+if(DGPP_ENABLE_IBV)
 add_executable(glm4_forward_check apps/glm4_forward_check.cpp)
 target_link_libraries(glm4_forward_check PRIVATE dgpp_models_glm4_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
 dgpp_set_common(glm4_forward_check)
+endif()
 
 add_executable(qwen_load_check apps/qwen_load_check.cpp)
 target_link_libraries(qwen_load_check PRIVATE dgpp_models_qwen_loader dgpp_loaders CUDA::cudart Threads::Threads)
 dgpp_set_common(qwen_load_check)
 
+if(DGPP_ENABLE_IBV)
 add_executable(qwen_tp_test tests/cuda/qwen_tp_test.cpp)
 target_include_directories(qwen_tp_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(qwen_tp_test PRIVATE dgpp_models_qwen_layers dgpp_bus dgpp_loaders CUDA::cudart Threads::Threads)
 dgpp_set_common(qwen_tp_test)
 add_test(NAME qwen_tp_test COMMAND qwen_tp_test)
+endif()
 
 # The Qwen engines (Q6 stage B): the graph engine's scalar and row-batched
 # replays against the eager engine over a loopback world of 2 (port 29944).
+if(DGPP_ENABLE_IBV)
 add_executable(qwen_engine_test tests/cuda/qwen_engine_test.cpp)
 target_include_directories(qwen_engine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(qwen_engine_test PRIVATE dgpp_models_qwen_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
@@ -1210,10 +1238,13 @@ add_test(NAME qwen_engine_row_independent
           $<TARGET_FILE:qwen_engine_test>)
 set_tests_properties(qwen_engine_test qwen_engine_row_independent PROPERTIES RESOURCE_LOCK qwen_engine_world)
 set_tests_properties(qwen_engine_row_independent PROPERTIES LABELS "gpu;rdma")
+endif()
 
+if(DGPP_ENABLE_IBV)
 add_executable(qwen_forward_check apps/qwen_forward_check.cpp)
 target_link_libraries(qwen_forward_check PRIVATE dgpp_models_qwen_layers dgpp_bus dgpp_loaders CUDA::cudart Threads::Threads)
 dgpp_set_common(qwen_forward_check)
+endif()
 
 add_executable(glm_loader_test tests/cuda/glm_loader_test.cpp)
 target_include_directories(glm_loader_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
