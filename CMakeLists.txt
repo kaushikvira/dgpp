@@ -348,6 +348,23 @@ target_include_directories(dgpp_models_dsv4_loader PUBLIC ${CMAKE_CURRENT_SOURCE
 target_link_libraries(dgpp_models_dsv4_loader PUBLIC dgpp_models_dsv4 dgpp_loaders CUDA::cudart)
 dgpp_set_common(dgpp_models_dsv4_loader)
 
+# The DeepSeek-V4-Flash layer surface (2026-09-17, docs/dsv4_kernel_port_spec.md
+# §2.1-§2.4): the v4-owned layer files — the CSA2 compressor/indexer attention
+# (the 64-head select, the shared csa2_select's 32-head pin's V4 re-expression),
+# the DSpark draft/verify glue (the 3-phase union attention, the dsv4-native
+# dspark_attn op's V4 re-expression) and the hash-routing MoE layer (the
+# tid2eid router's the first num_hash_layers' the fused top-k router's + the
+# MXFP4 expert's). The shared kernels' (csa2 / dsa / dsv41_dspark / glm_moe /
+# scale_gemm) are composed unmodified; every adapted op is oracle-qualified on
+# CPU (tests/unit/dsv4_*_oracle_test.cpp) before any forward path consumes it.
+add_library(dgpp_models_dsv4_layers STATIC
+  src/models/dsv4/csa2_layer.cu
+  src/models/dsv4/dspark_layer.cu
+  src/models/dsv4/hash_layer.cu)
+target_include_directories(dgpp_models_dsv4_layers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_models_dsv4_layers PUBLIC dgpp_models_dsv4 dgpp_kernels dgpp_models_glm CUDA::cudart)
+dgpp_set_common(dgpp_models_dsv4_layers)
+
 # Qwen3.8-Flash-Next: the host-side model description.
 add_library(dgpp_models_qwen STATIC
   src/models/qwen/config.cpp
@@ -1243,6 +1260,23 @@ add_executable(dsv4_fp8_scale_test tests/unit/dsv4_fp8_scale_test.cpp)
 target_include_directories(dsv4_fp8_scale_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 dgpp_set_common(dsv4_fp8_scale_test)
 add_test(NAME dsv4_fp8_scale_test COMMAND dsv4_fp8_scale_test)
+
+# DeepSeek-V4-Flash (deepseek_v4) layer-surface CPU oracles (2026-09-17,
+# docs/dsv4_kernel_port_spec.md §2.1-§2.4): the host-only, no-GPU naive
+# references that pin the numerics of the v4-owned layer files' adapted ops
+# (the CSA2 compressor/indexer attention, the DSpark draft/verify + the 3-
+# phase union attention, the MHC pre/post/head + Sinkhorn, the MoE fused
+# router + the tid2eid hash mode + the MXFP4 expert) — so the Phase B v4
+# layer files (src/models/dsv4/{csa2,dspark,hash}_layer.cu) have a host-side
+# oracle before any forward path consumes them (house rule: every adapted op
+# is oracle-qualified on CPU before consumption).
+foreach(_dsv4_oracle dsv4_csa2_oracle_test dsv4_dspark_oracle_test dsv4_mhc_oracle_test dsv4_moe_oracle_test)
+  add_executable(${_dsv4_oracle} tests/unit/${_dsv4_oracle}.cpp)
+  target_include_directories(${_dsv4_oracle} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  dgpp_set_common(${_dsv4_oracle})
+  add_test(NAME ${_dsv4_oracle} COMMAND ${_dsv4_oracle})
+  set_tests_properties(${_dsv4_oracle} PROPERTIES LABELS "host")
+endforeach()
 
 # mHC module parity (M4): compute/update/final-mean kernels vs the double
 # oracle; real geometry, edge cases, determinism.
