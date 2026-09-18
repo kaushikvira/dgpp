@@ -141,3 +141,49 @@ Lane D/Q down first).
    (ibverbs is on the box; the main `dgpp-serve` app is inside the IBV gate).
    build-ci is configured with IBV=ON and builds green. Fix for the OFF path:
    move `bus_small_repro` inside the IBV gate.
+
+## Latest — 2026-09-18 GPU window (state after the first w2 bring-up)
+
+The engine now **loads and constructs** DeepSeek-V4-Flash at world 2 on the
+real fabric (preflight clean; 200 Gb/s RoCE, bus ~170 Gb/s/QP; 46 layers
+resident, 78.83 GiB/rank; model constructed). Four bugs were found and fixed
+on the way, all committed on `dsv4-flash`:
+
+1. `scripts/cluster_doctor.py` — the checkpoint check accepted only
+   `chat_template.jinja` / `encoding/encoding.py`; v4 ships
+   `encoding/encoding_dsv4.py`.
+2. `src/models/dsv4/model.cpp` — `load_hash_tables()` is mmap'd from the
+   shards, so it must run **before** `loader_.release_sources()` (the
+   loader's own documented contract).
+3. `src/models/dsv4/model.cpp` — the draft-stage count is
+   `cfg_.num_draft_stages()` (**3**, from `compress_ratios`), NOT
+   `cfg_.num_nextn_predict_layers` (**1**). The G0 trap: `mtp.0` carries
+   `main_proj`, `mtp.2` the head tensors.
+4. `src/models/dsv4/csa2_layer.cu` — the six attention partials were sized
+   by `max(rows, splits)` but `attn_finish_kernel` indexes them
+   `[r*n_split + s]`, so the size must be the **product**. The 32x
+   under-allocation was the out-of-bounds behind the "illegal memory access"
+   on the first decode (compute-sanitizer: an invalid global read 61,569 B
+   past the scratch). Mirrors dsv41's `ws_slots`. Cost: csa2 scratch
+   0.01 -> 0.26 GiB.
+
+### Remaining before dsv4 can serve (the next gate)
+- **The six attention partials are never WRITTEN** on the dsv4 path: the
+  `dsa_attn_partial` (over the window ring) and `dsa_attn_listed` (over the
+  main compressed cache) wiring is still pending (the code comments call it
+  "GPU-gate pending"). Memory is safe now, but attention numerics are
+  garbage until this lands — so a dsv4 generation would not yet be
+  meaningful. **This is the single biggest remaining piece.**
+- `dsv4_csa2_select_decode/_prefill` are not invoked from
+  `enqueue_decode` (the select is the caller's), and
+  `dsv4_dspark_union_attn` is not called on the decode/draft path.
+- The dsv4 GPU numerics parity gate (csa2 64-head select, dspark union
+  attention, moe router) has still never been run — the CPU oracles pass,
+  but they never exercised the scratch sizing.
+- Then: reference parity against the checkpoint's own `inference/`, and the
+  tps measurement against the 40-60 target.
+
+### State at the end of the window
+The **qwen3.8-flash-next production lane is up** (`:8888` + the TLS front
+door) and stays up — one stack at a time, so the dsv4 re-test needs the GPU
+window free again.
