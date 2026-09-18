@@ -215,6 +215,7 @@ add_library(dgpp_text STATIC
   src/text/unicode_normalize.cpp
   src/text/chat_template.cpp
   src/text/dsv41_prompt.cpp
+  src/text/dsv4_prompt.cpp
   src/text/tool_parser.cpp
   src/text/tool_grammar.cpp
   src/text/json_grammar.cpp)
@@ -336,6 +337,16 @@ add_library(dgpp_models_dsv4 STATIC
 target_include_directories(dgpp_models_dsv4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dgpp_models_dsv4 PUBLIC dgpp_loaders dgpp_common)
 dgpp_set_common(dgpp_models_dsv4)
+
+# The DeepSeek-V4-Flash loader (Phase B step 1): the ResidentLayerStream
+# family on the release's 128 x 128 fp8 grid (e8m0 scales decoded to the
+# F32 grid the fp8 kernels read), the MXFP4 expert slice builders, the
+# tid2eid hash-table mappings.
+add_library(dgpp_models_dsv4_loader STATIC
+  src/models/dsv4/loader.cpp)
+target_include_directories(dgpp_models_dsv4_loader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_models_dsv4_loader PUBLIC dgpp_models_dsv4 dgpp_loaders CUDA::cudart)
+dgpp_set_common(dgpp_models_dsv4_loader)
 
 # Qwen3.8-Flash-Next: the host-side model description.
 add_library(dgpp_models_qwen STATIC
@@ -660,6 +671,18 @@ add_test(NAME dsv41_tokenizer_test
   COMMAND tokenizer_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/dsv41_tokenizer_goldens.jsonl)
 set_tests_properties(dsv41_tokenizer_test PROPERTIES SKIP_RETURN_CODE 2)
 
+# The DeepSeek-V4-Flash tokenizer's standalone gate: the engine's BPE encoder vs
+# the goldens on the local checkpoint's tokenizer.json (not in the HF hub cache,
+# so the HF-cache-resolving tokenizer_test does not cover it). A missing model
+# dir skips the run (SKIP_RETURN_CODE 2).
+add_executable(dsv4_tokenizer_test tests/host/dsv4_tokenizer_test.cpp)
+target_include_directories(dsv4_tokenizer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dsv4_tokenizer_test PRIVATE dgpp_text dgpp_models_glm Threads::Threads)
+dgpp_set_common(dsv4_tokenizer_test)
+add_test(NAME dsv4_tokenizer_test
+  COMMAND dsv4_tokenizer_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/dsv4_tokenizer_goldens.jsonl)
+set_tests_properties(dsv4_tokenizer_test PROPERTIES SKIP_RETURN_CODE 2)
+
 # The DeepSeek-V4.1 prompt renderer's differential gate (no Jinja: the
 # checkpoint's encoding.py is the golden source).
 add_executable(dsv41_prompt_test tests/host/dsv41_prompt_test.cpp)
@@ -669,6 +692,18 @@ dgpp_set_common(dsv41_prompt_test)
 add_test(NAME dsv41_prompt_test
   COMMAND dsv41_prompt_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/dsv41_prompt_goldens.jsonl)
 set_tests_properties(dsv41_prompt_test PROPERTIES SKIP_RETURN_CODE 2)
+
+# The DeepSeek-V4-Flash prompt renderer's differential gate: Dsv4Prompt::render +
+# tokenizer vs the local checkpoint's own encoder (tests/data/dsv4_prompt_goldens.jsonl).
+# The tokenizer loads from the local model dir (DGPP_DSV4_MODEL_DIR); a missing
+# dir skips the run (SKIP_RETURN_CODE 2).
+add_executable(dsv4_prompt_test tests/host/dsv4_prompt_test.cpp)
+target_include_directories(dsv4_prompt_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dsv4_prompt_test PRIVATE dgpp_text dgpp_models_glm Threads::Threads)
+dgpp_set_common(dsv4_prompt_test)
+add_test(NAME dsv4_prompt_test
+  COMMAND dsv4_prompt_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/dsv4_prompt_goldens.jsonl)
+set_tests_properties(dsv4_prompt_test PROPERTIES SKIP_RETURN_CODE 2)
 set_tests_properties(qwen_tokenizer_test PROPERTIES SKIP_RETURN_CODE 2)
 add_test(NAME glm4_tokenizer_test
   COMMAND tokenizer_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/glm4_tokenizer_goldens.jsonl)
@@ -1075,6 +1110,25 @@ target_link_libraries(dsv41_loader_test PRIVATE dgpp_models_dsv41_loader CUDA::c
 dgpp_set_common(dsv41_loader_test)
 add_test(NAME dsv41_loader_test COMMAND dsv41_loader_test)
 
+# The DeepSeek-V4-Flash loader on its synthetic fixture (world 2 byte-exact,
+# the globals, the tid2eid table mappings, the image round trip) — the
+# device-touching gates; the host-side half runs without a GPU below.
+add_executable(dsv4_loader_test tests/cuda/dsv4_loader_test.cpp)
+target_include_directories(dsv4_loader_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(dsv4_loader_test PRIVATE dgpp_models_dsv4_loader CUDA::cudart Threads::Threads)
+dgpp_set_common(dsv4_loader_test)
+add_test(NAME dsv4_loader_test COMMAND dsv4_loader_test)
+
+# The DeepSeek-V4-Flash loader's host-side gates (fixture build, the
+# counting-pass byte reconcile at world 2, the e8m0 oracle, the MXFP4
+# slice contract, the hash-table gather, the refusals): no CUDA calls,
+# runs on the CI box.
+add_executable(dsv4_loader_cpu_test tests/cuda/dsv4_loader_cpu_test.cpp)
+target_include_directories(dsv4_loader_cpu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(dsv4_loader_cpu_test PRIVATE dgpp_models_dsv4_loader CUDA::cudart Threads::Threads)
+dgpp_set_common(dsv4_loader_cpu_test)
+add_test(NAME dsv4_loader_cpu_test COMMAND dsv4_loader_cpu_test)
+
 add_executable(dsv41_load_check apps/dsv41_load_check.cpp)
 target_link_libraries(dsv41_load_check PRIVATE dgpp_models_dsv41_loader dgpp_loaders CUDA::cudart Threads::Threads)
 dgpp_set_common(dsv41_load_check)
@@ -1384,7 +1438,8 @@ set_tests_properties(unit unit_tests http_server_test serve_test fabric_serve_te
 set_tests_properties(checkpoint_audit_test route_trace_test sampling_profile_test
   site_env_test script_reports_test portability_test setup_tools_test launcher_test PROPERTIES LABELS "host;python")
 set_tests_properties(tokenizer_test qwen_tokenizer_test glm4_tokenizer_test dsv41_tokenizer_test
-  chat_template_test qwen_chat_template_test glm4_chat_template_test dsv41_prompt_test
+  dsv4_tokenizer_test
+  chat_template_test qwen_chat_template_test glm4_chat_template_test dsv41_prompt_test dsv4_prompt_test
   PROPERTIES LABELS "host;checkpoint")
 foreach(_test qwen_forward_fixture qwen_forward_generate glm4_forward_fixture
     glm4_forward_generate glm_forward_fixture glm_forward_generate dsa_dump_generate kda_dump_generate)
@@ -1397,3 +1452,4 @@ if(DGPP_ENABLE_IBV)
 endif()
 set_tests_properties(roster_selftest PROPERTIES LABELS "host")
 set_tests_properties(dsv4_fp8_scale_test PROPERTIES LABELS "host")
+set_tests_properties(dsv4_loader_cpu_test PROPERTIES LABELS "host")
