@@ -83,6 +83,10 @@
 #include "models/dsv41/loader.hpp"
 #include "models/dsv41/model.hpp"
 #include "text/dsv41_prompt.hpp"
+#include "models/dsv4/config.hpp"
+#include "models/dsv4/loader.hpp"
+#include "models/dsv4/model.hpp"
+#include "text/dsv4_prompt.hpp"
 #include "models/glm_dsa/model.hpp"
 #include "sched/scheduler.hpp"
 #include "text/tokenizer.hpp"
@@ -629,14 +633,77 @@ struct Dsv41Family final : ServeFamily {
   }
 };
 
+// DeepSeek-V4-Flash (DeepseekV4ForCausalLM, the fp8 128 x 128 dense grid +
+// the MXFP4 experts as shipped; docs/dsv4_kernel_port_spec.md): the CSA2
+// decode path (the window ring, the C4A/C128A compressor, the 64-head
+// indexer, the two-source attention) plus the hash-routing MoE (the tid2eid
+// table on the first num_hash_layers, the fused top-k router, the MXFP4
+// expert) — the prefix snapshot holds no per-request state (the attention's
+// state is positional, the paged pool's the GPU-gate pending's completion's);
+// the DSpark draft is the mtp block (depth = the verified block length,
+// default 5).
+struct Dsv4Family final : ServeFamily {
+  dgpp::Dsv4TextConfig cfg;
+  std::string ckpt;
+  std::vector<int64_t> eos;
+  std::unique_ptr<dgpp::Dsv4Model> model;
+  explicit Dsv4Family(const std::string& checkpoint)
+      : cfg(dgpp::Dsv4TextConfig::from_json_file((fs::path(checkpoint) / "config.json").string())),
+        ckpt(checkpoint), eos{cfg.eos_token_id} {}
+  const char* name() const override { return "deepseek_v4"; }
+  int64_t vocab_size() const override { return cfg.vocab_size; }
+  std::vector<int64_t>& eos_token_ids() override { return eos; }
+  int64_t block_tokens() const override { return dgpp::Dsv4Model::kv_block_tokens_static(); }
+  int prefill_chunk_tokens() const override { return dgpp::Dsv4Model::prefill_chunk_tokens(); }
+  std::string pool_check(int64_t) const override { return ""; }  // no paged pool yet
+  const char* kv_format_name() const override { return "fp8_block latent + fp8_block window"; }
+  int decode_rows_cap() const override { return dgpp::Dsv4Model::decode_rows_cap(); }
+  int default_mtp_depth() const override { return cfg.dspark_block_size; }
+  // The widest fold the decode graph records: the attention's wo_b partial
+  // and the MoE partial, [rows, hidden] bf16 per site.
+  size_t lat_slot_bytes(int decode_rows) const override {
+    return static_cast<size_t>(decode_rows) * static_cast<size_t>(cfg.hidden_size) * 2;
+  }
+  dgpp::MemoryPlan plan(int forward_rows, int64_t context, int rank, int world_, bool fabric, int slots, bool mtp,
+                         int decode_rows) const override {
+    return dgpp::Dsv4Model::plan_memory(cfg, forward_rows, context, fabric ? rank : 0, fabric ? world_ : 1,
+                                        fabric ? dgpp::Dsv4Residency::Resident : dgpp::Dsv4Residency::Streaming,
+                                        slots, fabric && mtp, decode_rows);
+  }
+  size_t snapshot_bytes(int world_, bool mtp) const override {
+    return dgpp::Dsv4Model::session_snapshot_bytes(cfg, world_, mtp);
+  }
+  void build_model(dgpp::BoundaryReducer* reducer, int rank, int world_, bool fabric, int forward_rows,
+                   int64_t pool_tokens, int slots, bool mtp, int decode_rows) override {
+    dgpp::Dsv4LayerStream::set_resident_image_dir(dgpp::GlmLayerStream::resident_image_dir());
+    model = std::make_unique<dgpp::Dsv4Model>(
+        cfg, ckpt, forward_rows, pool_tokens,
+        fabric ? dgpp::Dsv4Residency::Resident : dgpp::Dsv4Residency::Streaming, reducer, fabric ? rank : 0,
+        fabric ? world_ : 1, slots, fabric && mtp, decode_rows);
+  }
+  void destroy_model() override { model.reset(); }
+  size_t model_snapshot_bytes() const override { return model ? model->session_snapshot_bytes() : 0; }
+  std::unique_ptr<ServeGraphEngine> make_graph_engine(
+      dgpp::net::CollectiveBus* bus, int rank, int world_, uint16_t* pick_scratch, int batch_min_live,
+      uint16_t* prefix_scratch, uint16_t* gather_scratch, int candidates, const dgpp::text::GrammarVocab* grammar,
+      int prefix_slots, int mtp_depth) override {
+    return std::make_unique<ServeGraphEngineOf<dgpp::Dsv4Model>>(
+        model.get(), bus, rank, world_, pick_scratch, cfg.vocab_size, /*pick_timeout_ms=*/60000, batch_min_live,
+        prefix_scratch, gather_scratch, candidates, grammar, prefix_slots, mtp_depth);
+  }
+  std::unique_ptr<dgpp::sched::SchedulerEngine> make_eager_engine(
+      int slots, dgpp::DecodePick pick, dgpp::DecodeSample sample, const dgpp::text::GrammarVocab* grammar,
+      int prefix_slots) override {
+    return std::make_unique<dgpp::EagerEngineAdapter<dgpp::Dsv4Model>>(
+        model.get(), slots, std::move(pick), std::move(sample), grammar, prefix_slots);
+  }
+};
+
 std::unique_ptr<ServeFamily> make_family(const std::string& ckpt, int world, dgpp::LatentFormat kv_format,
                                          const std::optional<dgpp::RopeScaling>& rope_scaling) {
   const dgpp::ModelArchitecture arch =
       dgpp::detect_architecture_file((fs::path(ckpt) / "config.json").string());
-  if (arch == dgpp::ModelArchitecture::DeepseekV4)
-    throw std::runtime_error(
-        "DeepSeek-V4-Flash (DeepseekV4ForCausalLM): the engine recognizes and binds this "
-        "checkpoint (Phase A) but its serve family lands with the loader (Phase B)");
+  if (arch == dgpp::ModelArchitecture::DeepseekV4) return std::make_unique<Dsv4Family>(ckpt);
   if (arch == dgpp::ModelArchitecture::DeepseekV41) return std::make_unique<Dsv41Family>(ckpt);
   if (arch == dgpp::ModelArchitecture::Qwen4Exp) return std::make_unique<QwenFamily>(ckpt, rope_scaling);
   if (arch == dgpp::ModelArchitecture::Glm4Moe) return std::make_unique<Glm4Family>(ckpt);
@@ -746,6 +813,11 @@ int serve_openai(dgpp::sched::SchedulerEngine* engine, int64_t vocab_size,
     frontend = std::make_unique<dgpp::serve::Dsv41Frontend>(&tok);
     template_hash = dgpp::text::Dsv41Prompt::source_hash();
     DGPP_LOG_INFO("serve: tokenizer {:#x}, the DeepSeek-V4.1 prompt renderer {:#x}", tok.revision_hash(),
+                  template_hash);
+  } else if (family_name == "deepseek_v4") {
+    frontend = std::make_unique<dgpp::serve::Dsv4Frontend>(&tok);
+    template_hash = dgpp::text::Dsv4Prompt::source_hash();
+    DGPP_LOG_INFO("serve: tokenizer {:#x}, the DeepSeek-V4-Flash prompt renderer {:#x}", tok.revision_hash(),
                   template_hash);
   } else {
     tpl.emplace(dgpp::text::ChatTemplate::load((fs::path(ckpt) / "chat_template.jinja").string()));
@@ -1257,6 +1329,10 @@ int main(int argc, char** argv) {
     if (arch == dgpp::ModelArchitecture::DeepseekV41) {
       mtp_depth = dgpp::Dsv41TextConfig::from_json_file((fs::path(ckpt) / "config.json").string()).dspark_block_size;
       DGPP_LOG_INFO("serve: --mtp without --mtp-depth on DeepSeek-V4.1: the DSpark block's {} drafts", mtp_depth);
+    } else if (arch == dgpp::ModelArchitecture::DeepseekV4) {
+      mtp_depth = dgpp::Dsv4TextConfig::from_json_file((fs::path(ckpt) / "config.json").string()).dspark_block_size;
+      DGPP_LOG_INFO("serve: --mtp without --mtp-depth on DeepSeek-V4-Flash: the DSpark block's {} drafts",
+                     mtp_depth);
     }
   }
   // ---- the fabric's first handshake: the head pushes the
@@ -1448,6 +1524,7 @@ int main(int argc, char** argv) {
   // (both read it; the other families keep their tables whole).
   dgpp::GlmDsaLayerStream::set_embed_vocab_sharded(embed_sharding == "vocab");
   dgpp::Dsv41LayerStream::set_embed_vocab_sharded(embed_sharding == "vocab");
+  dgpp::Dsv4LayerStream::set_embed_vocab_sharded(embed_sharding == "vocab");
   if (world > 1) {
     require(rank >= 0 && rank < world, "--rank outside --world");
     require(!peer.empty() || rank == 0,

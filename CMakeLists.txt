@@ -369,6 +369,15 @@ target_include_directories(dgpp_models_dsv4_layers PUBLIC ${CMAKE_CURRENT_SOURCE
 target_link_libraries(dgpp_models_dsv4_layers PUBLIC dgpp_models_dsv4 dgpp_kernels dgpp_models_glm CUDA::cudart)
 dgpp_set_common(dgpp_models_dsv4_layers)
 
+# The DeepSeek-V4-Flash session model (the dsv41 model's structure on the
+# committed V4 layer surfaces — csa2 / hash / dspark): the walk, the head,
+# the DSpark draft, the memory plan.
+add_library(dgpp_models_dsv4_model STATIC
+  src/models/dsv4/model.cpp)
+target_include_directories(dgpp_models_dsv4_model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_models_dsv4_model PUBLIC dgpp_models_dsv4_loader dgpp_models_dsv4_layers dgpp_models_glm dgpp_kernels CUDA::cudart)
+dgpp_set_common(dgpp_models_dsv4_model)
+
 # Qwen3.8-Flash-Next: the host-side model description.
 add_library(dgpp_models_qwen STATIC
   src/models/qwen/config.cpp
@@ -597,7 +606,7 @@ if(DGPP_ENABLE_IBV)
   # layout split of 2026-09-06; dgpp_serve is the library it links).
   add_executable(dgpp_serve_app apps/dgpp_serve.cpp)
   target_link_libraries(dgpp_serve_app PRIVATE dgpp_models_glm_loader dgpp_models_qwen_layers dgpp_models_glm4_layers dgpp_models_glm_dsa_layers
-                                             dgpp_models_dsv41_layers
+                                             dgpp_models_dsv41_layers dgpp_models_dsv4_model
                                              dgpp_loaders dgpp_bus
                                              dgpp_serve CUDA::cudart
                                              Threads::Threads)

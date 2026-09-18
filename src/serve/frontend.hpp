@@ -20,6 +20,7 @@
 #include "loaders/minijson.hpp"
 #include "text/chat_template.hpp"
 #include "text/dsv41_prompt.hpp"
+#include "text/dsv4_prompt.hpp"
 #include "text/tokenizer.hpp"
 #include "text/tool_parser.hpp"
 #include "serve/generation_service.hpp"
@@ -106,6 +107,37 @@ class Dsv41Frontend : public ModelFrontend {
   bool template_reads(std::string_view name) const override { return dgpp::text::Dsv41Prompt::reads(name); }
   std::string render_chat(const minijson::Value& globals) const override {
     return dgpp::text::Dsv41Prompt::render(globals);
+  }
+  dgpp::text::ChatMarkers markers() const override { return markers_; }
+  std::vector<int64_t> boundary_token_ids() const override {
+    std::vector<int64_t> ids;
+    for (const dgpp::text::ChatMarker& m : markers_.role_markers) ids.push_back(m.id);
+    return ids;
+  }
+
+ private:
+  const dgpp::text::Tokenizer* tok_;
+  dgpp::text::ChatMarkers markers_;
+};
+
+// The DeepSeek-V4-Flash frontend (docs/deepseek_v4_flash_plan.md G6): the
+// twin of the V4.1's — text/dsv4_prompt renders its encoder's format (the
+// system message's the bare content's, the effort prefix's the string
+// levels' the reference's); the markers come off its tokenizer as the
+// V4.1's.
+class Dsv4Frontend : public ModelFrontend {
+ public:
+  explicit Dsv4Frontend(const dgpp::text::Tokenizer* tok) : tok_(tok) {
+    if (tok_ == nullptr) throw std::invalid_argument("Dsv4Frontend: the tokenizer must be loaded");
+    markers_ = dgpp::text::ChatMarkers::from_tokenizer(*tok_);
+  }
+  std::vector<int64_t> encode_text(std::string_view text) const override { return tok_->encode(text); }
+  std::string decode_ids(const std::vector<int64_t>& ids) const override {
+    return tok_->decode(ids, /*skip_special_tokens=*/true);
+  }
+  bool template_reads(std::string_view name) const override { return dgpp::text::Dsv4Prompt::reads(name); }
+  std::string render_chat(const minijson::Value& globals) const override {
+    return dgpp::text::Dsv4Prompt::render(globals);
   }
   dgpp::text::ChatMarkers markers() const override { return markers_; }
   std::vector<int64_t> boundary_token_ids() const override {

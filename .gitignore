@@ -70,3 +70,5 @@ deploy/cluster_*.json
 # scripts/ is not committed by accident.
 scripts/maximize-cluster-memory.sh
 .pi/
+
+dsv4_loader_fixture/
