@@ -79,13 +79,22 @@ Dsv4Csa2Layer::Layout Dsv4Csa2Layer::layout(const Dsv4Csa2Config& cfg, int max_t
   L.slots = alloc(T * 8);
   L.topk = alloc(T * cfg.index_topk * 4);
   L.counts = alloc(T * 4);
-  const size_t ws_rows = std::max<size_t>(std::max(max_decode_rows, 8), std::max(decode_n_split, 8));
-  L.m_main = alloc(ws_rows * lh * 4);
-  L.l_main = alloc(ws_rows * lh * 4);
-  L.c_main = alloc(ws_rows * lh * kCsa2Latent * 4);
-  L.m_win = alloc(ws_rows * lh * 4);
-  L.l_win = alloc(ws_rows * lh * 4);
-  L.c_win = alloc(ws_rows * lh * kCsa2Latent * 4);
+  // The six partials' (the m / l / c's the main's + the window's) the shared
+  // attn_finish kernel's [r * n_split + s]'s (row, split)'s index's — the
+  // dsv41's Csa2Layer's ws_slots' sizing (the max_decode_rows's x the
+  // decode_n_split's the (row, split)'s pairs' the product's, NOT the
+  // max's — the dsv4's former ws_rows' max's the 32x's under-allocation's,
+  // the GPU-gate pending's parity gate's the OOB's). The dsv4's prefill's
+  // the <= max_decode_rows rows' enqueue_decode's, so the product's
+  // suffices (the dsv41's kPrefillAttnRows * kPrefillSplit's term's the
+  // dsv4's absent's prefill-split's attention's).
+  const size_t ws_slots = std::max<size_t>(max_decode_rows, 8) * std::max<size_t>(decode_n_split, 8);
+  L.m_main = alloc(ws_slots * lh * 4);
+  L.l_main = alloc(ws_slots * lh * 4);
+  L.c_main = alloc(ws_slots * lh * kCsa2Latent * 4);
+  L.m_win = alloc(ws_slots * lh * 4);
+  L.l_win = alloc(ws_slots * lh * 4);
+  L.c_win = alloc(ws_slots * lh * kCsa2Latent * 4);
   L.violations = alloc(16);
   L.total = align256(off);
   return L;
