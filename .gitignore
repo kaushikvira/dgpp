@@ -52,6 +52,7 @@ glm_dsa_loader_fixture/
 glm_dsa_engine_fixture/
 glm_dsa_engine_fixture_wide_*/
 glm_dsa_forward_fixture/
+dsv4_loader_cpu_fixture/
 # Local deployment copies hold model choices and engine tuning. Shared node
 # addresses, SSH login, ports and site paths live in .env, not these JSONs.
 # Keep legacy filenames ignored as well while existing sites migrate.
