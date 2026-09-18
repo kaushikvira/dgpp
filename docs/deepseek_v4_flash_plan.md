@@ -89,12 +89,16 @@ Lane D/Q down first).
   across ranks; e8m0 decode; MXFP4 slice boundary; hash-table map/gather;
   bad-geometry refusal). 🔌 the CUDA loader test (`dsv4_loader_test`) runs
   in the morning GPU window.
-- **G4 — kernel geometry (CSA2 / indexer / engram / DSpark).** ⏳ W2b
-  (`src/models/dsv4/csa2_layer.{hpp,cu}` + the 4 CPU oracle tests
-  `dsv4_{csa2,moe,mhc,dspark}_oracle_test.cpp`). In progress; verify + commit
-  when it lands. Hard rule: dsv41/glm/qwen stay bitwise; numerics borrowed
-  from `~/work/dsv4-native` read-only with file:line citations; every new op
-  gets a CPU oracle first.
+- **G4 — kernel geometry (CSA2 / indexer / engram / DSpark).** ✅ commit
+  `617245c`. The three v4 layer surfaces (`csa2_layer`, `dspark_layer`,
+  `hash_layer`) compose the shared `csa2`/`dsa`/`scale_gemm`/`dsv41_dspark`/
+  glm-moe kernels **unmodified** and add only the V4-specific re-expressions
+  (64-head select, the DSpark union-softmax, the hash-routing MoE gate with
+  the `tid2eid` table-lookup mode). 15 CPU oracle tests pass (csa2 5,
+  dspark 4, mhc 3, moe 3); dsv41/glm/qwen stay bitwise (append-only CMake,
+  no shared kernel touched). 🔌 the GPU parity gate (64-head select, union
+  attn, router, the `Csa2StatePool` partials + MXFP4 expert view-table
+  wiring) runs in the morning window.
 - **G5 — DSpark / graph engine / parity.** 🔌 DSpark block 5, targets
   [40,41,42], 1 predict layer, graph engine at world 2, reference parity
   against the checkpoint's own `inference/` (`model.py`/`kernel.py`/
@@ -113,8 +117,9 @@ Lane D/Q down first).
 
 ## 4. Watch-items
 
-1. **G4 (W2b) is the last code gate before the morning.** It is the only
-   piece not yet committed; everything else is landed and green.
+1. **All code gates are landed and green host-side** (G0/G1/G2/G3/G4/G6
+   committed). The remaining work is the morning GPU window: the G4 GPU
+   parity gate, G5 reference parity, and the G7 fabric boot.
 2. **Draft-count trap (handled):** `num_nextn_predict_layers` is 1 but the
    shards carry 3 `mtp.N` blocks; the parser takes the count from
    `compress_ratios` (commit `6effa28`). Do not "fix" it back to 1.
@@ -129,3 +134,10 @@ Lane D/Q down first).
    schedule the soak off-peak.
 6. **The v4.1 `dsv41_prompt_test` skips on this box** (its checkpoint is not
    in the local HF cache) — exit 2 is the designed skip, not a regression.
+7. **Pre-existing CMake bug (not dsv4-related):** `bus_small_repro` is added
+   unconditionally but links `dgpp_bus` (which only exists under
+   `if(DGPP_ENABLE_IBV)`), so a full `all` build with `DGPP_ENABLE_IBV=OFF`
+   fails at `bus_small_repro`. The intended build is `DGPP_ENABLE_IBV=ON`
+   (ibverbs is on the box; the main `dgpp-serve` app is inside the IBV gate).
+   build-ci is configured with IBV=ON and builds green. Fix for the OFF path:
+   move `bus_small_repro` inside the IBV gate.
