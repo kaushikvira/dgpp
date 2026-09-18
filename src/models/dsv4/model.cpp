@@ -151,9 +151,8 @@ Dsv4Model::Dsv4Model(const Dsv4TextConfig& cfg, const std::string& checkpoint_di
     throw std::invalid_argument("Dsv4Model: a vocab-sharded embedding needs the boundary reducer (world > 1)");
   if (residency == Dsv4Residency::Resident) {
     for (int l = 0; l < (mtp ? cfg_.max_layer() : cfg_.num_hidden_layers); ++l) (void)loader_.load_layer(l);
-    loader_.release_sources();
   }
-  log_memory_ledger("dsv4: layers resident, sources released");
+  log_memory_ledger("dsv4: layers resident");
   {
     SessionParams sp;
     sp.max_tokens = max_tokens;
@@ -261,15 +260,22 @@ Dsv4Model::Dsv4Model(const Dsv4TextConfig& cfg, const std::string& checkpoint_di
     }
     log_memory_ledger("dsv4: hash tables on the device");
   }
+  // The hash tables are mmap'd from the checkpoint shards, so the sources
+  // are held until their rows are gathered onto the device (the loader's
+  // contract: load_hash_tables() precedes release_sources()).
+  if (residency == Dsv4Residency::Resident) {
+    loader_.release_sources();
+    log_memory_ledger("dsv4: sources released");
+  }
   // The DSpark stage's view (the main projection's the stage 0's, the head
   // tensors' the last stage's — the layer's rebind's both's). Resident's the
   // draft stages' the stable's (mtp implies the resident stack).
   if (mtp) {
     const Dsv4LayerResident& r0 = loader_.load_layer(cfg_.num_hidden_layers);
     const Dsv4LayerResident& rl =
-        loader_.load_layer(cfg_.num_hidden_layers + cfg_.num_nextn_predict_layers - 1);
-    dspark_w_ = dspark_view(r0, rl, cfg_.num_nextn_predict_layers - 1);
-    dspark_->rebind(dspark_w_, cfg_.num_nextn_predict_layers - 1);
+        loader_.load_layer(cfg_.num_hidden_layers + cfg_.num_draft_stages() - 1);
+    dspark_w_ = dspark_view(r0, rl, cfg_.num_draft_stages() - 1);
+    dspark_->rebind(dspark_w_, cfg_.num_draft_stages() - 1);
   }
   // The activation buffers.
   const size_t M = static_cast<size_t>(max_tokens_);
@@ -593,7 +599,7 @@ void Dsv4Model::draft_first(int req, const int64_t* tokens, const int64_t* d_pos
   const int H = cfg_.hidden_size;
   const int W = targets_ * H;
   const int block = cfg_.dspark_block_size;
-  const int stages = cfg_.num_nextn_predict_layers;
+  const int stages = cfg_.num_draft_stages();
   const float eps = cfg_.rms_norm_eps;
   if (head_rows == 0) return;  // the prefill fills the window (run_rows); no block
   // ---- the accepted rows' main hidden -> main_x ----------------------------
