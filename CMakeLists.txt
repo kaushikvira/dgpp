@@ -483,11 +483,14 @@ target_link_libraries(glm_stream_check PRIVATE dgpp_models_glm_loader)
 dgpp_set_common(glm_stream_check)
 
   # The small-collective stall repro (engine hunt instrument, not a CI gate
-  # until the fix lands — see the file comment).
-  add_executable(bus_small_repro apps/bus_small_repro.cu)
-  target_link_libraries(bus_small_repro PRIVATE dgpp_bus CUDA::cudart
-                                                Threads::Threads)
-  dgpp_set_common(bus_small_repro)
+  # until the fix lands — see the file comment). It links dgpp_bus, which
+  # only exists when DGPP_ENABLE_IBV is on, so it is gated with it.
+  if(DGPP_ENABLE_IBV)
+    add_executable(bus_small_repro apps/bus_small_repro.cu)
+    target_link_libraries(bus_small_repro PRIVATE dgpp_bus CUDA::cudart
+                                                  Threads::Threads)
+    dgpp_set_common(bus_small_repro)
+  endif()
 
   # The in-process two-rank graph scheduling model that root-caused the
   # batched-MTP loopback stall (docs/batched_mtp_graph_stall.md): kernels-only
