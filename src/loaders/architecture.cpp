@@ -34,12 +34,17 @@ ModelArchitecture detect_architecture(const minijson::Value& root) {
     return ModelArchitecture::Glm4Moe;
   // DeepSeek-V4.1-Flash (2026-09-13, docs/deepseek_v41_flash_plan.md):
   // `DeepseekV41ForCausalLM` / `deepseek_v41` (its text_config's type is
-  // `deepseek_v41_text`).
+  // `deepseek_v41_text`). Checked before the V4 branch: `DeepseekV41ForCausalLM`
+  // starts with `DeepseekV4`, so the longer class name must match first.
   if (arch.rfind("DeepseekV41", 0) == 0 || (arch.empty() && type == "deepseek_v41"))
     return ModelArchitecture::DeepseekV41;
+  // DeepSeek-V4-Flash (2026-09-17): `DeepseekV4ForCausalLM` / `deepseek_v4`,
+  // a FLAT config.json (no text_config, unlike V4.1).
+  if (arch.rfind("DeepseekV4", 0) == 0 || (arch.empty() && type == "deepseek_v4"))
+    return ModelArchitecture::DeepseekV4;
   throw std::runtime_error(
       "config.json: unsupported architecture '" + arch + "' (model_type '" +
-      type + "'); the engine implements Glm5*, Qwen4Exp*, Glm4Moe*, GlmMoeDsa* and DeepseekV41*");
+      type + "'); the engine implements Glm5*, Qwen4Exp*, Glm4Moe*, GlmMoeDsa*, DeepseekV4* and DeepseekV41*");
 }
 
 ModelArchitecture detect_architecture_file(const std::string& path) {

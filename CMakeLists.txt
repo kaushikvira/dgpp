@@ -328,6 +328,15 @@ target_include_directories(dgpp_models_dsv41_layers PUBLIC ${CMAKE_CURRENT_SOURC
 target_link_libraries(dgpp_models_dsv41_layers PUBLIC dgpp_models_dsv41_loader dgpp_models_csa2 dgpp_models_moe dgpp_models_glm dgpp_kernels CUDA::cudart)
 dgpp_set_common(dgpp_models_dsv41_layers)
 
+# DeepSeek-V4-Flash (2026-09-17, the flat-layout V4 family): the
+# host-side model description (config, binding) — Phase A, no loader.
+add_library(dgpp_models_dsv4 STATIC
+  src/models/dsv4/config.cpp
+  src/models/dsv4/binding.cpp)
+target_include_directories(dgpp_models_dsv4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_models_dsv4 PUBLIC dgpp_loaders dgpp_common)
+dgpp_set_common(dgpp_models_dsv4)
+
 # Qwen3.8-Flash-Next: the host-side model description.
 add_library(dgpp_models_qwen STATIC
   src/models/qwen/config.cpp
@@ -427,6 +436,10 @@ dgpp_set_common(glm_dsa_bind_check)
 add_executable(dsv41_bind_check apps/dsv41_bind_check.cpp)
 target_link_libraries(dsv41_bind_check PRIVATE dgpp_models_dsv41 dgpp_loaders)
 dgpp_set_common(dsv41_bind_check)
+
+add_executable(dsv4_bind_check apps/dsv4_bind_check.cpp)
+target_link_libraries(dsv4_bind_check PRIVATE dgpp_models_dsv4 dgpp_loaders)
+dgpp_set_common(dsv4_bind_check)
 
 # M5 d4 at real scale: the shard-parity gate (loader-vs-bind bitwise +
 # replicated digest + byte reconcile) as a deployment command — the same
@@ -616,13 +629,15 @@ add_executable(unit_tests
   tests/unit/glm_dsa_binding_test.cpp
   tests/unit/dsv41_config_test.cpp
   tests/unit/dsv41_binding_test.cpp
+  tests/unit/dsv4_config_test.cpp
+  tests/unit/dsv4_binding_test.cpp
   tests/unit/nvfp4_quant_test.cpp
   tests/unit/verify_schedule_test.cpp
   src/core/trace.cpp)
 target_include_directories(unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(unit_tests PRIVATE CUDA::cudart dgpp_loaders
                                         dgpp_models_glm dgpp_models_qwen dgpp_models_glm4
-                                        dgpp_models_glm_dsa dgpp_models_dsv41
+                                        dgpp_models_glm_dsa dgpp_models_dsv41 dgpp_models_dsv4
                                         dgpp_rope_scaling
                                         dgpp_net dgpp_serve Threads::Threads)
 target_compile_definitions(unit_tests PRIVATE DGPP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
@@ -1166,6 +1181,15 @@ dgpp_set_common(scale_gemm_test)
 add_test(NAME scale_gemm_test COMMAND scale_gemm_test)
 set_tests_properties(scale_gemm_test PROPERTIES SKIP_RETURN_CODE 2)
 
+# DeepSeek-V4-Flash fp8 scale contract (host, no GPU): the E8M0 -> F32
+# scale decode and the 128 x 128 block tiling arithmetic, pinned against
+# naive references (docs/dsv4_kernel_port_spec.md §3-§4; the Phase B
+# loader's oracle before the GPU work lands).
+add_executable(dsv4_fp8_scale_test tests/unit/dsv4_fp8_scale_test.cpp)
+target_include_directories(dsv4_fp8_scale_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+dgpp_set_common(dsv4_fp8_scale_test)
+add_test(NAME dsv4_fp8_scale_test COMMAND dsv4_fp8_scale_test)
+
 # mHC module parity (M4): compute/update/final-mean kernels vs the double
 # oracle; real geometry, edge cases, determinism.
 add_executable(glm_mhc_test tests/cuda/glm_mhc_test.cu)
@@ -1372,3 +1396,4 @@ if(DGPP_ENABLE_IBV)
   set_tests_properties(nic_regress_selftest PROPERTIES LABELS "gpu;rdma" RUN_SERIAL TRUE)
 endif()
 set_tests_properties(roster_selftest PROPERTIES LABELS "host")
+set_tests_properties(dsv4_fp8_scale_test PROPERTIES LABELS "host")

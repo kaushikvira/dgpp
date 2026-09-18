@@ -629,6 +629,10 @@ std::unique_ptr<ServeFamily> make_family(const std::string& ckpt, int world, dgp
                                          const std::optional<dgpp::RopeScaling>& rope_scaling) {
   const dgpp::ModelArchitecture arch =
       dgpp::detect_architecture_file((fs::path(ckpt) / "config.json").string());
+  if (arch == dgpp::ModelArchitecture::DeepseekV4)
+    throw std::runtime_error(
+        "DeepSeek-V4-Flash (DeepseekV4ForCausalLM): the engine recognizes and binds this "
+        "checkpoint (Phase A) but its serve family lands with the loader (Phase B)");
   if (arch == dgpp::ModelArchitecture::DeepseekV41) return std::make_unique<Dsv41Family>(ckpt);
   if (arch == dgpp::ModelArchitecture::Qwen4Exp) return std::make_unique<QwenFamily>(ckpt, rope_scaling);
   if (arch == dgpp::ModelArchitecture::Glm4Moe) return std::make_unique<Glm4Family>(ckpt);
