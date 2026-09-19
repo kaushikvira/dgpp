@@ -566,3 +566,43 @@ kernel-vs-CPU-oracle harness for the mHC / MoE / csa2 / dspark / fp8-scale ops) 
 being built now — that gate has never existed, and this codebase's history (the
 union-attention accumulator bug that the CPU oracle passed) says that is where the
 bug is.
+
+### 2026-09-20, night part 2: two more real bugs found, the degeneration persists
+
+Found and fixed by `compute-sanitizer` + the new GPU tests (both are genuine,
+both were silent):
+1. **Uninitialized draft input** (`--tool initcheck`): `main_hidden_` is the
+   draft's fused `[rows, targets x hidden]` buffer, but the stream-mean writer
+   passed `hidden` as the row stride instead of the fused width, so the targets'
+   rows overlapped and the rest of the buffer was never written —
+   `hidden_store_kernel` then read it (`Uninitialized __global__ memory read of
+   size 2 bytes`, thread 64/block 2, via `qwen_mtp_hidden_store_bf16` ←
+   `run_rows`). Fixed in `Dsv4DsparkLayer::stream_mean` (an explicit
+   `out_stride`). initcheck is now CLEAN (0 reports) — but `accept p1` is still
+   0%, so the draft's numerics are wrong for another reason too.
+2. **The new ring format's kernels were never opted in for large dynamic shared
+   memory** (`dsa_prepare_kernel_smem`'s per-format list omitted
+   `kFp8BlockRope`), so its `attn_flash_kernel<512,576,*>` launches were rejected
+   with `invalid argument` — caught by the ring work's own GPU case. Opt-in is
+   per kernel SYMBOL, so a forgotten format silently disables the launch.
+   `dsa_test` is now 44/44.
+
+Also fixed: the gate's fabric shape check demanded `kv 262144 / C2`, but
+`resident_image_key()` is the per-rank TENSOR SET — the kv-1048576/C6, mtp-1,
+nomtp and mtp-5 shapes all restore the same image. It is world-only now.
+
+Ruled out tonight (each tested, not assumed): the chat template (raw
+completions are equally degenerate), the tokenizer/renderer goldens, the weights
+(a freshly rebuilt resident image is equally degenerate), the loader / binding /
+fp8-scale formats (GPU loader 5/5, cpu 6/6, fp8-scale 4/4, and the loader DOES
+decode e8m0→F32 per port-spec §3), the input path (three prompts → three
+different continuations), the eager vs captured-graph paths (both degenerate),
+the LatentFormat dispatches (every `case` covers the new format), and the TP
+sharding rules (they match the port spec's census).
+
+**In flight**: `dsv4_gpu_parity_test` (a GPU kernel-vs-CPU-oracle harness for
+the mHC / MoE / csa2 / dspark / fp8-scale ops — the gate that has never existed),
+a per-layer hidden-state dump for the engine, and a torch per-layer reference of
+the same checkpoint to diff it against. The reference lane is `make up-base`
+(vLLM, same checkpoint) and answers the smoke prompt coherently; our common
+prefix with it is still zero tokens.
