@@ -606,3 +606,40 @@ a per-layer hidden-state dump for the engine, and a torch per-layer reference of
 the same checkpoint to diff it against. The reference lane is `make up-base`
 (vLLM, same checkpoint) and answers the smoke prompt coherently; our common
 prefix with it is still zero tokens.
+
+## THE ROOT CAUSE (2026-09-20, ~07:5x): the MoE expert is a stub — the model has no FFN
+
+`Dsv4HashLayer::expert()` in `src/models/dsv4/hash_layer.cu` — the function the
+model's every layer calls to produce its feed-forward output — is a **STUB**:
+
+```cpp
+void Dsv4HashLayer::expert(const void* x, int tokens, const int32_t* topk_ids,
+                           const float* topk_w, void* out, cudaStream_t stream) {
+  // ...the MXFP4 expert's composition (the GPU-gate pending's completion's wiring)
+  (void)x; (void)tokens; (void)topk_ids; (void)topk_w; (void)out; (void)stream;
+}
+```
+
+It has been a stub since the G4 commit (`5dc7e31`) and was never implemented.
+The **router is real** (`route()` → `dsv4_moe_router`, with the tid2eid hash mode
+for layers 0-2 and the learned/noaux_tc path for 3-42, both CPU-oracle-qualified),
+but the experts never run. The model's MoE site
+(`model.cpp`: `moe_->expert(x_, T, topk_ids_, topk_w_, ffn_out, stream_)` then
+`fold(ffn_out, …); stream_update(ffn_out, T)`) therefore folds an **unwritten
+buffer** into the residual stream on **every layer**.
+
+That is the degeneration: not a numerical drift, a missing half of the model.
+It explains every symptom — garbage from the FIRST token, on both the eager and
+the captured-graph paths, with the prompt reaching the model (the output is
+input-dependent), the plumbing clean, the memory clean, and the CPU oracles
+green (they test the reference math, not this wiring). It also explains why the
+attention/q/compressor fixes changed the garbage's flavour without curing it:
+the FFN was never contributing.
+
+The fix is a composition of kernels that already exist and work for the GLM
+family: `launch_moe_grouped_mma_fp4` (gate+up), `launch_moe_slot_gate_up_swiglu_fp4`
+(the SwiGLU, clamp 10), `launch_moe_slot_down_fp4` (the down projection, router
+weight folded in), `launch_moe_slot_accum` (the routed sum) — plus the shared
+expert's fp8 triple and the `fp4_gemv` K=4096 compile entry the port spec §2.4
+says is needed. The CPU oracle to match is
+`tests/unit/dsv4_moe_oracle_test.cpp`'s `dsv4_moe_mxfp4_expert_decode_and_clamp`.
