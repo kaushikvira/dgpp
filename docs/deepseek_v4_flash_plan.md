@@ -494,3 +494,38 @@ engine-side violation logged. That is the numerics work in the spec's §5:
 fp4 -> e4m3 re-expression), `G8` (the ring/main quant-class deltas), then the
 compressor/partials items. The parity gate against the checkpoint's own
 `inference/` remains the arbiter.
+
+## The 2026-09-19 night session (MTP + graph serving, working the numerics)
+
+The plumbing is done (see the window above): the world-2 shape serves with MTP
+depth 5 and the decode graph captured. The night is spent on the numerics, in
+the order the independent cross-check (`docs/dsv4_vs_native_diff.md`, a
+three-way diff of our engine vs `~/work/dsv4-native` vs the Python reference)
+ranked them:
+
+- **Fixed: the per-head q re-normalization (`G-q-renorm`)** and the indexer's
+  **Hadamard rotation (`G5`)**, in the csa2 q path and the DSpark staging
+  (CPU-oracle-qualified). The independent source corroborates this as the
+  rank-1 delta: `dsv4-native`'s own rank-1 fix is the same renorm, and its
+  `DSV4_QRENORM_DUMP` measures the pre-renorm per-head RMS as O(2-4) — a
+  head-varying logit-scale distortion, the class that collapses attention into
+  repetition. **Result: the degeneration persists** (the garbage changed from
+  `...”` to `Compound للمعارف…`), so more is wrong.
+- **In flight: the window ring's RoPE-64 quantization (`G8` first bullet)** —
+  ranked #2 by the cross-check and the top *numerical* delta in the dominant
+  path for a short prompt: we quantize all 512 dims to fp8, the reference keeps
+  the RoPE'd 64 in bf16 and quantizes only the NoPE 448 per-64.
+- **In flight: the compressor cluster** (`G-c128a` gated pool — 20 of the 46
+  layers, `G-tail-cadence`, `G-tail-pool`, `G-tail-ape`). The cross-check ranks
+  these as real bugs that are INERT on a 15-token prompt (the compressed cache
+  is nearly empty) but required for long context.
+- **Ground truth being prepared**: torch 2.13 + cu130 in `eugr/spark-vllm:latest`
+  DOES see the GB10 (cap 12.1, bf16 matmul verified), so the checkpoint's own
+  `inference/generate.py` is runnable on this kit — a runbook task is
+  establishing the exact conversion/invocation/footprint so the parity gate can
+  diff REAL reference token streams against ours instead of guessing.
+
+Baseline to beat: **10.7 tok/s** (client-measured, 512 tokens, `dsv4-gates/…-tps/`),
+against the 40-60 tok/s target. The arithmetic ties the two goals together: at
+the current 65 ms/pass with `accept p1 0%` we get 1.00 tok/pass; a healthy MTP
+acceptance (~70%, depth 5) is ~3 tok/pass → ~45 tok/s.
