@@ -8,11 +8,13 @@
 #include <format>
 #include <map>
 #include <mutex>
+#include <string_view>
 #include <cstdlib>
 #include <stdexcept>
 #include <tuple>
 
 #include "common/cuda_check.hpp"
+#include "common/log.hpp"
 #include "kernels/bf16_gemv.hpp"
 #include "kernels/mma_gemv.hpp"
 
@@ -20,6 +22,8 @@ namespace dgpp {
 
 namespace {
 constexpr size_t kRecommendedWorkspace = 64ull << 20;
+
+constexpr std::string_view gemm_out_name(GemmOut od) { return od == GemmOut::F32 ? "F32" : "BF16"; }
 
 // Full plan identity: shapes, dtypes, and activation leading dimension. The
 // old packed uint64 key had no room for the row stride, and a hash-fold risks
@@ -349,7 +353,14 @@ bool CublasLtGemm::ensure_plan(int m, int n, int k, DType io_dtype, GemmOut out_
     impl_->get_plan(m, n, k, io_dtype, out_dtype, act_row_stride, nullptr,
                     kRecommendedWorkspace);
     return true;
-  } catch (const std::exception&) {
+  } catch (const std::exception& e) {
+    // The rejection's the shape's truth (the layout's invalid's — an
+    // act_row_stride's below the k's — the heuristic's empty's, the
+    // descriptor's build's failure's): the plan's the cache's, so a
+    // re-call's a hit's, not a re-log's — the line's the rejected
+    // shape's + the cuBLASLt's reason's, once's.
+    DGPP_LOG_WARN("cublasLt ensure_plan: m={} n={} k={} io={} out={} stride={} rejected: {}",
+                  m, n, k, dtype_name(io_dtype), gemm_out_name(out_dtype), act_row_stride, e.what());
     return false;
   }
 }
