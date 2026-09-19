@@ -42,7 +42,7 @@ void Dsv4Csa2Config::validate(const Dsv4Csa2Config& c) {
 
 struct Dsv4Csa2Layer::Layout {
   size_t total = 0;
-  size_t qr, kv, q, o, oa, idx_q, q_fp8, q_scale, w, w_folded, latent, latent_main, comp_kv, comp_score, entries,
+  size_t qr, kv, q, o, oa, idx_q, q_fp8, q_scale, w, w_folded, latent, comp_kv, comp_score, entries,
        ent_pos, ik, pos, req_ids, slots, topk, counts,
        m_main, l_main, c_main, m_win, l_win, c_win,
        wlist, wcounts, ring, ring_table, pos_sel, select_ws, counter, main_block_table, violations;
@@ -86,9 +86,8 @@ Dsv4Csa2Layer::Layout Dsv4Csa2Layer::layout(const Dsv4Csa2Config& cfg, int max_t
   L.q_scale = alloc(T * cfg.index_heads * 4);
   L.w = alloc(T * cfg.index_heads * 2);
   L.w_folded = alloc(T * cfg.index_heads * 4);
-  L.latent = alloc(T * kCsa2TailW * 2);  // [T, kCsa2TailW] bf16 (the C4A's 1024's, the tail's latent_out's)
-  L.latent_main = alloc(T * kCsa2Latent * 2);  // [T, kCsa2Latent] bf16 (the publish's 512-dim latent, the C4A's overlap plane's the G-tail-pool's placeholder's)
-  L.comp_kv = alloc(T * kCsa2TailW * 4);  // [T, kCsa2TailW] fp32 (the wkv's F32 out's the tail's comp_kv's)
+  L.latent = alloc(T * kCsa2Latent * 2);  // [T, kCsa2Latent] bf16 (the C4A's + the C128A's the pooled latent_out's the 512-dim's the reference's pool's)
+  L.comp_kv = alloc(T * kCsa2TailW * 4);  // [T, kCsa2TailW] fp32 (the wkv's F32 out's the tail's comp_kv's the C4A's the full's, the C128A's the [T, 512]'s the prefix's)
   L.comp_score = alloc(T * kCsa2TailW * 4);  // [T, kCsa2TailW] fp32 (the wgate's F32 out's the tail's comp_score's)
   L.entries = alloc(T * 8);  // [T] int64 (the entry's ordinal's the tail's entries_out's)
   L.ent_pos = alloc(T * 8);  // [T] int64 (the entry's rotation position's the tail's ent_pos_out's)
@@ -191,7 +190,6 @@ Dsv4Csa2Layer::Dsv4Csa2Layer(IGemm& gemm, const Dsv4Csa2Config& cfg, int max_tok
   iw_ = reinterpret_cast<uint16_t*>(at(L.w));
   w_folded_ = reinterpret_cast<float*>(at(L.w_folded));
   latent_ = reinterpret_cast<uint16_t*>(at(L.latent));
-  latent_main_ = reinterpret_cast<uint16_t*>(at(L.latent_main));
   comp_kv_ = reinterpret_cast<float*>(at(L.comp_kv));
   comp_score_ = reinterpret_cast<float*>(at(L.comp_score));
   entries_ = reinterpret_cast<int64_t*>(at(L.entries));
@@ -250,9 +248,10 @@ void Dsv4Csa2Layer::rebind(const Dsv4Csa2LayerWeights& w, int layer) {
   if (w.ratio > 0 && w.cache_ord < 0) throw std::invalid_argument("dsv4 csa2 layer: a compressing layer needs its cache");
   if (w.ratio == 0 && (w.kv_source || w.index_source))
     throw std::invalid_argument("dsv4 csa2 layer: a SWA-only layer owns no compressor or indexer");
-  if (w.kv_source && (w.comp_wkv == nullptr || w.comp_norm == nullptr || w.idx_wk == nullptr ||
-                      w.idx_k_norm == nullptr || (w.ratio == 4 && (w.comp_wgate == nullptr || w.tail_ord < 0))))
-    throw std::invalid_argument("dsv4 csa2 layer: a kv source needs its compressor and index-key weights");
+  if (w.kv_source && (w.comp_wkv == nullptr || w.comp_wgate == nullptr || w.comp_norm == nullptr ||
+                      w.comp_ape == nullptr || w.tail_ord < 0 || w.idx_wk == nullptr ||
+                      w.idx_k_norm == nullptr))
+    throw std::invalid_argument("dsv4 csa2 layer: a kv source needs its compressor (the wkv / wgate's the gated pool's, the APE's) and index-key weights");
   if (w.index_source && (w.idx_wq_b.payload == nullptr || w.idx_wp == nullptr))
     throw std::invalid_argument("dsv4 csa2 layer: an index source needs its indexer weights");
   // The projection geometry's check against the config (the V4's 128 x
@@ -275,9 +274,11 @@ bool Dsv4Csa2Layer::prepare(int tokens) {
   csa2_prepare_kernel_smem();
   bool ok = true;
   ok &= gemm_.ensure_plan(tokens, kCsa2Latent, cfg_.hidden, DType::BF16, GemmOut::BF16, size_t(cfg_.hidden));
-  // The C4A's (ratio-4's) wkv / wgate's F32 out's (the tail's comp_kv /
-  // comp_score's, the kCsa2TailW's 1024's width's).
+  // The C4A's (ratio-4's) + the C128A's (ratio-128's) wkv / wgate's F32
+  // out's (the tail's comp_kv / comp_score's, the kCsa2TailW's 1024's
+  // width's the C4A's, the kCsa2Latent's 512's the C128A's).
   ok &= gemm_.ensure_plan(tokens, kCsa2TailW, cfg_.hidden, DType::BF16, GemmOut::F32, size_t(cfg_.hidden));
+  ok &= gemm_.ensure_plan(tokens, kCsa2Latent, cfg_.hidden, DType::BF16, GemmOut::F32, size_t(cfg_.hidden));
   ok &= gemm_.ensure_plan(tokens, kCsa2IndexDim, kCsa2Latent, DType::BF16, GemmOut::BF16, size_t(kCsa2Latent));
   ok &= gemm_.ensure_plan(tokens, cfg_.index_heads, cfg_.hidden, DType::BF16, GemmOut::BF16, size_t(cfg_.hidden));
   return ok;
@@ -346,48 +347,26 @@ void Dsv4Csa2Layer::indexer_query(const void* hidden_in, int tokens, const int64
   csa2_fold_weights(iw_, q_scale_, w_folded_, int64_t(tokens) * heads, stream);
 }
 
-// The C4A's publish's 1024 -> 512 latent row-slice (the G-tail-pool's
-// placeholder's the first kCsa2Latent's dims' the overlap plane's):
-// the cudaMemcpy2DAsync's kernels-only decode graph's replacement
-// (2026-09-20, the dsv4's graph's blocker's fix's) — the copy-engine's
-// node's the capture's rejection's source's (the 21's C4A layers' one's
-// each's the captured walk's, the 'graph variant 0 captured 21 memcpy's
-// error's), the kernel's the graph's node's. One block's a row's (the
-// tokens' the decode rows' the max_decode_rows' bound's), the 256's
-// threads' the 512's dims' two's passes'. The copy's the elements' the
-// memcpy's (bitwise the same's, the stream order's preserved's).
-__global__ void dsv4_csa2_latent_slice_kernel(const uint16_t* __restrict__ src, uint16_t* __restrict__ dst,
-                                              int src_stride, int dst_stride) {
-  const size_t s = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(src_stride);
-  const size_t d = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(dst_stride);
-  for (int i = threadIdx.x; i < kCsa2Latent; i += blockDim.x)
-    dst[d + static_cast<size_t>(i)] = src[s + static_cast<size_t>(i)];
-}
-
+// The publish's (the dsv41's publish_entries's the no-pool's re-
+// expression's): the compressor's entries' (the entries_'s the p / ratio's
+// the publish's, the ent_pos_'s the p + 1 - ratio's the reference's 372's)
+// into the model's planar main / index caches (the G-cache-format's
+// kFp4Block's main's + the planar e4m3's index's, the identity's block
+// table's the entry e at slot e's). The 512-dim's the pooled's latent's
+// (the C4A's 8-entry's x 512's + the C128A's 128-entry's x 512's the
+// reference's pool's the dsv4_compress_tail_update's latent_out's the
+// [T, kCsa2Latent]'s) is the main's / the index's latent's direct's (the
+// G-tail-pool's the 1024 -> 512's slice's placeholder's the reference's
+// pool's the 512-dim's output's the replaced's).
 void Dsv4Csa2Layer::publish_entries(void* main_cache, void* index_cache, float* index_scale,
                                     const int32_t* req_ids, int tokens, cudaStream_t stream) {
   if (tokens <= 0 || main_cache == nullptr) return;
-  const int epb = cfg_.block_tokens / w_.ratio;  // the entries per block (the spec's §1.3's epb's)
-  // The 512-dim latent for the publish (the dsv41's publish_entries's the
-  // latent_'s the [T, kCsa2Latent]'s the no-pool's re-expression's). The
-  // C4A's latent_'s the [T, kCsa2TailW]'s (the 1024's the pair-pooled's,
-  // the dsv4_compress_tail_update's latent_out's), the 512-dim's main /
-  // index's latent's the overlap plane's (the dims' 0..511's the spec's
-  // §3.3's) — the G-tail-pool's gap's placeholder's (the 1024 -> 512's
-  // reduction's undefined's, the GPU's parity's gate's settles's the plane's
-  // choice's), the dsv4_csa2_latent_slice_kernel's the first 512 dims' the
-  // latent_main_'s (the kernel's the cudaMemcpy2DAsync's replacement's,
-  // the kernels-only's decode graph's, 2026-09-20's). The C128A's
-  // latent_'s the [T, 512]'s the plain form's (the wkv's projection + the
-  // one-rounding's RMSNorm's), used direct's.
-  uint16_t* lm;
-  if (w_.ratio == 4) {
-    dsv4_csa2_latent_slice_kernel<<<tokens, 256, 0, stream>>>(latent_, latent_main_, kCsa2TailW, kCsa2Latent);
-    DGPP_CUDA_OK(cudaGetLastError());
-    lm = latent_main_;
-  } else {
-    lm = reinterpret_cast<uint16_t*>(latent_);  // the C128A's [T, 512]'s the plain form's
-  }
+  const int epb = cfg_.block_tokens / w_.ratio;  // the entries per block (the spec's §1.3's epb's the C4A's 32's the C128A's 1's)
+  // The 512-dim's the pooled's latent's (the dsv41's publish_entries's the
+  // latent_'s the [T, kCsa2Latent]'s the no-pool's re-expression's): the
+  // C4A's + the C128A's the dsv4_compress_tail_update's latent_out's the
+  // [T, kCsa2Latent]'s the reference's pool's the direct's.
+  uint16_t* lm = reinterpret_cast<uint16_t*>(latent_);
   // The index keys from the unrotated latents: wk -> RMSNorm -> the tail
   // rotated at the entry's position -> the planar form (the dsv41's
   // publish_entries's, the no-pool's identity block table's the
@@ -492,16 +471,18 @@ void Dsv4Csa2Layer::enqueue_decode(const void* hidden_in, void* main_cache, void
   //      format, the ring slot = pos % ring_slots) — the ring is read after
   //      the append, so this batch's rows are visible to its own queries.
   //   3. the window slot lists (csa2_window_slots_decode).
-  //   4. the compressor (the ratio-4's overlapping's the wkv / wgate's F32
-  //      out's + the per-request tail's update, the dsv41's
-  //      csa2_compress_decode_update's V4 re-expression on the C4A's width;
-  //      the ratio-128's plain's the wkv's projection + the one-rounding
-  //      RMSNorm's) + the publish (the dsv41's publish_entries's the no-
-  //      pool's re-expression's: the compressor's entries' into the model's
-  //      planar main / index caches' the kFp4Block's main's + the planar
-  //      e4m3's index's, the ratio-4's the C4A's, the ratio-128's the
-  //      separate item's the C128A compressor's the G-c128a-compressor's
-  //      gap's) — the latent for the window ring's append.
+  //   4. the compressor (the 0731's reference's form's, the ratio's
+  //      parameterized's: the C4A's ratio-4's coff 2's + the C128A's ratio-
+  //      128's coff 1's the G-c128a-compressor's the gated pool's) — the
+  //      wkv / wgate's F32 out's + the APE's + the per-request tail's
+  //      update (the dsv4_compress_tail_update's the reference's form's,
+  //      the per-token's state's write's the EVERY ratio-th's publish's the
+  //      (coff * ratio)-entry's x 512's pool's the C4A's window's shift's)
+  //      + the publish (the dsv41's publish_entries's the no-pool's re-
+  //      expression's: the compressor's entries' into the model's planar
+  //      main / index caches' the kFp4Block's main's + the planar e4m3's
+  //      index's, the C4A's + the C128A's the populated's) — the latent
+  //      for the window ring's append.
   //   5. the indexer's 64-head query + the v4-owned 64-head selection
   //      (dsv4_csa2_select_decode over the planar index cache) -> topk_ /
   //      counts_. The selection's numerics are certified against the CPU
@@ -518,50 +499,38 @@ void Dsv4Csa2Layer::enqueue_decode(const void* hidden_in, void* main_cache, void
                     LatentFormat::kFp8Block);
   csa2_window_slots_decode(pos, tokens, cfg_.window, cfg_.ring_slots, wlist_, wcounts_, stream);
   if (w_.ratio > 0 && w_.kv_source) {
-    if (w_.ratio == 4) {
-      // The ratio-4's overlapping compressor (coff 2 — the dsv41's
-      // ratio-2's pair pooling, the V4's one geometry swap): the wkv / wgate's
-      // pair (the F32 out's the tail's kernel's comp_kv / comp_score's, the
-      // kCsa2TailW's 1024's width's) + the per-request tail's update (the
-      // dsv41's csa2_compress_decode_update's V4 re-expression on the C4A's
-      // width — the tail's fp32 [2, kCsa2TailW]'s per-request ring, the
-      // even-stash / odd-pool's, the wgate's plane + the tail's ordinal's
-      // the model's publish's, the GPU-gate pending's completion's). The
-      // tail's plane (tails) + the W (tails_w) are the model's (the d_tails_
-      // plane's the tail's ordinal's, the tails_w_'s), the dsv41's
-      // pool.tails(w_.tail_ord)'s no-pool's re-expression's.
-      const int W = (tails_w > 0) ? tails_w : kCsa2TailW;  // the C4A's W (the model's tails_w_'s)
-      gemm_.matmul(hidden_in, w_.comp_wkv, comp_kv_, tokens, W, cfg_.hidden, DType::BF16, GemmOut::F32,
-                   size_t(cfg_.hidden), gemm_ws_, gemm_ws_bytes_, stream);
-      gemm_.matmul(hidden_in, w_.comp_wgate, comp_score_, tokens, W, cfg_.hidden, DType::BF16, GemmOut::F32,
-                   size_t(cfg_.hidden), gemm_ws_, gemm_ws_bytes_, stream);
-      dsv4_compress_tail_update(comp_kv_, comp_score_, req_ids, pos, req_spans, num_requests, w_.comp_norm,
-                                cfg_.eps, tails, latent_, entries_, ent_pos_, tokens, W, w_.ratio, tail_snapshots,
-                                stream);
-      // The publish (the dsv41's publish_entries's the no-pool's re-
-      // expression's): the compressor's entries' (the entries_'s the p / 2's
-      // the odd's, the ent_pos_'s the (p / 2) * ratio's) into the model's
-      // planar main / index caches (the G-cache-format's kFp4Block's main's
-      // + the planar e4m3's index's + the fp32 row-scale's, the identity's
-      // block table's the entry e at slot e's). The model's allocation's
-      // the d_tails_'s the tail's plane's the dsv41's pool.tails(w_.
-      // tail_ord)'s no-pool's re-expression's sibling's. The C128A's
-      // publish's the separate item's (the C128A compressor's the
-      // entries_'s the G-c128a-compressor's gap's the unpopulated's).
-      if (main_cache != nullptr)
-        publish_entries(main_cache, index_cache, index_scale, req_ids, tokens, stream);
-    } else {
-      // The ratio-128's plain compressor (coff 1 — the dsv41's ratio-1's
-      // projection + norm): the wkv's projection + the one-rounding
-      // RMSNorm. The entries_'s / the ent_pos_'s the C128A compressor's
-      // the separate item's (the G-c128a-compressor's gap's), so the
-      // publish's the unpopulated's (the main cache's the model's
-      // allocation's the zero's the cold start's, the main source's the
-      // no-op's the counts_'s 0's).
-      gemm_.matmul(hidden_in, w_.comp_wkv, latent_, tokens, kCsa2Latent, cfg_.hidden, DType::BF16, GemmOut::BF16,
-                   size_t(cfg_.hidden), gemm_ws_, gemm_ws_bytes_, stream);
-      csa2_rmsnorm_bf16(latent_, kCsa2Latent, w_.comp_norm, latent_, kCsa2Latent, tokens, kCsa2Latent, cfg_.eps, stream);
-    }
+    // The reference's compressor (the 0731's Compressor's the ratio's
+    // parameterized's, the C4A's ratio-4's coff 2's + the C128A's ratio-128's
+    // coff 1's the G-c128a-compressor's the gated pool's the closed's): the
+    // wkv / wgate's pair (the F32 out's the tail's comp_kv / comp_score's,
+    // the W's the C4A's kCsa2TailW's 1024's the C128A's kCsa2Latent's 512's)
+    // + the per-request tail's update (the dsv4_compress_tail_update's the
+    // reference's form's the APE's on the score's half's the per-token's
+    // state's write's the EVERY ratio-th's publish's the (coff * ratio)-
+    // entry's x 512's pool's the C4A's window's shift's the GPU-gate's
+    // pending's completion's). The tail's plane (tails) + the W (tails_w)
+    // are the model's (the d_tails_'s the tail's ordinal's plane's, the
+    // per-ordinal's tails_w_'s), the dsv41's pool.tails(w_.tail_ord)'s
+    // no-pool's re-expression's.
+    if (tails == nullptr) throw std::invalid_argument("dsv4 csa2 layer: a compressing layer needs the model's tails");
+    const int coff = (w_.ratio == 4) ? 2 : 1;  // the reference's the 1 + (ratio == 4)'s
+    const int W = (tails_w > 0) ? tails_w : coff * kCsa2Latent;  // the C4A's 1024's the C128A's 512's (the model's tails_w_'s)
+    gemm_.matmul(hidden_in, w_.comp_wkv, comp_kv_, tokens, W, cfg_.hidden, DType::BF16, GemmOut::F32,
+                 size_t(cfg_.hidden), gemm_ws_, gemm_ws_bytes_, stream);
+    gemm_.matmul(hidden_in, w_.comp_wgate, comp_score_, tokens, W, cfg_.hidden, DType::BF16, GemmOut::F32,
+                 size_t(cfg_.hidden), gemm_ws_, gemm_ws_bytes_, stream);
+    dsv4_compress_tail_update(comp_kv_, comp_score_, w_.comp_ape, req_ids, pos, req_spans, num_requests,
+                              w_.comp_norm, cfg_.eps, tails, latent_, entries_, ent_pos_, tokens, w_.ratio, coff,
+                              tail_snapshots, stream);
+    // The publish (the dsv41's publish_entries's the no-pool's re-
+    // expression's): the compressor's entries' (the entries_'s the p /
+    // ratio's the publish's, the ent_pos_'s the p + 1 - ratio's) into the
+    // model's planar main / index caches (the G-cache-format's kFp4Block's
+    // main's + the planar e4m3's index's + the fp32 row-scale's, the
+    // identity's block table's the entry e at slot e's). The C128A's
+    // publish's the main's only's (the index_source's false's the no-
+    // index's, the index's append's skipped's the C4A's the both's).
+    if (main_cache != nullptr) publish_entries(main_cache, index_cache, index_scale, req_ids, tokens, stream);
   }
   if (w_.index_source) {
     if (index_cache == nullptr || index_scale == nullptr)

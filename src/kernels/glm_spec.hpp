@@ -31,7 +31,7 @@ struct GlmSpecSegment {
   size_t bytes = 0;
 };
 
-constexpr int kSpecMaxSegments = 32;  // KDA rec + KDA conv + DSA layers
+constexpr int kSpecMaxSegments = 64;  // KDA rec + KDA conv + DSA layers (the dsv4's 41's compressor tails' the C4A's 21's + the C128A's 20's the 2026-09-21's the reference's form's)
 
 struct GlmSpecSegments {
   int count = 0;

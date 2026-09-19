@@ -1342,3 +1342,74 @@ s (the `act_quant(..., inplace=True)`'s the ck:model.py:378's, the
 `kv_cache`'s buffer's) — neither's format's. Unresolved: the wiring'
 s decision's (the GPU-gate's) — the doc's records's both's formats'
 s so's the decision's is informed's.
+
+## 6. Resolution's (the 2026-09-21's the 0731's reference's form's the
+## `compressor`'s the closed's the `dsv4_compress_tail_update`'s the
+## `dsv4_compress_tail_init`'s the `csa2_layer`'s the `model.cpp`'s the
+## `compress.hpp`'s the `compress.cu`'s the `csa2_layer.hpp`'s the
+## `csa2_layer.cu`'s the `model.hpp`'s the `compress_tail_test`'s the
+## `csa2_oracle_test`'s the `model_state_test`'s)
+
+The §5's gaps 1, 3, 4, 5 (the `G-tail-cadence`'s, the `G-tail-pool`'s, the
+`G-tail-ape`'s, the `G-c128a-compressor`'s) are CLOSED's: the C++'s now
+implements' the reference's `Compressor`'s (the ck:model.py:285-400's)
+per-request' tail' update' (the `dsv4_compress_tail_update`'s the
+`dsv4_compress_tail_init`'s the `src/models/dsv4/compress.cu`'s the
+`src/models/dsv4/compress.hpp`'s):
+
+- **G-tail-cadence** (the closed's): the publish's the EVERY ratio-th
+  token's (the `(p + 1) % ratio == 0`'s the ck:model.py:350's) — the C4A's
+  (ratio 4's) every 4th's, the C128A's (ratio 128's) every 128th's (the
+  2-token's / the 8-token's the 2026-09-21's the G-tail-cadence's
+  closed's).
+- **G-tail-pool** (the closed's): the C4A's tail's the 8-entry's × 512's
+  (the 2 overlapping's windows' the ck:model.py:356-358's the
+  `torch.cat`'s the plane-split's the 2026-09-21's the `pair_pool`'s the
+  2-entry's × W's pair's the G-tail-pool's closed's) + the C128A's (the
+  G-c128a-compressor's the closed's) the 128-entry's × 512's the
+  128-token's ring's (the ck:model.py:362-365's the plain's branch's the
+  2026-09-21's the per-token's plain's the G-c128a-compressor's
+  closed's).
+- **G-tail-ape** (the closed's): the APE's the `ape[p % ratio]`'s the
+  score's half's only's (the ck:model.py:351's the decode's) — the
+  `dsv4_compress_tail_update`'s the `ape`'s parameter's the caller's
+  host's the GEMM's epilogue's NOT's the kernel's the `csa2_layer`'s the
+  `comp_ape`'s the `csa2_view`'s the `model.cpp`'s the
+  `compress.hpp`'s the `compress.cu`'s the `csa2_layer.hpp`'s the
+  `csa2_layer.cu`'s the `model.hpp`'s the `compress_tail_test`'s the
+  `csa2_oracle_test`'s the `model_state_test`'s the G-tail-ape's
+  closed's.
+- **G-c128a-compressor** (the closed's): the C128A layers (the 20 of 46's
+  the `ratio == 128`'s) the SAME reference's gated pool's (the `wkv` +
+  the `wgate`'s the APE's the 128-entry's × 512's pool's the
+  `score_state`'s the `-inf`'s init's the ck:model.py:309-310's the
+  2026-09-21's the per-token's plain's `latent_main`'s + the RMSNorm's
+  the G-c128a-compressor's closed's).
+
+The state's init's the reference's (the `kv_state`'s zero's + the
+`score_state`'s the `-inf`'s the ck:model.py:309-310's the cold start's
+the publish's the 0's weight's the `-inf`'s rows's) — the
+`dsv4_compress_tail_init`'s the `csa2_layer`'s the `model.cpp`'s the
+`compress.hpp`'s the `compress.cu`'s the `csa2_layer.hpp`'s the
+`csa2_layer.cu`'s the `model.hpp`'s the `compress_tail_test`'s the
+`csa2_oracle_test`'s the `model_state_test`'s. The per-request's state's
+the fp32's `[2][coff * ratio][coff * 512]`'s (the C4A's 8 × 1024's the
+C128A's 128 × 512's the checkpoint's `kv_state` / `score_state`'s the
+`(b, coff * ratio, coff * head_dim)`'s) — the `d_tails`'s the
+`spec_tails`'s the `write_state_snapshot`'s the `read_state_snapshot`'s
+the `session_snapshot_bytes`'s the `snapshot_state_bytes`'s the
+`spec_segments`'s the `model.cpp`'s the `model.hpp`'s the
+`kSpecMaxSegments`'s the 64's the 32's the raised's the 41's the tail's
+families' the 32's the exceeded's (the `src/kernels/glm_spec.hpp`'s the
+shared's seam's the capacity-only's). The C4A's window's shift's (the
+ck:model.py:366-367's) the `dsv4_compress_tail_update`'s the
+`compress.cu`'s. The entry's ordinal's the `p / ratio`'s + the rotation's
+position's the `p + 1 - ratio`'s (the ck:model.py:372,379's) the
+`csa2_entry_positions`'s the `csa2_layer.cu`'s the causal's bound's the
+`(pos + 1) / ratio - 1`'s the consistent's.
+
+The GPU parity's gate's (the `G3`'s) still PENDING's: the kernel's
+numerics' (the fp32's interior's the one-rounding's bf16's) is
+oracle-qualified's on' CPU's (the `dsv4_compress_tail_test`'s the
+`dsv4_csa2_oracle_test`'s the `dsv4_model_state_test`'s) — the GPU's
+run's the parity's the `G3`'s the pending's.

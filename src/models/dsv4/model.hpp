@@ -281,19 +281,29 @@ class Dsv4Model : public SessionModel<Dsv4Model> {
   float* inv_freq_window_ = nullptr;      // device [32]
   float* inv_freq_compressed_ = nullptr;  // device [32]
   std::vector<int> cache_ord_;            // per layer (-1: window only)
-  std::vector<int> tail_ord_;             // per ratio-4 kv source (-1: none)
+  std::vector<int> tail_ord_;             // per compressing layer (-1: none, the C4A's + the C128A's the reference's state's)
   std::vector<int> cache_ratio_;           // per cache ordinal, the compress ratio (4 C4A / 128 C128A)
   int tails_ = 0;
-  // The ratio-4 (C4A) overlapping compressor's per-request tails (2026-09-18,
-  // the dsv4 dspark + compressor wiring; docs/dsv4_kernel_port_spec.md §2.1(b)):
-  // fp32 [tails_][max_requests][2][tails_w_] (tails_w_ = kCsa2TailW = 1024,
-  // the C4A's coff x kCsa2Latent's — the pending even's kv (the first W) + the
-  // score (the second W), the dsv41 csa2_compress_decode_update's re-expression
-  // on the C4A's width). The spec rows'
-  // tails (the rollback's the table's the spec_rows_').
+  // The 0731's Compressor's per-request tails (the 2026-09-18's dsv4 dspark
+  // + compressor wiring's the 2026-09-21's the reference's form's, the
+  // G-c128a-compressor's + the G-tail-cadence / G-tail-pool / G-tail-ape's
+  // the closed's; docs/dsv4_attention_spec.md §5): per compressing layer
+  // (the C4A's + the C128A's), the checkpoint's kv_state / score_state's
+  // (b, coff * ratio, coff * head_dim)'s the fp32's (the kv's plane's the
+  // zero's + the score's the -inf's the reference's 309-310's), the C4A's
+  // (ratio 4's coff 2's) the 8 x 1024's (the 2 overlapping's windows' 4
+  // tokens' the wkv / wgate's 1024-wide's) + the C128A's (ratio 128's
+  // coff 1's) the 128 x 512's the 128-token's ring's. The per-ordinal's
+  // tail_ratio_'s the ratio's (the geometry's the coff's the 1 + (ratio ==
+  // 4)'s), the tail_off_'s / the spec_off_'s the per-ordinal's float's
+  // offset's (the max_requests's / the max_decode_rows_'s the stride's).
+  // The spec rows' tails (the rollback's the table's the spec_rows_'s)
+  // ride the pending's verify's call site's.
+  std::vector<int> tail_ratio_;  // per tail ordinal: the ratio (4 C4A / 128 C128A)
+  std::vector<size_t> tail_off_;  // per tail ordinal: the float's offset's into d_tails_'s (the max_requests's the per-ordinal's)
+  std::vector<size_t> spec_off_;  // per tail ordinal: the float's offset's into spec_tails_'s (the max_decode_rows_'s the per-ordinal's)
   float* d_tails_ = nullptr;
   float* spec_tails_ = nullptr;
-  int tails_w_ = kCsa2TailW;  // the W's (the C4A's compressor's output width's, the 1024's)
   // The planar main + index caches (2026-09-19, the dsv4 seam S1b: the no-pool
   // positional state, the dsv41 Csa2StatePool's planes' raw-pointer re-
   // expression): per cache ordinal (kv source), the kFp4Block main cache

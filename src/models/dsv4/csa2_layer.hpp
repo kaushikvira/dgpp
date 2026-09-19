@@ -81,12 +81,13 @@ struct Dsv4Csa2LayerWeights {
   const uint16_t* idx_wk = nullptr;  // the kv sources
   const uint16_t* idx_k_norm = nullptr;
   const uint16_t* comp_wkv = nullptr;  // the kv sources (bf16 [W, hidden])
-  const uint16_t* comp_wgate = nullptr;  // the ratio-4 (C4A) overlapping
+  const uint16_t* comp_wgate = nullptr;  // the kv sources (the gated pool's, the C4A's + the C128A's)
   const uint16_t* comp_norm = nullptr;
+  const float* comp_ape = nullptr;  // the kv sources (f32 [ratio, W], the APE's the score's half's)
   const float* inv_freq = nullptr;  // device [64]: the layer's rotary table
   int ratio = 0;  // 0: SWA-only, 4: C4A (the indexer), 128: C128A
   int cache_ord = -1;
-  int tail_ord = -1;  // the compressor tail (a ratio-4 kv source)
+  int tail_ord = -1;  // the compressor tail (a ratio > 0 kv source, the C4A's + the C128A's)
   bool kv_source = false;
   bool index_source = false;
 };
@@ -158,21 +159,27 @@ class Dsv4Csa2Layer {
   //
   // The compressor's per-request tail (the ratio-4's overlapping's, the
   // model's d_tails_'s the tail's ordinal's plane's the model's state's):
-  //   tails    the per-request tail's base (fp32 [max_requests][2][W], the
-  //                model's d_tails_'s the tail's ordinal's plane's, the
+  //   tails    the per-request tail's base (fp32 [max_requests][2][coff *
+  //                ratio][W] — the C4A's 8 x 1024's the 2 overlapping's
+  //                windows' the C128A's 128 x 512's the 128-token's ring's,
+  //                the model's d_tails_'s the tail's ordinal's plane's, the
   //                dsv41's pool.tails(w_.tail_ord)'s the no-pool's
   //                re-expression's); null: the tail's update's skipped (the
-  //                ratio-4's layers' the model's always's passes it's, the
-  //                ratio-0 / ratio-128's pass null's).
+  //                ratio-0's layers' pass null's, the model's always's
+  //                passes it's for the ratio > 0's).
   //   tails_w  the W's (the compressor's output width's, the C4A's
-  //                kCsa2TailW's 1024's, the model's tails_w_'s); 0: the
-  //                tail's update's skipped (the ratio-4's layers' the
-  //                model's always's passes kCsa2TailW's).
-  // The tail's update (the dsv4_compress_tail_update's) runs on the ratio-4's
-  // branch (the wkv / wgate's F32 out's + the tail's even-stash / odd-pool's),
-  // using the layer's own w_.comp_norm / cfg_.eps / w_.ratio (the dsv41's
-  // contract's — the layer's the rebound's the values's) + the caller's tails /
-  // tails_w (the model's state's).
+  //                kCsa2TailW's 1024's the C128A's kCsa2Latent's 512's, the
+  //                model's per-ordinal's tails_w_'s); 0: the tail's update's
+  //                skipped (the ratio > 0's layers' the model's always's
+  //                passes it's).
+  // The tail's update (the dsv4_compress_tail_update's) runs on every ratio
+  // > 0's branch (the C4A's ratio-4's the C128A's ratio-128's — the wkv /
+  // wgate's F32 out's + the APE's + the per-token's state's write's the
+  // EVERY ratio-th's publish's the (coff * ratio)-entry's x 512's pool's
+  // the C4A's window's shift's), using the layer's own w_.comp_norm /
+  // w_.comp_ape / cfg_.eps / w_.ratio (the reference's contract's — the
+  // layer's the rebound's the values's) + the caller's tails / tails_w (the
+  // model's state's).
   void enqueue_decode(const void* hidden_in, void* main_cache, void* index_cache, float* index_scale,
                       const int32_t* req_ids, const int64_t* pos, const int32_t* req_spans,
                       int num_requests, int tokens, void* out, cudaStream_t stream,
@@ -239,12 +246,10 @@ class Dsv4Csa2Layer {
   // The grouped wo_a / wo_b (the block-diagonal over the groups).
   void project_out(int tokens, void* out, cudaStream_t stream);
   // The publish (the dsv41 Csa2Layer::publish_entries's the no-pool's
-  // re-expression): the compressor's `latent_` (the ratio-4's the C4A's
-  // kCsa2TailW's 1024's pair-pooled's, the 512-dim's the main / index's
-  // latent's the overlap plane's the dims' 0..511's the G-tail-pool's gap's
-  // placeholder's the cudaMemcpy2DAsync's the first 512 dims' the
-  // latent_main_'s; the ratio-128's the plain's [T, 512]'s the latent_'s
-  // direct's) into the model's planar main / index caches (the kFp4Block
+  // re-expression): the compressor's `latent_` (the C4A's 8-entry's x 512's
+  // + the C128A's 128-entry's x 512's the reference's pool's the dsv4_
+  // compress_tail_update's latent_out's the [T, kCsa2Latent]'s) into the
+  // model's planar main / index caches (the kFp4Block
   // main's + the planar e4m3's index's + the fp32 row-scale's, the
   // identity block table's the main_block_table_'s the entry e at slot e's).
   // The index keys (the index_source's the C4A's the idx_wk's the 128-wide's
@@ -281,12 +286,11 @@ class Dsv4Csa2Layer {
   float* q_scale_ = nullptr;   // [T * 64]
   uint16_t* iw_ = nullptr;     // [T, 64] the indexer's weights
   float* w_folded_ = nullptr;  // [T * 64]
-  uint16_t* latent_ = nullptr; // [T, kCsa2TailW] the compressor's latent (the C4A's 1024's)
-  uint16_t* latent_main_ = nullptr;  // [T, kCsa2Latent] the publish's 512-dim latent (the C4A's overlap plane's the G-tail-pool's placeholder's, the C128A's the latent_'s direct's)
-  float* comp_kv_ = nullptr;   // [T, kCsa2TailW] fp32 the wkv's F32 out (the C4A's tail's comp_kv's)
-  float* comp_score_ = nullptr;  // [T, kCsa2TailW] fp32 the wgate's F32 out (the C4A's tail's comp_score's)
-  int64_t* entries_ = nullptr;   // [T] the entry's ordinal's (p / 2 on the odd's, -1 otherwise)
-  int64_t* ent_pos_ = nullptr;    // [T] the entry's rotation position's (entries * ratio)
+  uint16_t* latent_ = nullptr;  // [T, kCsa2Latent] the compressor's pooled latent (the C4A's 8-entry's + the C128A's 128-entry's x 512's the reference's pool's)
+  float* comp_kv_ = nullptr;  // [T, kCsa2TailW] fp32 the wkv's F32 out (the C4A's the full's 1024's, the C128A's the [T, 512]'s the prefix's)
+  float* comp_score_ = nullptr;  // [T, kCsa2TailW] fp32 the wgate's F32 out (the C4A's the full's 1024's, the C128A's the [T, 512]'s the prefix's)
+  int64_t* entries_ = nullptr;  // [T] the entry's ordinal's (p / ratio on the publish's, -1 otherwise)
+  int64_t* ent_pos_ = nullptr;  // [T] the entry's rotation position's (p + 1 - ratio)
   uint16_t* ik_ = nullptr;     // [T, 128]
   int64_t* pos_ = nullptr;     // [T]
   int32_t* req_ids_ = nullptr; // [T]
