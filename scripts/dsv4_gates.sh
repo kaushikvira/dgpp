@@ -27,7 +27,10 @@
 #       the sanitizer found errors, tps is under target)
 #   2 = a designed SKIP: a precondition is not met (the GPU is not quiet,
 #       the live lane is up, the build or the checkpoint is missing, no torch
-#       env) — the message says what to do, and nothing was run
+#       env, the direct shape has no resident image so the loader is
+#       streaming, the fabric config's shape does not match the resident
+#       images, the fabric binary is missing) — the message says what to do,
+#       and nothing was run
 #
 # Every subcommand is dry-runnable without a GPU: precondition checks exit 2
 # with the designed message, they never crash. `status` is pure read-only.
@@ -47,8 +50,21 @@
 #   DSV4_SMOKE_WORLD          direct-mode --world (default: 1)
 #   DSV4_SMOKE_MAX_TOKENS     smoke prompt's max_tokens (default: 64)
 #   DSV4_SMOKE_EXTRA_KNOBS    extra dgpp-serve flags (e.g. "--temperature 0")
-#   DSV4_FABRIC_CONFIG        fabric-mode deployment (default: the repo's
-#                             deploy/cluster_deepseek-v4-flash_fp4_w2.example.json)
+#   DSV4_FABRIC_CONFIG        fabric-mode deployment (default: the site's w2
+#                             dsv4 deployment /home/kv/work/q-dgx-gateway/config/
+#                             dgpp-dsv4-w2.json when present — world 2 / kv 262144 /
+#                             max_concurrency 2, mtp 1 (or off — the mtp flag does
+#                             not enter the image's key) — the shape the resident
+#                             images were captured for — else the repo's
+#                             deploy/cluster_deepseek-v4-flash_fp4_w2.example.json;
+#                             a config whose shape does not match the resident
+#                             images is a designed SKIP, with the reason)
+#   DSV4_FABRIC_BIN           the dgpp-serve binary fabric mode launches
+#                             (default: $DGPP_BUILD_DIR/dgpp-serve — the repo's own
+#                             build, the same dir build_has checks; passed to
+#                             dgpp-cluster as --bin, so the site's DGPP_RELEASE pin
+#                             — a master build with no dsv4 model code — is never
+#                             launched)
 #   DGPP_ENV_FILE             site file for fabric mode
 #   DSV4_TPS_TOKENS           sustained-decode length N (default: 512)
 #   DSV4_TPS_TARGET_MIN/MAX   the target band (default: 40 / 60)
@@ -81,7 +97,21 @@ SMOKE_KV="${DSV4_SMOKE_KV_CAPACITY:-8192}"
 SMOKE_WORLD="${DSV4_SMOKE_WORLD:-1}"
 SMOKE_MAX_TOKENS="${DSV4_SMOKE_MAX_TOKENS:-64}"
 SMOKE_EXTRA_KNOBS="${DSV4_SMOKE_EXTRA_KNOBS:---temperature 0}"
-FABRIC_CONFIG="${DSV4_FABRIC_CONFIG:-$ROOT/deploy/cluster_deepseek-v4-flash_fp4_w2.example.json}"
+# The fabric deployment's default: the site's w2 dsv4 shape (world 2, kv
+# 262144, max_concurrency 2, mtp 1 or off — the deployment the resident
+# images in ~/.cache/dgpp/resident/ were captured for; the 83 GB
+# 5c67fe8d85a3cf87.img is that image), falling back to the repo's example
+# when the site file is absent. fabric_shape_ok() refuses a config whose
+# shape does not match the images (designed SKIP, exit 2).
+SITE_FABRIC_CONFIG="/home/kv/work/q-dgx-gateway/config/dgpp-dsv4-w2.json"
+if [ -z "${DSV4_FABRIC_CONFIG:-}" ] && [ -f "$SITE_FABRIC_CONFIG" ]; then
+  FABRIC_CONFIG="$SITE_FABRIC_CONFIG"
+else
+  FABRIC_CONFIG="${DSV4_FABRIC_CONFIG:-$ROOT/deploy/cluster_deepseek-v4-flash_fp4_w2.example.json}"
+fi
+# The fabric mode's binary: explicit, so dgpp-cluster never falls back to the
+# site's DGPP_RELEASE pin (a master build that has no dsv4 model code at all).
+FABRIC_BIN="${DSV4_FABRIC_BIN:-$BUILD/dgpp-serve}"
 TPS_TOKENS="${DSV4_TPS_TOKENS:-512}"
 TPS_MIN="${DSV4_TPS_TARGET_MIN:-40}"
 TPS_MAX="${DSV4_TPS_TARGET_MAX:-60}"
@@ -208,6 +238,38 @@ checkpoint_ok() {
   return 0
 }
 
+# The fabric config's shape must be the deployment the resident images were
+# captured for (world 2 / kv 262144 / max_concurrency 2, mtp 1 or off — the
+# per-rank tensor set the on-disk image holds; the mtp flag does not enter
+# the image's key, so the mtp-1 and nomtp variants share the image, cf. the
+# image-key comment above serve_log_streaming). A different shape's first
+# run would have to capture a new image — a full checkpoint build, far
+# longer than the gate window — so the gate refuses the mismatch (designed
+# SKIP) with the reason, instead of launching a world that cannot come up
+# in time.
+fabric_shape_ok() {
+  [ -f "$FABRIC_CONFIG" ] || { log "fabric config $FABRIC_CONFIG is missing"; return 1; }
+  local shape w kv mc mtp md
+  shape=$(python3 - "$FABRIC_CONFIG" <<'PYSHAPE'
+import json, sys
+d = json.load(open(sys.argv[1]))
+e = d.get("engine", {})
+print("%s %s %s %s %s" % (d.get("world_size"), e.get("kv_capacity"), e.get("max_concurrency"), e.get("mtp"), e.get("mtp_depth")))
+PYSHAPE
+) || { log "cannot read the shape out of $FABRIC_CONFIG (is it a deployment JSON?)"; return 1; }
+  read -r w kv mc mtp md <<< "$shape"
+  # The image's key (resident_image_key()) does not include mtp: the w2
+  # dsv4 shape's mtp-1 and nomtp variants share the same resident image
+  # (only which layers a run captures differs — a run captures whatever is
+  # missing). Both variants match the image.
+  if [ "$w" = "2" ] && [ "$kv" = "262144" ] && [ "$mc" = "2" ] && { [ "$mtp" = "True" ] && [ "$md" = "1" ] || [ "$mtp" = "False" ]; }; then
+    return 0
+  fi
+  log "fabric config $FABRIC_CONFIG is world $w / kv $kv / max_concurrency $mc / mtp $mtp (depth $md) — the resident images in ${DGPP_RESIDENT_CACHE_DIR:-$HOME/.cache/dgpp/resident} were captured for the w2 dsv4 shape (world 2 / kv 262144 / max_concurrency 2, mtp 1 or off)"
+  log "  -> point DSV4_FABRIC_CONFIG at the w2 dsv4 deployment (the site's $SITE_FABRIC_CONFIG when present), or capture an image for this shape first"
+  return 1
+}
+
 find_compute_sanitizer() {
   local c
   command -v compute-sanitizer >/dev/null 2>&1 && { command -v compute-sanitizer; return 0; }
@@ -253,6 +315,38 @@ probe_torch_env() {
 # the engine launch (direct | fabric)
 # ---------------------------------------------------------------------------
 
+# The streaming-fallback guard. dgpp-serve's world-1 boot is the "local
+# reference" path: it never uses the resident image, so it prints
+# "model constructed in Xs (streaming, …)" and every forward pass re-reads
+# the layer weights off disk (streaming residency reuses one layer
+# allocation, rebuilt per pass — src/loaders/resident_stream.hpp). A single
+# prefill then outlasts the whole gate window: the request hangs to the
+# curl timeout and the gate reports HTTP 000 — a FAIL that says nothing
+# about dsv4's correctness. When the marker is in the serve log the case is
+# a designed SKIP (exit 2), not a hang.
+#
+# Which shape the resident images correspond to: the images in the default
+# dir ~/.cache/dgpp/resident/ (DGPP_RESIDENT_CACHE_DIR) are keyed by the
+# shape — format version, loader format, world, rank, head sharding, the
+# checkpoint's config + shard headers (resident_image_key(),
+# src/loaders/resident_stream.hpp). The on-disk 83 GB 5c67fe8d85a3cf87.img
+# is the world-2 / kv-262144 deployment shape (the site's
+# dgpp-dsv4-w2.json: world 2, kv 262144, max_concurrency 2, mtp 1 — or its
+# nomtp variant; the mtp flag does not enter the image's key).
+#
+# How a new shape's image gets captured: the loader captures it on a run.
+# In RESIDENT mode (the world-2 fabric boot) the image file is opened
+# O_CREAT — created fresh, or "header mismatch … replacing" when the key
+# changed (src/loaders/resident_image.cpp) — and every layer the image does
+# not hold is built from the checkpoint and captured into the image
+# durably (fdatasync'd) before its entry is published (load_layer →
+# capture_layer_to_image → write_layer, src/loaders/resident_stream.hpp).
+# The first run of a shape is a full checkpoint build + capture (slow);
+# later runs restore from the image. The w1 streaming path never captures.
+serve_log_streaming() {  # serve_log_streaming LOGFILE -> 0 when the marker is present
+  grep 'model constructed in' "$1" 2>/dev/null | grep -q '(streaming,'
+}
+
 # launch_serve MODE PORT KNOBS LOGFILE -> prints the serve pid (direct) or
 # "fabric" (fabric mode; readiness and teardown go through dgpp-cluster).
 launch_serve() {
@@ -267,8 +361,11 @@ launch_serve() {
       ;;
     fabric)
       export DGPP_ENV_FILE="${DGPP_ENV_FILE:-/home/kv/work/q-dgx-gateway/.env.dgpp}"
-      log "launching fabric world: dgpp-cluster up --config $FABRIC_CONFIG (env: $DGPP_ENV_FILE)"
-      python3 "$ROOT/scripts/dgpp-cluster" up --config "$FABRIC_CONFIG" >> "$logfile" 2>&1 \
+      # --bin is explicit: without it dgpp-cluster falls back to the site's
+      # DGPP_RELEASE pin — a master build with no dsv4 model code. Default:
+      # the repo's own build (DSV4_FABRIC_BIN overrides).
+      log "launching fabric world: dgpp-cluster up --bin $FABRIC_BIN --config $FABRIC_CONFIG (env: $DGPP_ENV_FILE)"
+      python3 "$ROOT/scripts/dgpp-cluster" up --bin "$FABRIC_BIN" --config "$FABRIC_CONFIG" >> "$logfile" 2>&1 \
         || { log "dgpp-cluster up failed — see $logfile"; return 1; }
       SERVE_PID="fabric"
       ;;
@@ -373,7 +470,8 @@ gate_smoke() {
     maybe_build_targets dgpp-serve || true
     build_has dgpp-serve || skip_gate smoke "dgpp-serve is not built (cmake --build --preset $PRESET --target dgpp_serve_app -j, or scripts/ci-local.sh)"
   else
-    [ -f "$FABRIC_CONFIG" ] || skip_gate smoke "fabric config $FABRIC_CONFIG is missing"
+    fabric_shape_ok || skip_gate smoke "the fabric config's shape does not match the resident images — point DSV4_FABRIC_CONFIG at the w2 dsv4 deployment (world 2 / kv 262144 / max_concurrency 2, mtp 1 or off), or capture an image for this shape first"
+    [ -x "$FABRIC_BIN" ] || skip_gate smoke "the fabric binary $FABRIC_BIN is missing (DSV4_FABRIC_BIN; default the repo's build — cmake --build --preset $PRESET --target dgpp_serve_app -j, or scripts/ci-local.sh)"
   fi
 
   local host port
@@ -384,6 +482,14 @@ gate_smoke() {
     gate_result smoke FAIL "engine launch failed"; exit 1; }
   local rc=0
   wait_ready "http://$host:$port" "$READY_TIMEOUT" "$logfile" || rc=$?
+  if [ "$SMOKE_MODE" = "direct" ] && serve_log_streaming "$logfile"; then
+    # The streaming-fallback guard: this direct shape has no resident image,
+    # so the loader is streaming and a single prefill will not finish — a
+    # designed SKIP, not a request that hangs to the curl timeout (HTTP 000).
+    stop_serve
+    gate_result smoke SKIP "this shape (w$SMOKE_WORLD, kv $SMOKE_KV) has no resident image; the loader is streaming (marker in $logfile) and a single prefill will not finish — use DSV4_SMOKE_MODE=fabric with the world-2 shape, or capture an image for this shape first (a resident-mode run captures the missing layers)"
+    exit 2
+  fi
   if [ "$rc" -ne 0 ]; then
     stop_serve
     if [ "$rc" -eq 1 ]; then
@@ -553,7 +659,8 @@ gate_tps() {
     maybe_build_targets dgpp-serve || true
     build_has dgpp-serve || skip_gate tps "dgpp-serve is not built"
   else
-    [ -f "$FABRIC_CONFIG" ] || skip_gate tps "fabric config $FABRIC_CONFIG is missing"
+    fabric_shape_ok || skip_gate tps "the fabric config's shape does not match the resident images — point DSV4_FABRIC_CONFIG at the w2 dsv4 deployment (world 2 / kv 262144 / max_concurrency 2, mtp 1 or off), or capture an image for this shape first"
+    [ -x "$FABRIC_BIN" ] || skip_gate tps "the fabric binary $FABRIC_BIN is missing (DSV4_FABRIC_BIN; default the repo's build — cmake --build --preset $PRESET --target dgpp_serve_app -j, or scripts/ci-local.sh)"
   fi
 
   local host port
@@ -564,6 +671,13 @@ gate_tps() {
     gate_result tps FAIL "engine launch failed"; exit 1; }
   local rc=0
   wait_ready "http://$host:$port" "$READY_TIMEOUT" "$logfile" || rc=$?
+  if [ "$SMOKE_MODE" = "direct" ] && serve_log_streaming "$logfile"; then
+    # The streaming-fallback guard (cf. gate_smoke): designed SKIP, not a
+    # request that hangs to the curl timeout.
+    stop_serve
+    gate_result tps SKIP "this shape (w$SMOKE_WORLD, kv $SMOKE_KV) has no resident image; the loader is streaming (marker in $logfile) and a single prefill will not finish — use DSV4_SMOKE_MODE=fabric with the world-2 shape, or capture an image for this shape first (a resident-mode run captures the missing layers)"
+    exit 2
+  fi
   if [ "$rc" -ne 0 ]; then
     stop_serve
     if [ "$rc" -eq 1 ] && [ "$SMOKE_MODE" = "direct" ] && [ "$SMOKE_WORLD" -eq 1 ]; then
@@ -721,7 +835,8 @@ gate_reference() {
     maybe_build_targets dgpp-serve || true
     build_has dgpp-serve || skip_gate reference "dgpp-serve is not built"
   else
-    [ -f "$FABRIC_CONFIG" ] || skip_gate reference "fabric config $FABRIC_CONFIG is missing"
+    fabric_shape_ok || skip_gate reference "the fabric config's shape does not match the resident images — point DSV4_FABRIC_CONFIG at the w2 dsv4 deployment (world 2 / kv 262144 / max_concurrency 2, mtp 1 or off), or capture an image for this shape first"
+    [ -x "$FABRIC_BIN" ] || skip_gate reference "the fabric binary $FABRIC_BIN is missing (DSV4_FABRIC_BIN; default the repo's build — cmake --build --preset $PRESET --target dgpp_serve_app -j, or scripts/ci-local.sh)"
   fi
   local host port
   read -r host port < <(client_host_port)
@@ -730,6 +845,13 @@ gate_reference() {
     gate_result reference FAIL "engine launch failed"; exit 1; }
   local rc=0
   wait_ready "http://$host:$port" "$READY_TIMEOUT" "$logfile" || rc=$?
+  if [ "$SMOKE_MODE" = "direct" ] && serve_log_streaming "$logfile"; then
+    # The streaming-fallback guard (cf. gate_smoke): designed SKIP, not a
+    # capture that hangs to the curl timeout.
+    stop_serve
+    gate_result reference SKIP "this shape (w$SMOKE_WORLD, kv $SMOKE_KV) has no resident image; the loader is streaming (marker in $logfile) and a single prefill will not finish — use DSV4_SMOKE_MODE=fabric with the world-2 shape, or capture an image for this shape first (a resident-mode run captures the missing layers)"
+    exit 2
+  fi
   if [ "$rc" -ne 0 ]; then
     stop_serve
     if [ "$rc" -eq 1 ] && [ "$SMOKE_MODE" = "direct" ] && [ "$SMOKE_WORLD" -eq 1 ]; then
@@ -836,7 +958,11 @@ maybe_build_targets() {  # maybe_build_targets target...
 }
 
 usage() {
-  sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//' | sed '/^$/d'
+  # The header comment (up to `set -u`) is the documentation: print it whole,
+  # whatever length it has grown to.
+  local end
+  end=$(grep -n '^set -u$' "$0" | head -1 | cut -d: -f1)
+  [ -n "$end" ] && sed -n "2,$((end - 1))p" "$0" | sed 's/^# \{0,1\}//' | sed '/^$/d'
   log "usage: $0 {smoke|parity|sanitizer|tps|reference|all|status|help} [--build]"
   log "  --build  build the missing (registered) test targets before parity/sanitizer"
 }

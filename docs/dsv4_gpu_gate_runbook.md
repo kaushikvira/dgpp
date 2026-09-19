@@ -190,9 +190,15 @@ torch env" SKIP — the message is torch-flavoured, but the root cause is the mi
   (`$ROOT/dsv4-gates`) · `DSV4_CHECKPOINT_DIR` (`/data/models/DeepSeek-V4-Flash-0731`)
 - `DSV4_SMOKE_MODE` (`direct`) · `DSV4_SMOKE_PORT` (8899) · `DSV4_SMOKE_KV_CAPACITY` (8192) ·
   `DSV4_SMOKE_WORLD` (1) · `DSV4_SMOKE_MAX_TOKENS` (64) · `DSV4_SMOKE_EXTRA_KNOBS` (`--temperature 0`)
-- `DSV4_FABRIC_CONFIG` (`deploy/cluster_deepseek-v4-flash_fp4_w2.example.json`) ·
-  `DGPP_ENV_FILE` (the site file for fabric mode) · `DSV4_LANE_HEALTH_URL`
-  (`http://127.0.0.1:8888/health`)
+- `DSV4_FABRIC_CONFIG` (the site's w2 dsv4 deployment
+  `/home/kv/work/q-dgx-gateway/config/dgpp-dsv4-w2.json` when present — world 2 / kv 262144 /
+  max_concurrency 2, mtp 1 (or off — the mtp flag does not enter the image's key), the shape the
+  resident images were captured for; else the in-repo
+  `deploy/cluster_deepseek-v4-flash_fp4_w2.example.json`, which a shape mismatch refuses as a
+  designed SKIP) · `DSV4_FABRIC_BIN` (`$DGPP_BUILD_DIR/dgpp-serve` — the repo's own build,
+  passed to dgpp-cluster as `--bin` so the site's `DGPP_RELEASE` pin — a master build with no
+  dsv4 code — is never launched) · `DGPP_ENV_FILE` (the site file for fabric mode) ·
+  `DSV4_LANE_HEALTH_URL` (`http://127.0.0.1:8888/health`)
 - `DSV4_TPS_TOKENS` (512) · `DSV4_TPS_TARGET_MIN`/`MAX` (40 / 60) · `DSV4_READY_TIMEOUT`
   (900 s) · `DSV4_TARGET_TIMEOUT` (600 s)
 - `DSV4_PARITY_TARGETS` (the nine wired in §2) · `DSV4_PARITY_GPU_TARGETS` and
