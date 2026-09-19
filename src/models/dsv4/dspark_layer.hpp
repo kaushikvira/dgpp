@@ -84,8 +84,9 @@ class Dsv4DsparkLayer {
 
   // The target layers' stream mean (the dsv41_stream_mean_bf16's): the
   // hc_mult = num_targets' streams' the fp32 sum in stream order's, the
-  // one-rounding bf16 mean's.
-  void stream_mean(const void* streams, int rows, void* out, cudaStream_t stream);
+  // one-rounding bf16 mean's. out_stride is the caller's row stride — the
+  // draft's fused [rows, num_targets x hidden] buffer needs the fused width.
+  void stream_mean(const void* streams, int rows, void* out, int64_t out_stride, cudaStream_t stream);
   // The block rows (the dsv41_dspark_block_rows's): the [next, noise,
   // ...]'s layout off the accepted verify rows' (the P = 1 + max's, the
   // -1's padding's).

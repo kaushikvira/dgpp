@@ -125,12 +125,19 @@ bool Dsv4DsparkLayer::prepare(int rows) {
   return ok;
 }
 
-void Dsv4DsparkLayer::stream_mean(const void* streams, int rows, void* out, cudaStream_t stream) {
+void Dsv4DsparkLayer::stream_mean(const void* streams, int rows, void* out, int64_t out_stride,
+                                 cudaStream_t stream) {
   // The target layers' attention input's the hc_mult = num_targets' streams'
   // the fp32 sum in stream order's, the one-rounding bf16 mean's (the
   // torch's bf16 mean's, the dsv41_stream_mean_bf16's).
+  // out_stride is the caller's row stride: the draft's fused buffer holds
+  // [rows, num_targets x hidden] with the per-target block at ord*hidden,
+  // so the stride is that fused WIDTH, not hidden (2026-09-20: passing
+  // hidden here overlapped the targets' rows and left the rest of the
+  // fused buffer uninitialized — the initcheck report at
+  // model.cpp's store_draft_hidden read).
   dsv41_stream_mean_bf16(static_cast<const uint16_t*>(streams), cfg_.num_targets, cfg_.hidden, rows,
-                         static_cast<uint16_t*>(out), cfg_.hidden, stream);
+                         static_cast<uint16_t*>(out), out_stride, stream);
 }
 
 void Dsv4DsparkLayer::block_rows(const int64_t* step_pos, const int64_t* tokens, const int32_t* req_ids, int groups,

@@ -995,8 +995,11 @@ void Dsv4Model::enqueue_layer(const Dsv4LayerResident& r, int layer, int T, cons
   // DSpark: the target layers' attention INPUT, its stream mean, per row
   // (the reference reads it before the layer).
   if (mtp_) {
+    const size_t W = static_cast<size_t>(targets_) * H;  // the fused stream-mean width
     const int ord = target_ordinal(layer);
-    if (ord >= 0) dspark_->stream_mean(cur_, T, main_hidden_ + static_cast<size_t>(ord) * H, stream_);
+    if (ord >= 0)
+      dspark_->stream_mean(cur_, T, main_hidden_ + static_cast<size_t>(ord) * H, static_cast<int64_t>(W),
+                           stream_);
   }
   // ---- the attention site ----------------------------------------------------
   GlmMhcWeights aw;
