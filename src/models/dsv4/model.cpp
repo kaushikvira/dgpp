@@ -993,7 +993,8 @@ void Dsv4Model::enqueue_layer(const Dsv4LayerResident& r, int layer, int T, cons
   // projection's real output's (the csa2 layer's q_latent's / the block_kv's
   // the getter's — the 2026-09-18's stand-in's scratch's the csa2 seam's the
   // fill's the replaced's): the q_latent's the csa2 q's (the wq_b's q
-  // latent's the RoPE'd's the G-q-renorm's gap's the absent's) + the
+  // latent's the per-head's re-normalized's (the G-q-renorm's the project_q_kv's
+  // closed's) + the RoPE'd's) + the
   // block_kv's the csa2 kv's (the wkv's block kv's the in-memory's
   // unquantized's the step's rows' own kv_latent's). The pool's (the C4A's
   // compressed's the n_comp > 0's the VERIFY's phase's) + the raw ring's

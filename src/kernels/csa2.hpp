@@ -21,6 +21,7 @@
 // RMSNorm (fp32 interior, bf16 out), the complex rotation over adjacent
 // pairs with fp32 angles p * inv_freq[i] and cosf/sinf (no table), the
 // release's quantizers, the sink in the softmax denominator only.
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 
@@ -70,6 +71,31 @@ void csa2_rope_inv_freq_host(int rope_dim, double theta, int64_t original_seq_le
 void csa2_rope_apply(void* x, int64_t row_stride, int64_t head_stride, int heads,
                      int rope_dim, const int64_t* pos, const float* inv_freq,
                      bool inverse, int64_t rows, cudaStream_t stream);
+
+// ---- the per-head q re-normalization (the checkpoint's ad-hoc rescale) ----
+// The reference re-normalizes each head's q AFTER the wq_b and BEFORE the
+// RoPE: `q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)`
+// (the checkpoint's inference/model.py:503-504 the csa2's, :775-776 the
+// DSpark's, docs/dsv4_attention_spec.md §5 G-q-renorm): the mean over the
+// FULL head_dim (the 448 NoPE + the 64 RoPE — the reference's `mean(-1)`
+// over the unflattened head, NOT the RoPE tail only), eps the layer's
+// norm_eps (the 1e-6's). The house norm rounding class (csa2_rmsnorm_bf16's:
+// the fp32 interior, ONE bf16 rounding at the end).
+// The per-head scale (the fp32 interior's the exact formula's — the host's
+// + device's the CPU oracle's driven's parity's pin's): rsqrtf(ss / dim +
+// eps), ss the head's sum-of-squares (the bf16 -> fp32's upcast exact's).
+__host__ __device__ inline float dsv4_q_renorm_scale(float ss, int dim, float eps) {
+  // 1.0f / sqrtf's the IEEE-exact's (the host's + device's the bit-
+  // identical's — the CUDA's sqrtf's the correctly rounded's, the
+  // glibc's the same's, the division's exact's in fp32's), so the CPU
+  // oracle's driven's the host's form's the device's kernel's the
+  // exact's scale's the pin's.
+  return 1.0f / sqrtf(ss / static_cast<float>(dim) + eps);
+}
+// q: bf16 [rows, heads * dim] (the wq_b's out, the UNrotated) -> the
+// per-head re-normalized in place (the (row, head) block's the dim's
+// elements' the fp32 interior's the ONE bf16 rounding's the out's).
+void csa2_q_renorm_bf16(void* q, int rows, int heads, int dim, float eps, cudaStream_t stream);
 
 // ---- positions ------------------------------------------------------------------
 // out[r] = pos[r] < 0 ? -1 : (pos[r] + 1) / ratio - 1: the compressed

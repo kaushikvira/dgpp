@@ -1164,7 +1164,7 @@ Unresolved: both's are documented's quant-class's tolerances's (not
 bit-exact's to's the reference's) — the GPU parity gate's the token'
 s gates' the acceptance's criterion's.
 
-### G-q-renorm — the ad-hoc q's re-normalization's is absent's from's the C++'s q path
+### G-q-renorm — the ad-hoc q's re-normalization's is absent's from's the C++'s q path — RESOLVED (the 2026-09-20's q path's task's)
 
 The reference's re-normalizes's each's head's q's vector's after's
 the `wq_b`'s: the `q *= torch.rsqrt(q.square().mean(-1, keepdim=True)
@@ -1172,16 +1172,38 @@ the `wq_b`'s: the `q *= torch.rsqrt(q.square().mean(-1, keepdim=True)
 py:775-776's the DSpark's — the §0.1's "the ad-hoc q re-
 normalization"'s). The C++'s csa2's `project_q_kv`'s (the
 `src/models/dsv4/csa2_layer.cu:253-272`'s: the `wq_a`'s GEMM's +
-the `q_norm`'s + the `wq_b`'s GEMM's + RoPE's) has NO per-head's
+the `q_norm`'s + the `wq_b`'s GEMM's + RoPE's) had NO per-head's
 rescale's — and the DSpark's union's kernel's expects' the q's latent'
 s PRE-renormalized's by's the caller's (the "the wq_b's output's +
 the q-renorm's + the RoPE's, the caller's"'s, the `src/models/dsv4/
 dspark_layer.cu:207-210`'s) — the current's model's stand-in's (the
-`src/models/dsv4/model.cpp:842-848`'s the csa2 seam's fill's) does
-NOT do's it's. Unresolved: the per-head's, per-row's logit's rescale'
-s is a real's numeric's delta's if's left's out's — the completion's
-must's add's it's (the csa2's q's path's + the DSpark's q's staging'
-s) or' document's the delta's.
+`src/models/dsv4/model.cpp:842-848`'s the csa2 seam's fill's) did
+NOT do's it's.
+
+**RESOLVED (the 2026-09-20's q path's task's):** the `csa2_q_renorm_bf16`
+kernel's (the `src/kernels/csa2.cu`'s `q_renorm_kernel`'s, the
+`src/kernels/csa2.hpp`'s the declaration's + the `dsv4_q_renorm_scale`
+the host's + device's the shared's formula's) is wired into's the
+`project_q_kv`'s (the `src/models/dsv4/csa2_layer.cu`'s) between's the
+`wq_b`'s GEMM's and's the RoPE's — exactly's where's the reference's
+applies's it's (the ck:model.py:504's the csa2's, the :776's the
+DSpark's). The C++'s DSpark's union attention's consumes's the csa2
+layer's `q_` (the `q_latent()`'s getter's the model's the
+`dspark_->union_attn`'s the real's input's), so the ONE insertion's
+covers BOTH's the csa2's q path's AND the DSpark's q staging's (the
+union kernel's the "pre-renormalized's by's the caller's"'s contract's
+the now's satisfied's). The rounding's the house's norm class's (the
+fp32's interior's the ONE's bf16 rounding's the end's — the
+`csa2_rmsnorm_bf16`'s the documented's class's; the reference's own's
+bf16's intermediate's roundings's the noise's level's, the fp32's
+interior's the higher's precision's). The CPU's oracle's the
+`dsv4_q_renorm_contract`'s (the `tests/unit/dsv4_csa2_oracle_test.
+cpp`'s) pins's the formula's against's the independent's DOUBLE's
+reference's + the full-512-dim's mean's semantics's + the unit-RMS's
+no-op's + the zero-row's edge's. The kernel's the graph's capturable's
+(the plain's `<<< >>>`'s launch's, the no host's copy's). The GPU's
+parity's gate's (the parent's validation's) measures's the
+end-to-end's delta's.
 
 ### G-union-wiring — the pool's / the raw ring's phases' still null's (the
 q / the block's wired's the 2026-09-20's S3's)
@@ -1244,15 +1266,17 @@ reachable's from's the model's yet's.
   item's (the prefill's the not's the required's, the ring's the decode's
   the append's the main walk's the every's token's).
 
-**The q's renorm's (the G-q-renorm's) still pending's:** the csa2's q
-path's + the DSpark's q staging's the ad-hoc's q re-normalization's (the
-`q *= rsqrt(q.square().mean(-1) + eps)`'s the ck:model.py:775-776's)
-the absent's (the csa2's `project_q_kv`'s the `csa2_layer.cu:253-272`'s
-the no per-head's rescale's, the DSpark's union's kernel's the q's the
+**The q's renorm's (the G-q-renorm's) RESOLVED's (the 2026-09-20's q
+path's task's):** the csa2's q path's + the DSpark's q staging's the
+ad-hoc's q re-normalization's (the `q *= rsqrt(q.square().mean(-1) +
+eps)`'s the ck:model.py:775-776's) the now's the `csa2_q_renorm_bf16`
+kernel's (the `src/kernels/csa2.cu`'s) the wired's into's the csa2's
+`project_q_kv`'s (the `csa2_layer.cu`'s) between's the `wq_b`'s GEMM's
++ the RoPE's — the DSpark's union's kernel's the q's the
 pre-renormalized's the caller's the `dspark_layer.cu:207-210`'s
-contract's, the model's the stand-in's the not's the done's the 2026-
-09-20's S3's the q's the csa2 q's the real's pointer's the passed's
-the renorm's the still's the absent's).
+contract's the satisfied's (the model's the csa2 q's the real's
+pointer's the passed's the renorm's the applied's). See the G-q-renorm'
+s entry's the RESOLVED's.
 
 ### G-cache-format — two physical formats's for's the C4A's compressed's entries
 

@@ -70,6 +70,31 @@ __global__ void rmsnorm_kernel(const uint16_t* x, int64_t x_stride, const uint16
   }
 }
 
+// ---- the per-head q re-normalization (the checkpoint's ad-hoc rescale) --
+// One block per (row, head): the fp32 sum-of-squares (the bf16 -> fp32's
+// exact upcast's, the __fmaf_rn's the thread's stride's), the block's
+// sum's (the block_sum_256's the fixed order's), the scale's the
+// dsv4_q_renorm_scale's (the host's + device's the CPU oracle's parity's
+// pin's), the ONE bf16 rounding's at the out's (the in-place's — the
+// q's the wq_b's GEMM out's the read's before's the write's the
+// per-element's the smem-free's, the x[i]'s the re-read's the
+// bf16-rounded's pre-rescale's value's the reference's `q *='s the
+// in-place's semantics's).
+__global__ void q_renorm_kernel(uint16_t* q, int dim, float eps) {
+  __shared__ float red[8];
+  const int64_t rh = blockIdx.x;  // (row, head)
+  uint16_t* x = q + rh * dim;
+  float ss = 0.0f;
+  for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+    const float v = bf16_bits_to_float(x[i]);
+    ss = __fmaf_rn(v, v, ss);
+  }
+  const float total = block_sum_256(ss, red);
+  const float rs = dsv4_q_renorm_scale(total, dim, eps);
+  for (int i = threadIdx.x; i < dim; i += blockDim.x)
+    x[i] = float_to_bf16_bits(__fmul_rn(bf16_bits_to_float(x[i]), rs));
+}
+
 // ---- rotation ------------------------------------------------------------------------
 __global__ void rope_apply_kernel(uint16_t* x, int64_t row_stride, int64_t head_stride,
                                   int heads, int half, const int64_t* pos,
@@ -776,6 +801,14 @@ void csa2_rmsnorm_bf16(const void* x, int64_t x_stride, const void* w, void* y, 
   rmsnorm_kernel<<<unsigned(rows), kCsa2Threads, 0, stream>>>(
       static_cast<const uint16_t*>(x), x_stride, static_cast<const uint16_t*>(w),
       static_cast<uint16_t*>(y), y_stride, dim, eps);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
+void csa2_q_renorm_bf16(void* q, int rows, int heads, int dim, float eps, cudaStream_t stream) {
+  if (rows <= 0 || heads <= 0) return;
+  if (dim <= 0 || dim > 8192) throw std::invalid_argument("csa2_q_renorm_bf16: dim must be in [1, 8192]");
+  q_renorm_kernel<<<unsigned(int64_t(rows) * heads), kCsa2Threads, 0, stream>>>(
+      static_cast<uint16_t*>(q), dim, eps);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

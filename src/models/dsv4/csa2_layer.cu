@@ -305,6 +305,17 @@ void Dsv4Csa2Layer::project_q_kv(const void* hidden_in, int tokens, const int64_
                   tokens, stream);
   launch_scale_gemm_grid_bf16(qr_, size_t(cfg_.q_lora), w_.wq_b.payload, w_.wq_b.scales, q_, tokens, lh * kCsa2Latent,
                               cfg_.q_lora, stream, 0, 7, 7, cfg_.dense_mma);
+  // The per-head q re-normalization (the checkpoint's `q *='s the
+  // torch.rsqrt's the q.square()'s the mean(-1, keepdim)'s the + the
+  // eps's, ck:model.py:503-504 the csa2's the :775-776's the DSpark's —
+  // the G-q-renorm's gap's the closed's): the wq_b's out's (the unrotated's)
+  // the per-(row, head)'s the FULL's 512's dims' the rescale's, BEFORE
+  // the RoPE's (the reference's order's). The DSpark's union attention's
+  // q_latent's (the q_'s the q_latent()'s getter's the model's the
+  // dspark_'s union_attn's the real's input's) the pre-renormalized's
+  // (the union kernel's the caller's contract's, dspark_layer.cu's the
+  // "the wq_b's output's + the q-renorm's + the RoPE's"'s).
+  csa2_q_renorm_bf16(q_, tokens, lh, kCsa2Latent, cfg_.eps, stream);
   csa2_rope_apply(q_ + (kCsa2Latent - kCsa2Rope), int64_t(lh) * kCsa2Latent, kCsa2Latent, lh, kCsa2Rope, pos,
                   w_.inv_freq, false, tokens, stream);
 }
