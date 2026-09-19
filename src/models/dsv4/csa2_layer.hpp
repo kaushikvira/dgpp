@@ -254,15 +254,27 @@ class Dsv4Csa2Layer {
 // ---- the v4-owned 64-head selection (the shared csa2_select's 32-head
 // pin's V4 re-expression; the spec §2.1(d)'s NEW 64-index-head fold
 // width) ---------------------------------------------------------------
+// The decode's selection's composite key (the dsv41's make_key's form's
+// the (~sortable_fp32 << 21) | entry_idx's the MIN's top-k's total
+// order's: the smallest's key's the highest's logit's, the exact ties'
+// the lower's entry index's — the pinned's oracle's the dsv41's shared
+// kernel's the prefill's stable-sort's the match's) + the running's
+// top-select_k's MIN-key's insertion's (the decode kernel's the mutex-
+// guarded's body's, the CPU's oracle's the driven's micro-case's the
+// shared's — the host's + device's the test's the parity's pin's).
+__host__ __device__ uint64_t dsv4_csa2_sortable_key(float logit, int idx, int idx_bits);
+__host__ __device__ int dsv4_csa2_select_insert(uint64_t* skeys, int* sidx, int select_k,
+                                                        uint64_t key, int idx);
 // The decode's 64-head selection: streams the index cache's visible
 // entries per row, computes the 64-head fp8 dots' logits (the folded
 // weight, the entry's scale), and keeps the running top-select_k
-// composite-key selection (the (sortable_fp32 << 21) | entry_idx's total
-// order, the exact ties to the lower entry index — the shared kernel's
-// selection's 64-head re-expression). `heads` MUST be 64 (the V4's
-// index_n_heads; the shared kernel's 32). `q_fp8` [rows, 64, 128] e4m3,
-// `w_folded` [rows, 64] fp32, `index_k` / `index_scale` the planar index
-// cache, `topk_out` [rows, select_k] (-1 padded), `counts` [rows].
+// composite-key selection (the dsv41's make_key's form's (~sortable_fp32
+// << 21) | entry_idx's MIN top-k's total order, the exact ties to the
+// lower entry index — the shared kernel's selection's 64-head
+// re-expression). `heads` MUST be 64 (the V4's index_n_heads; the
+// shared kernel's 32). `q_fp8` [rows, 64, 128] e4m3, `w_folded` [rows,
+// 64] fp32, `index_k` / `index_scale` the planar index cache,
+// `topk_out` [rows, select_k] (-1 padded), `counts` [rows].
 void dsv4_csa2_select_decode(const void* q_fp8, const float* w_folded, const int32_t* req_ids,
                              const int64_t* pos_sel, int rows, const int32_t* block_tables,
                              int blocks_per_request, const void* index_k, const float* index_scale,
