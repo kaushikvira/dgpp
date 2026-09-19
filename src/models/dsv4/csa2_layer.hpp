@@ -301,14 +301,17 @@ class Dsv4Csa2Layer {
   float* c_win_ = nullptr;
   // The window ring's per-call slot lists (csa2_window_slots_decode's
   // output) and the layer's own window ring (the no-pool positional state:
-  // [max_decode_rows][ring_slots] rows of the fp8_block form, one block per
+  // [max_decode_rows][ring_slots] rows of the fp8_block_rope form (the
+  // reference's window KV's mixed-precision's: the NoPE 448's e4m3 + the
+  // e8m0 per 64's, the RoPE 64's raw bf16's the 584 B envelope's — the
+  // G8's first bullet's the 2026-09-21's close's), one block per
   // request — the dsv41 pool's ring's V4 re-expression, the model's
   // "the window ring's the layer scratch's"). max_decode_rows safely
   // upper-bounds the distinct-request count (the model's max_requests <=
   // decode_rows_cap() == max_decode_rows).
   int32_t* wlist_ = nullptr;  // [max_decode_rows, window] the slot lists
   int32_t* wcounts_ = nullptr;  // [max_decode_rows]
-  uint8_t* ring_ = nullptr;  // [max_decode_rows, ring_slots] fp8_block rows
+  uint8_t* ring_ = nullptr;  // [max_decode_rows, ring_slots] fp8_block_rope rows (the 584 B envelope's)
   int32_t* ring_table_ = nullptr;  // [max_decode_rows] identity (one block per request)
   int32_t* main_block_table_ = nullptr;  // [max_decode_rows, max_blocks] identity (the planar main cache's)
   int64_t* pos_sel_ = nullptr;  // [max_decode_rows] the compressed entries' visible position
