@@ -458,3 +458,39 @@ NEXT STEP (do not guess): run the toolkit's sanitizer gate over exactly this
 shape — `DSV4_SMOKE_MODE=fabric bash scripts/dsv4_gates.sh sanitizer` (or
 compute-sanitizer on the direct dsv4 serve) — and read the FIRST invalid
 access, not the reported memset site.
+
+## 2026-09-19, fourth window: the plumbing is DONE — all three blockers cleared
+
+The full deployment shape now boots and serves: **world 2 / kv 262144 /
+max_concurrency 2 / MTP on (depth 5) / decode graph ON**, `rank 0 serving: ok
+(16s)`, 32 tokens in ~2.4 s. What it took (each with the evidence):
+
+1. **The union attention's output read out of its own accumulator array.**
+   `dsv4_dspark_union_attn_kernel` declared `float acc[dims_per_thread]` (64)
+   and then indexed it `acc[dim]` with `dim = dim_chunk * 64 + d` (0..511) — so
+   every thread with `dim_chunk > 0` read past the local array. Found by the
+   compute-sanitizer boot, first fault:
+   `Invalid __local__ read of size 16 bytes at dsv4_dspark_union_attn_kernel,
+   thread (33,0,0) in block (4,0,0)` — thread 33 % 8 == 1, i.e. `dim_chunk` 1,
+   reading `acc[64..]`. Fixed to `acc[d]` (`cfd2194`). This was OUR S3 wiring's
+   bug, and it is what the sticky `cudaMemsetAsync(d_tails_)` fault was hiding.
+2. **The draft-rows geometry was a CONFIG error, not code.** `mtp_depth` was 1
+   in the deployment config while the model's DSpark block is 6 rows per request
+   (1 + 5 drafts) — the engine itself says so:
+   `--mtp without --mtp-depth on DeepSeek-V4-Flash: the DSpark block's 5 drafts`.
+   With depth 1 the decode batch is `2 x 2 = 4 -> 8` rows but the draft block
+   needs `groups x block = 2 x 6 = 12`, hence
+   `mtp_run_rows: the draft blocks exceed the decode batch`. Setting
+   `engine.mtp_depth: 5` (and `decode_graph: true`) in
+   `q-dgx-gateway/config/dgpp-dsv4-w2.json` fixed it. **12 rows of the 32-row
+   dsv4 ceiling.**
+3. The two earlier blockers stayed fixed (the DSpark plan's `stride=12288`, the
+   kernels-only capture).
+
+**Where we stand: the model serves, the plumbing is complete, and the output is
+still degenerate** — `"ROW enpresak-banay...)--)--..."` at `temperature 0`, no
+engine-side violation logged. That is the numerics work in the spec's §5:
+`G5` (the indexer's q-side Hadamard dropped), `G-q-renorm`, `G6` (the indexer's
+fp4 -> e4m3 re-expression), `G8` (the ring/main quant-class deltas), then the
+compressor/partials items. The parity gate against the checkpoint's own
+`inference/` remains the arbiter.
