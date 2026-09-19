@@ -141,7 +141,16 @@ skip_gate() {  # skip_gate NAME reason...
 gpu_quiet() {
   local busy=""
   local pids
-  pids=$(pgrep -f 'dgpp-serve' 2>/dev/null || true)
+  pids=$(pgrep -x dgpp-serve 2>/dev/null || true)
+  if [ -z "$pids" ]; then
+    # `pgrep -f` would also match any unrelated shell whose command line merely
+    # mentions the binary (a `ls …/dgpp-serve` is enough) — only trust it for a
+    # command line that actually STARTS the engine.
+    pids=$(pgrep -f 'dgpp-serve([[:space:]]|$)' 2>/dev/null | while read -r p; do
+             [ "$p" = "$$" ] && continue
+             tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -qE '(^|/)dgpp-serve( |$)' && echo "$p"
+           done | tr '\n' ' ' || true)
+  fi
   if [ -n "$pids" ]; then
     busy="$busy dgpp-serve running (pid $(echo $pids | tr '\n' ' '))"
   fi
