@@ -156,3 +156,153 @@ tails_w_` at `src/models/dsv4/model.cpp:225` then sizes 2048 floats ×
 `src/models/dsv4/csa2_layer.cu:391-392` must produce **1024** output
 rows (it currently passes `kCsa2Latent` = 512 as the GEMM `n` — see
 GAP G3).
+
+## 1. The six decode attention partials (m / l / c × main / window)
+
+The csa2 decode attention is a **two-source** attention: a sliding-window
+source over the layer's own 128-slot ring (the fp8 ring format) and —
+for a kv source (`ratio > 0`) — a main source over the selected
+compressed entries (the planar main cache, the fp4 main format). Each
+source is computed as a split-KV partial (the flash-decoding shape), and
+the six partials are merged in one finish. This is the V4 re-expression
+of the checkpoint reference's single `sparse_attn` over the
+concatenated `[window | compressed]` KV (ck:model.py:520, 538) — the
+split-partial + finish merge is algebraically the SAME single softmax,
+within the fp32 accumulation budget.
+
+### 1.1 What each partial holds
+
+Each source is split across the key dimension into `n_split` chunks
+(the flash-decoding "split-KV"), one partial per (row, split). The six
+partials live in the layer scratch, indexed `[r * n_split + s]`
+(**the (row, split) PRODUCT**, not the max — the 2026-09-18 GPU-window
+OOB regression the `dsv4_csa2_partial_layout` oracle guards):
+
+| partial | type / shape | holds |
+|---|---|---|
+| `m_main` | fp32 `[ws_slots, lh]` | the running MAX of the main source's per-split logits (per head) |
+| `l_main` | fp32 `[ws_slots, lh]` | the running SUM (normalizer) of `exp(logit - m)` for the main source |
+| `c_main` | fp32 `[ws_slots, lh, 512]` | the accumulated `Σ exp(logit - m) · kv` value vector for the main source |
+| `m_win` | fp32 `[ws_slots, lh]` | the running MAX of the window source's per-split logits |
+| `l_win` | fp32 `[ws_slots, lh]` | the running SUM (normalizer) for the window source |
+| `c_win` | fp32 `[ws_slots, lh, 512]` | the accumulated value vector for the window source |
+
+- `lh` = `local_heads()` = `num_heads / tp` = 64 / 2 = **32**
+  (`src/models/dsv4/csa2_layer.hpp:57-64,70`).
+- `512` = `kCsa2Latent` (the latent width, K == V).
+- `ws_slots` = `max(max_decode_rows, 8) * max(decode_n_split, 8)`
+  (`src/models/dsv4/csa2_layer.cu:104`), so the `[r * n_split + s]`
+  index fits: `r < max_decode_rows` and `s < n_split <= decode_n_split`,
+  hence `r * n_split < ws_slots`.
+- `n_split_win` = `min(decode_n_split_, kWinDecodeSplit = 8)`
+  (`src/models/dsv4/csa2_layer.cu:308`, `kWinDecodeSplit` at
+  `csa2_layer.hpp:156`) — a FIXED 8-way key-dimension split for the
+  window, independent of the row count, so a one-row decode and row 0 of
+  a multi-row verify compute the window identically.
+- `n_main` = `decode_n_split_` (= 32, the constructor default) when the
+  main source runs, else 0 (`src/models/dsv4/csa2_layer.cu:319`).
+
+### 1.2 The ring format (the window source's KV)
+
+The window source reads the layer's own ring, `[max_decode_rows]
+[ring_slots]` rows, **one block per request** (the identity block
+table `ring_table_`), `ring_slots` = 160 (`Dsv4Csa2Config::ring_slots`,
+`csa2_layer.hpp:53`; the validate requires `ring_slots >= window + 16`,
+`csa2_layer.cu:36`). Each row is the **`kFp8Block`** latent format
+(`src/kernels/latent_format.hpp:60-64`): the 512-dim RoPE'd kv as
+**512 e4m3 codes + 16 e8m0 (power-of-two) scales, one per 32 elements**
+= 528 bytes/row, self-describing (the scales are inside the row, no
+beside row-scale). The ring slot for a row at absolute position `p` is
+`p % ring_slots` (`csa2_ring_slot_positions`, `src/kernels/csa2.hpp:85-87`;
+`csa2_layer.cu:380`). The window slot list per row is the ascending
+positions `[max(0, p - window + 1), p]` mapped to ring slots, `-1`
+padded to `[rows, window]` with counts (`csa2_window_slots_decode`,
+`src/kernels/csa2.hpp:97-110`). The ring is READ AFTER the append, so
+the batch's own rows are visible to their own queries
+(`csa2_layer.cu:380-382`, the `dsa_latent_append` before the
+`csa2_window_slots_decode`).
+
+**Delta vs the reference (GAP G8):** the reference's ring is exactly
+`window_size` = 128 slots (ck:model.py:261-274 `get_window_topk_idxs`,
+the ring `self.kv_cache` of width 128), and its window KV quantizes
+ONLY the non-RoPE 448 dims to fp8 (per-64, e8m0 scale) leaving the RoPE
+64 in bf16 (ck:model.py:508-512). The C++ ring keeps 160 slots (the 32
+extra older slots are never attended — the window set, the last 128
+positions, is identical) and quantizes the FULL 512 (e4m3 + e8m0/32,
+the RoPE 64 included) to the self-describing `kFp8Block` row. Same
+window, a different quantization class.
+
+### 1.3 The main format (the main source's KV)
+
+The main source reads the planar compressed main cache, the
+**`kFp4Block`** latent format (`src/kernels/latent_format.hpp:60-64`):
+**256 e2m1 nibbles (2/byte) + 32 e4m3 block-scales, one per 16
+elements = 288 bytes/row** (the card's number), self-describing. The
+entries-per-block `epb = block_tokens / ratio` = 128 / 4 = **32** for
+C4A, 128 / 128 = **1** for C128A (`src/models/dsv4/csa2_layer.cu:318`).
+The main source is `dsa_attn_listed` (the 16-head-multiple tensor-core
+form) over the selected `topk_` / `counts_`, falling back to
+`dsa_attn_partial` when `lh` is not a multiple of 16
+(`src/models/dsv4/csa2_layer.cu:320-328`). The identity main block
+table (`main_block_table_`, one block per request, entry `e` at slot
+`e`) is the no-pool positional state (`src/models/dsv4/csa2_layer.cu:95-99`).
+
+**Delta vs the reference (GAP G8):** the reference stores the
+compressed KV dequantized in bf16 (the `act_quant(..., inplace=True)`
+at ck:model.py:378, the `kv_cache` buffer), and its quantization is the
+per-64 e4m3/e8m0 over the 448 NoPE dims + the bf16 RoPE 64 (the 584 B
+record, §4.2). The C++ main cache is the coarser self-describing
+`kFp4Block` (e2m1/e4m3/16 over the full 512) — a documented quant-class
+tolerance, not bit-exact to the reference.
+
+### 1.4 The finish: the merge + the sink's exactly-once
+
+`csa2_attn_finish` (`src/kernels/csa2.hpp:238-245`) merges the two
+sources' partials and the sink into the output:
+
+1. **Merge the splits within each source** (`dsa_attn_combine`
+   contract, `src/kernels/dsa.hpp:358-365`):
+   `c = (Σ_s p_s · c_s) / (Σ_s p_s · l_s)`, `p_s = exp(m_s - max m)` —
+   the standard flash-decoding rescale. An empty source (a main source
+   with `counts == 0`) has `m = -inf` so its `p_s = 0` and it
+   contributes nothing.
+2. **Merge the two sources** into one softmax state (the running max `m`
+   and normalizer `l` across main + window).
+3. **The sink's exactly-once** (`src/kernels/csa2.hpp:240` "the sink
+   (exp(sink_h - m) in the denominator only, the reference's)"): the
+   learned per-head `attn_sink` (fp32 `[local_heads]`) adds exactly
+   `exp(sink_h - m)` to the MERGED denominator, ONCE — not per-split,
+   not per-source. This matches the reference's `sum_exp[i] +=
+   T.exp(attn_sink[i] - scores_max[i])` (ck:kernel.py:346;
+   fn:kernel.py:383).
+4. **Normalize + round**: `out = c / l`, ONE bf16 rounding.
+5. **Inverse-rotate**: the query's rotation is removed from the last 64
+   dims of every head (`csa2_rope_apply(..., inverse=true)`,
+   `src/kernels/csa2.hpp:63-70`), matching the reference's `
+   apply_rotary_emb(o[..., -rd:], freqs_cis, True)` (ck:model.py:539).
+   Padding rows (`pos < 0`) are zeroed.
+
+The sink's exactly-once + the degenerate limits are pinned by the CPU
+oracle `dsv4_sparse_attn_sink_exactly_once`
+(`tests/unit/dsv4_csa2_oracle_test.cpp:657-720`): the null / `-inf`
+sink is bit-identical to no sink (the no-op), the `+inf` sink is the
+EXACTLY-zero output, and a finite sink adds exactly ONE `exp(sink - m')`
+to the merged denominator (`m' = max(mx, sink)`).
+
+### 1.5 What the C++ already pins (the delta this spec adds)
+
+- `dsv4_csa2_partial_layout`
+  (`tests/unit/dsv4_csa2_oracle_test.cpp:721-803`) pins the six
+  partials' `ws_slots` (row,split)-PRODUCT sizing and the
+  `[r * n_split + s]` indexing bound on a synthetic shape.
+- `dsv4_sparse_attn_sink_exactly_once` pins the finish's sink
+  exactly-once + the +inf / no-tokens degenerate limits.
+
+The delta this spec adds: the EXACT ring (`kFp8Block`, 160 slots,
+`p % 160`) and main (`kFp4Block`, `epb` = 32/1) formats and their
+byte layouts, the `n_split_win` = 8 vs `n_main` = 32 split counts, the
+`[r * n_split + s]` indexing, and the finish's 5-step merge order — the
+values a coder needs to wire the partials without guessing. The
+reference-mapping (the single `sparse_attn` over the concatenated KV,
+the sink in the denominator only, the inverse rotation) is what makes
+the split-partial form numerically the reference's attention.
