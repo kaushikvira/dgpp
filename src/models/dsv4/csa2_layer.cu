@@ -8,7 +8,6 @@
 #include <string>
 #include <vector>
 
-#include "common/capture_trace.hpp"
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
 #include "kernels/dsa.hpp"
@@ -327,6 +326,24 @@ void Dsv4Csa2Layer::indexer_query(const void* hidden_in, int tokens, const int64
   csa2_fold_weights(iw_, q_scale_, w_folded_, int64_t(tokens) * heads, stream);
 }
 
+// The C4A's publish's 1024 -> 512 latent row-slice (the G-tail-pool's
+// placeholder's the first kCsa2Latent's dims' the overlap plane's):
+// the cudaMemcpy2DAsync's kernels-only decode graph's replacement
+// (2026-09-20, the dsv4's graph's blocker's fix's) — the copy-engine's
+// node's the capture's rejection's source's (the 21's C4A layers' one's
+// each's the captured walk's, the 'graph variant 0 captured 21 memcpy's
+// error's), the kernel's the graph's node's. One block's a row's (the
+// tokens' the decode rows' the max_decode_rows' bound's), the 256's
+// threads' the 512's dims' two's passes'. The copy's the elements' the
+// memcpy's (bitwise the same's, the stream order's preserved's).
+__global__ void dsv4_csa2_latent_slice_kernel(const uint16_t* __restrict__ src, uint16_t* __restrict__ dst,
+                                              int src_stride, int dst_stride) {
+  const size_t s = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(src_stride);
+  const size_t d = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(dst_stride);
+  for (int i = threadIdx.x; i < kCsa2Latent; i += blockDim.x)
+    dst[d + static_cast<size_t>(i)] = src[s + static_cast<size_t>(i)];
+}
+
 void Dsv4Csa2Layer::publish_entries(void* main_cache, void* index_cache, float* index_scale,
                                     const int32_t* req_ids, int tokens, cudaStream_t stream) {
   if (tokens <= 0 || main_cache == nullptr) return;
@@ -338,22 +355,15 @@ void Dsv4Csa2Layer::publish_entries(void* main_cache, void* index_cache, float* 
   // index's latent's the overlap plane's (the dims' 0..511's the spec's
   // §3.3's) — the G-tail-pool's gap's placeholder's (the 1024 -> 512's
   // reduction's undefined's, the GPU's parity's gate's settles's the plane's
-  // choice's), the cudaMemcpy2DAsync's the first 512 dims' the
-  // latent_main_'s. The C128A's latent_'s the [T, 512]'s the plain form's
-  // (the wkv's projection + the one-rounding's RMSNorm's), used direct's.
+  // choice's), the dsv4_csa2_latent_slice_kernel's the first 512 dims' the
+  // latent_main_'s (the kernel's the cudaMemcpy2DAsync's replacement's,
+  // the kernels-only's decode graph's, 2026-09-20's). The C128A's
+  // latent_'s the [T, 512]'s the plain form's (the wkv's projection + the
+  // one-rounding's RMSNorm's), used direct's.
   uint16_t* lm;
   if (w_.ratio == 4) {
-    DGPP_CUDA_OK(cudaMemcpy2DAsync(latent_main_, kCsa2Latent * 2, latent_, kCsa2TailW * 2, kCsa2Latent * 2,
-                                   tokens, cudaMemcpyDeviceToDevice, stream));
-    // The capture's copy-site's trace (the 21's C4A layers's one's each's,
-    // the kernels-only graph's blocker's enumeration's; the site's the
-    // layer's index's, the walk's order's): the construction's gated's on
-    // the capture's (the eager's walk's the per-token's hot path's keeps's
-    // allocation-free's).
-    if (stream_is_capturing(stream))
-      capture_trace_copy2d(("dsv4 csa2 publish_entries latent 1024->512 (layer " + std::to_string(layer_) + ")").c_str(),
-                           "D2D", latent_, static_cast<size_t>(kCsa2TailW) * 2, latent_main_,
-                           static_cast<size_t>(kCsa2Latent) * 2, static_cast<size_t>(kCsa2Latent) * 2, tokens, stream);
+    dsv4_csa2_latent_slice_kernel<<<tokens, 256, 0, stream>>>(latent_, latent_main_, kCsa2TailW, kCsa2Latent);
+    DGPP_CUDA_OK(cudaGetLastError());
     lm = latent_main_;
   } else {
     lm = reinterpret_cast<uint16_t*>(latent_);  // the C128A's [T, 512]'s the plain form's
