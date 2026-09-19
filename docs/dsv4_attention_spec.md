@@ -208,7 +208,7 @@ The window source reads the layer's own ring, `[max_decode_rows]
 [ring_slots]` rows, **one block per request** (the identity block
 table `ring_table_`), `ring_slots` = 160 (`Dsv4Csa2Config::ring_slots`,
 `csa2_layer.hpp:53`; the validate requires `ring_slots >= window + 16`,
-`csa2_layer.cu:36`). Each row is the **`kFp8Block`** latent format
+`csa2_layer.cu:38`). Each row is the **`kFp8Block`** latent format
 (`src/kernels/latent_format.hpp:60-64`): the 512-dim RoPE'd kv as
 **512 e4m3 codes + 16 e8m0 (power-of-two) scales, one per 32 elements**
 = 528 bytes/row, self-describing (the scales are inside the row, no
@@ -226,11 +226,31 @@ the batch's own rows are visible to their own queries
 `window_size` = 128 slots (ck:model.py:261-274 `get_window_topk_idxs`,
 the ring `self.kv_cache` of width 128), and its window KV quantizes
 ONLY the non-RoPE 448 dims to fp8 (per-64, e8m0 scale) leaving the RoPE
-64 in bf16 (ck:model.py:508-512). The C++ ring keeps 160 slots (the 32
-extra older slots are never attended — the window set, the last 128
-positions, is identical) and quantizes the FULL 512 (e4m3 + e8m0/32,
-the RoPE 64 included) to the self-describing `kFp8Block` row. Same
-window, a different quantization class.
+64 in bf16 (ck:model.py:508-512). **RESOLVED (the 2026-09-21's ring's
+format's task's):** the C++ ring now stores the reference's mixed-
+precision record — the new `kFp8BlockRope` latent format
+(`src/kernels/latent_format.hpp`): the NoPE 448 in e4m3 with an e8m0
+(power-of-two) scale per 64 (the release's `act_quant(..., 64, ue8m0)`
+bitwise) and the RoPE 64 raw bf16 (the positional signal's kept exact's),
+the 584 B envelope's (the dsv4-native's KV record's, the DSpark union
+kernel's `dsv4_dspark_decode_record`'s the byte-compat's: [448 e4m3 |
+128 bf16 | 7 e8m0 + 1 pad]'s the 8-byte aligned's). The ring keeps 160
+slots — VERIFIED never attended past the window: the ring slot for
+position `p` is `p % ring_slots` (`src/kernels/csa2.cu:172-177`,
+`csa2_ring_slot_positions`), the window list is the ascending last
+`min(window, p + 1)` positions mapped to slots (`src/kernels/csa2.cu:
+184-193`, `window_slots_decode_kernel`), and the attention reads ONLY
+the listed slots (`dsa_attn_partial` over `wlist_` / `wcounts_`,
+`src/models/dsv4/csa2_layer.cu`'s `attend`) — with `window` (128) + the
+MTP's 16's rows's < `ring_slots` (160), no two attended positions
+collide mod 160 and each attended slot was last written by its own
+position (the next colliding writer's `p + 160`, past the attended's
+span's), so the 32 extra slots (the positions `[p - 159, p - 128]`'s)
+are never listed and the window's content's the reference's 128-slot's
+ring's the identical's (the cosmetic's the 160-vs-128's the no-op's,
+the `Dsv4Csa2Config::validate`'s `ring_slots >= window + 16`'s the
+MTP's rows's the bound's, `src/models/dsv4/csa2_layer.cu:36`'s).
+Same's window's, now's the reference's quantization's class's.
 
 ### 1.3 The main format (the main source's KV)
 
@@ -1187,17 +1207,33 @@ s, the `spec:§3.2`'s option's B's class's).
 
 ### G8 — the ring's / main's quant-class's deltas (the §1.2/1.3's flags's)
 
-- **The window's ring's**: the C++'s ring's the 160's slots's the
-  `kFp8Block`'s full's 512's (the e4m3's + e8m0/32's, the RoPE's 64'
-  s INCLUDED's, the `src/kernels/latent_format.hpp:60-64`'s, the
-  `src/models/dsv4/csa2_layer.cu`'s the `L.ring`'s) vs' the
-  reference's 128-slot's ring's (the `window_size`'s, the ck:model.
-  py:261-274's) that's quantizes's ONLY's the NoPE's 448's to's fp8'
-  s per-64's (the e4m3's + e8m0's, the RoPE's 64's the bf16's, the
-  ck:model.py:508-512's the `act_quant(kv[..., :-rd], 64, ...)`'s).
-  Same's window's (the last's 128's positions's), a different's
-  quantization's class's (the 32's extra's older's slots's never'
-  attended's).
+- **The window's ring's — RESOLVED (the 2026-09-21's ring's format's
+  task's):** the C++'s ring's now's the `kFp8BlockRope`'s record's (the
+  `src/kernels/latent_format.hpp`'s the new's format's): the NoPE's
+  448's the e4m3's + the e8m0's per 64's (the release's act_quant's
+  block-64's ue8m0's the bitwise's), the RoPE's 64's the raw's bf16's
+  (the positional's precision's the kept's — the reference's "rope
+  dims stay bf16 for positional precision's", the ck:model.py:508-512's
+  `act_quant(kv[..., :-rd], 64, ...)`'s), the 584 B envelope's (the
+  dsv4-native's KV record's + the DSpark union kernel's
+  `dsv4_dspark_decode_record`'s the byte-compat's: [448 e4m3 | 128
+  bf16 RoPE | 7 e8m0 + 1 pad]'s the 8-byte aligned's). The writer's
+  (the `dsa_latent_append`'s the `latent_append_fp8blockrope_kernel`'s,
+  the `src/kernels/dsa.cu`'s) the quantize's the NoPE's prefix's + the
+  copy's the RoPE's tail's; the reader's (the `dsa_attn_partial`'s the
+  `LatentTile<kFp8BlockRope>`'s tile loader's, the `src/kernels/dsa.cu`'
+  s) the decode's the prefix's per-64's + the copy's the tail's the
+  bit-exact's; the CPU's oracle's the `latent_format_fp8blockrope_*`'s
+  (the `tests/unit/latent_format_test.cpp`'s the record's byte layout's
+  + the round-trip's the RoPE's the bit-exact's the NoPE's the
+  per-64's pin's) + the GPU's append's the host codec's parity's
+  (the `tests/cuda/dsa_test.cu`'s the `dsa_latent_append_quantized_'
+  matches_host_codec`'s). The 160's slots's the 128's window's the
+  never-attended-past's claim's VERIFIED's (the §1.2's the file:line's
+  the `csa2.cu:172-193`'s the `window_slots_decode_kernel`'s the
+  `ring_slot_positions_kernel`'s the `ring_slots >= window + 16`'s the
+  validate's the `csa2_layer.cu:38`'s) — the cosmetic's no-op's, the
+  unfixed's.
 - **The main's cache's**: the C++'s `kFp4Block`'s (the e2m1's /
   e4m3/16's over' the full's 512's, the 288 B's row's, the
   `src/kernels/latent_format.hpp:60-64`'s) vs' the reference's

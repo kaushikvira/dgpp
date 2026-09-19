@@ -3626,6 +3626,12 @@ DGPP_TEST(dsa_latent_append_quantized_matches_host_codec) {
   latent_append_quantized_case(LatentFormat::kFp4Block, 32, 5011);
   latent_append_quantized_case(LatentFormat::kFp8Block, 256, 5012);
   latent_append_quantized_case(LatentFormat::kFp4Block, 256, 5013);
+  // The DeepSeek-V4-Flash window ring's mixed-precision record (the G8's
+  // close, 2026-09-21): the NoPE 448's e4m3 + the e8m0 per 64's, the RoPE
+  // 64's raw bf16's — the 584 B envelope's (the device's append's the host
+  // codec's the bitwise's, the RoPE's the tail's the byte-exact's).
+  latent_append_quantized_case(LatentFormat::kFp8BlockRope, 512, 5014);
+  latent_append_quantized_case(LatentFormat::kFp8BlockRope, 128, 5015);  // a 64-wide NoPE prefix
 }
 
 // The three attention kernels over a quantized cache, at the real geometry
@@ -3743,6 +3749,10 @@ DGPP_TEST(dsa_attention_quantized_cache_matches_dequantized_oracle) {
   attention_quantized_case(LatentFormat::kFp8Block, 6003);
   attention_quantized_case(LatentFormat::kFp4Block, 6004);
   attention_quantized_case(LatentFormat::kBf16, 6003);  // the path the others must equal
+  // The mixed-precision record (the split kernel's + the listed/dense
+  // flash kernels' over the 584 B envelope's, against the oracle fed the
+  // dequantized rows' the RoPE's the exact's the NoPE's the quantized's).
+  attention_quantized_case(LatentFormat::kFp8BlockRope, 6005);
 }
 
 // A whole layer (chunked prefill across a partial pool + a decode batch) on

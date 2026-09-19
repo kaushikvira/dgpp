@@ -118,13 +118,19 @@ Dsv4Csa2Layer::Layout Dsv4Csa2Layer::layout(const Dsv4Csa2Config& cfg, int max_t
   // The window ring's per-call slot lists (csa2_window_slots_decode's
   // [rows, window] lists + [rows] counts) and the layer's own window ring
   // (the no-pool positional state: [max_decode_rows][ring_slots] rows of
-  // the fp8_block form + the identity ring table, one block per request —
-  // the dsv41 pool's ring's V4 re-expression). max_decode_rows safely
+  // the fp8_block_rope form + the identity ring table, one block per
+  // request — the dsv41 pool's ring's V4 re-expression). The fp8_block_rope
+  // record's the reference's window KV's mixed-precision's (the G8's first
+  // bullet's close, 2026-09-21): the NoPE 448's e4m3 + the e8m0 per 64's
+  // (the release's act_quant's block-64's ue8m0's), the RoPE 64's raw
+  // bf16's (the reference's "rope dims stay bf16 for positional
+  // precision's"), the 584 B envelope's (the dsv4-native's KV record's,
+  // the DSpark union kernel's the byte-compat's). max_decode_rows safely
   // upper-bounds the distinct-request count (the model's max_requests <=
   // decode_rows_cap() == max_decode_rows).
   L.wlist = alloc(size_t(max_decode_rows) * size_t(cfg.window) * 4);
   L.wcounts = alloc(size_t(max_decode_rows) * 4);
-  L.ring = alloc(size_t(max_decode_rows) * size_t(cfg.ring_slots) * latent_row_bytes(LatentFormat::kFp8Block, kCsa2Latent));
+  L.ring = alloc(size_t(max_decode_rows) * size_t(cfg.ring_slots) * latent_row_bytes(LatentFormat::kFp8BlockRope, kCsa2Latent));
   L.ring_table = alloc(size_t(max_decode_rows) * 4);
   L.pos_sel = alloc(size_t(max_decode_rows) * 8);
   // The v4-owned 64-head selection's workspace + counters (the dsa_select
@@ -402,11 +408,16 @@ void Dsv4Csa2Layer::attend(int tokens, const int64_t* pos, const int32_t* req_id
   // The two-source attention (the dsv41 layer's Csa2StatePool's wiring's
   // V4 re-expression, the no-pool positional state):
   //   * the window source: dsa_attn_partial over the layer's own ring
-  //     (the fp8_block ring format, the window slot lists wlist_ / wcounts_
-  //     the csa2_window_slots_decode's, the n_split_win the decode's
-  //     key-dimension split's the kWinDecodeSplit's) -> m_win_ / l_win_ /
-  //     c_win_. The ring is always available (the layer scratch's), so the
-  //     window source always runs.
+  //     (the fp8_block_rope record — the reference's window KV's mixed-
+  //     precision's: the NoPE 448's e4m3 + the e8m0 per 64's, the RoPE
+  //     64's raw bf16's the bit-exact's, the G8's first bullet's the
+  //     2026-09-21's close's, so the window source sees the reference's
+  //     KV precision's the RoPE's positional's signal's unquantized's —
+  //     the window slot lists wlist_ / wcounts_ the csa2_window_slots_
+  //     decode's, the n_split_win the decode's key-dimension split's the
+  //     kWinDecodeSplit's) -> m_win_ / l_win_ / c_win_. The ring is
+  //     always available (the layer scratch's), so the window source
+  //     always runs.
   //   * the main source: dsa_attn_listed over the planar main cache (the
   //     kFp4Block main format, the identity block table's the no-pool
   //     positional state's) + the selected topk_ / counts_ -> m_main_ /
@@ -418,7 +429,7 @@ void Dsv4Csa2Layer::attend(int tokens, const int64_t* pos, const int32_t* req_id
   const int n_split_win = std::min(decode_n_split_, kWinDecodeSplit);
   dsa_attn_partial(q_, ring_, req_ids, wlist_, cfg_.window, wcounts_, tokens, n_split_win, lh, kCsa2Latent,
                    cfg_.ring_slots, ring_table_, 1, attn_scale_, m_win_, l_win_, c_win_, stream,
-                   LatentFormat::kFp8Block, nullptr, 0);
+                   LatentFormat::kFp8BlockRope, nullptr, 0);
   int n_main = 0;
   if (main_cache != nullptr && w_.ratio > 0) {
     // The planar main cache's entries-per-block (the 128-token block's the
@@ -467,8 +478,10 @@ void Dsv4Csa2Layer::enqueue_decode(const void* hidden_in, void* main_cache, void
   // The decode's hot path (the graph-capturable one), the dsv41 layer's
   // Csa2StatePool's wiring's V4 re-expression (the no-pool positional state):
   //   1. the projections (q, the window latent kv).
-  //   2. the window ring's append (the layer's own ring, the fp8_block ring
-  //      format, the ring slot = pos % ring_slots) — the ring is read after
+  //   2. the window ring's append (the layer's own ring, the fp8_block_rope'
+  //      record's — the reference's window KV's the mixed-precision's: the
+  //      NoPE 448's e4m3 + the e8m0 per 64's, the RoPE 64's raw bf16's —
+  //      the ring slot = pos % ring_slots) — the ring is read after
   //      the append, so this batch's rows are visible to its own queries.
   //   3. the window slot lists (csa2_window_slots_decode).
   //   4. the compressor (the 0731's reference's form's, the ratio's
@@ -493,10 +506,12 @@ void Dsv4Csa2Layer::enqueue_decode(const void* hidden_in, void* main_cache, void
   project_q_kv(hidden_in, tokens, pos, stream);
   csa2_ring_slot_positions(pos, slots_, tokens, cfg_.ring_slots, stream);
   // The window ring's append (the layer's own ring, the no-pool positional
-  // state; the fp8_block ring format, one block per request — the dsv41
-  // pool's ring's V4 re-expression).
+  // state; the fp8_block_rope record — the NoPE 448's e4m3 + the e8m0 per
+  // 64's, the RoPE 64's raw bf16's the reference's window KV's, one block
+  // per request — the dsv41 pool's ring's V4 re-expression; the append
+  // kernel's the quantize's the prefix's + the copy's the tail's).
   dsa_latent_append(kv_, req_ids, slots_, tokens, ring_table_, 1, cfg_.ring_slots, ring_, kCsa2Latent, stream,
-                    LatentFormat::kFp8Block);
+                    LatentFormat::kFp8BlockRope);
   csa2_window_slots_decode(pos, tokens, cfg_.window, cfg_.ring_slots, wlist_, wcounts_, stream);
   if (w_.ratio > 0 && w_.kv_source) {
     // The reference's compressor (the 0731's Compressor's the ratio's
