@@ -89,9 +89,18 @@ void Dsv4DsparkLayer::rebind(const Dsv4DsparkWeights& w, int layer) {
 bool Dsv4DsparkLayer::prepare(int rows) {
   if (rows <= 0 || rows > max_rows_) throw std::invalid_argument("dsv4 dspark layer: prepare rows out of range");
   // The main projection's GEMM plan (the fp8 grid's, the V4's 128 x 128's
-  // F32-decoded e8m0 scales) + the lm head's.
+  // F32-decoded e8m0 scales) + the lm head's. The main projection's
+  // activation is the 3-target stream mean's fused [rows, num_targets x
+  // hidden]'s buffer (the model's main_hidden_'s the [M, targets * H]'s,
+  // the fp8 grid's kernel's the launch_scale_gemm_grid_bf16's at the
+  // full width's): its act_row_stride's the full width's (the IGemm's
+  // k's for the contiguous's), never the per-target hidden's — a stride
+  // below the k's an invalid cuBLASLt B layout (the (k x m)'s ld's < its
+  // k's rows's, the columns' the overlap's) that the plan's heuristic's
+  // rejects's (the 2026-09-19 window's 'DSpark plans unavailable' blocker's,
+  // the docs/deepseek_v4_flash_plan.md's diagnosis's).
   const int main_k = int64_t(cfg_.num_targets) * cfg_.hidden;
-  const size_t main_stride = size_t(cfg_.hidden);
+  const size_t main_stride = size_t(main_k);
   const bool main_ok = gemm_.ensure_plan(rows, cfg_.hidden, main_k, DType::BF16, GemmOut::BF16, main_stride);
   const bool lm_ok =
       gemm_.ensure_plan(rows, cfg_.lm_vocab_count, cfg_.hidden, DType::BF16, GemmOut::F32, size_t(cfg_.hidden));
