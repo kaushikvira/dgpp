@@ -56,4 +56,31 @@ DGPP_TEST(dsv4_model_session_snapshot_bytes_the_c4a_tail_width) {
               " want " + std::to_string(want));
 }
 
+DGPP_TEST(dsv4_model_union_attn_out_bytes_the_dspark_64_head_shape) {
+  // The DSpark union attention's out latent's shape's pin (the 2026-09-20's
+  // dsv4 S3's union-attn's q-latent's + the block-kv's wiring's): the
+  // [max_rows, 64, 512]'s the bf16's (the Dsv4DsparkConfig's kHeads's x
+  // kHeadDim's the DSpark's 64-head's the 512-dim's output's) — the model's
+  // staging's (the q fallback's + the out's the 2x's the constructor's the
+  // scratch's the same's formula's the union_attn_out_bytes's static's).
+  // A pure host's function's (the no CUDA's, the dsv4_model_state_test's the
+  // same's pattern's — it links the v4 model's library's but calls only
+  // host's the functions's).
+  const int max_rows = 16;  // a decode batch's row count
+  const size_t want = static_cast<size_t>(max_rows) * static_cast<size_t>(dgpp::Dsv4DsparkConfig::kHeads) *
+                      static_cast<size_t>(dgpp::Dsv4DsparkConfig::kHeadDim) * sizeof(uint16_t);
+  const size_t got = dgpp::Dsv4Model::union_attn_out_bytes(max_rows);
+  require(got == want,
+          "union_attn_out_bytes must pin the DSpark 64-head out latent's shape, got " + std::to_string(got) +
+              " want " + std::to_string(want));
+  // The degenerate's max_rows == 0's the no-rows's the 1's row's bound's
+  // (the std::max(1, max_rows)'s the constructor's the no-zero's alloc's):
+  // the formula's floors at 1's row's (the never's a zero-byte's alloc's).
+  const size_t want0 =
+      static_cast<size_t>(1) * static_cast<size_t>(dgpp::Dsv4DsparkConfig::kHeads) *
+      static_cast<size_t>(dgpp::Dsv4DsparkConfig::kHeadDim) * sizeof(uint16_t);
+  const size_t got0 = dgpp::Dsv4Model::union_attn_out_bytes(0);
+  require(got0 == want0, "union_attn_out_bytes(0) must floor at 1 row (the no-zero's alloc's)");
+}
+
 int main() { return ::dgpp::test::run_all(); }

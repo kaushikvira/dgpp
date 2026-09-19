@@ -113,6 +113,20 @@ size_t Dsv4Model::dspark_scratch_bytes(const Dsv4TextConfig& cfg, int lm_vocab_c
   return (off + 255) / 256 * 256;
 }
 
+size_t Dsv4Model::union_attn_out_bytes(int max_rows) {
+  // The DSpark union attention's out latent's (the 2026-09-20's dsv4 S3's
+  // union-attn's q-latent's + the block-kv's wiring's): the [max_rows, 64,
+  // 512]'s the bf16's (the Dsv4DsparkConfig's kHeads's x kHeadDim's the
+  // DSpark's 64-head's the 512-dim's output's). The q latent's + the block
+  // kv's the csa2 projection's real output's (the csa2 layer's q_latent's /
+  // the block_kv's the getter's), so the model's staging's only the out
+  // latent's (the 2026-09-18's stand-in's scratch's the q / the block's /
+  // the out's three's regions's the single's out region's the replaced's).
+  const size_t R = static_cast<size_t>(std::max(1, max_rows));
+  return R * static_cast<size_t>(Dsv4DsparkConfig::kHeads) * static_cast<size_t>(Dsv4DsparkConfig::kHeadDim) *
+         sizeof(uint16_t);
+}
+
 // ---------------------------------------------------------------------------
 // Construction.
 // ---------------------------------------------------------------------------
@@ -301,16 +315,23 @@ Dsv4Model::Dsv4Model(const Dsv4TextConfig& cfg, const std::string& checkpoint_di
     dspark_cfg_ = dspark_config(cfg_, targets_, lm_vocab_begin_, lm_vocab_count_);
     dspark_scratch_bytes_ = dspark_scratch_bytes(cfg_, lm_vocab_count_, max_decode_rows_);
     dspark_scratch_ = dev_alloc<char>(dspark_scratch_bytes_);
-    // The DSpark union attention's staging (the 512-dim's the dsv4 DSpark's
-    // kHeadDim's): the q latent's [max_decode_rows] + the in-memory block's kv's
-    // [block_size] + the out latent's [max_decode_rows] (the csa2 projection's
-    // outputs' the csa2 seam's the parallel agent's the csa2 partial fills's
-    // until the wiring's complete's).
-    const size_t head_dim = 512;  // the dsv4 DSpark's kHeadDim's (the 448 NoPE + 64 RoPE's)
-    const size_t uq = static_cast<size_t>(head_dim) * static_cast<size_t>(max_decode_rows_);
-    const size_t ub = static_cast<size_t>(head_dim) * static_cast<size_t>(cfg_.dspark_block_size);
-    union_attn_scratch_bytes_ = (uq + ub + uq) * sizeof(uint16_t);
+    // The DSpark union attention's staging (2026-09-20, the dsv4 S3's
+    // union-attn's q-latent's + the block-kv's wiring's): two's the
+    // [max_decode_rows, 64, 512]'s the bf16's regions' — region 0's the q
+    // fallback's (the zeroed's stand-in's the tp>1's the head count's the
+    // DSpark's replicated's 64-head's vs. the csa2's sharded's local's
+    // delta's the no-OOB's safe's interim's) + region 1's the out latent's
+    // (the DSpark's 64-head's the 512-dim's output's). The q latent's + the
+    // block kv's the csa2 projection's real output's (the csa2 layer's
+    // q_latent's / the block_kv's the getter's the 2026-09-18's stand-in's
+    // scratch's the csa2 seam's the fill's the removed's — the tp=1's the
+    // real q's the csa2 q's the 64's head's the match's, the tp>1's the
+    // head count's delta's the zeroed's fallback's the interim's).
+    union_attn_scratch_bytes_ = 2 * union_attn_out_bytes(max_decode_rows_);
     union_attn_scratch_ = dev_alloc<char>(union_attn_scratch_bytes_);
+    // The q fallback's (region 0's) the zeroed's (the out region's region 1's
+    // the kernel's writes's it's, no zero's needed's).
+    DGPP_CUDA_OK(cudaMemsetAsync(union_attn_scratch_, 0, union_attn_out_bytes(max_decode_rows_), stream_));
     dspark_ = std::make_unique<Dsv4DsparkLayer>(gemm_, dspark_cfg_, max_decode_rows_, dspark_scratch_,
                                                  dspark_scratch_bytes_, gemm_ws_, gemm_ws_bytes_);
   }
@@ -510,6 +531,9 @@ Dsv4Model::MemoryPlan Dsv4Model::plan_memory(const Dsv4TextConfig& cfg, int max_
   if (mtp)
     plan.add("dspark scratch (the stream mean's, the block rows', the base logits', the confidence's)",
              dspark_scratch_bytes(cfg, static_cast<int>(V), rows));
+  if (mtp)
+    plan.add("dspark union attention's staging (the q fallback's + the out latent's the [rows, 64, 512]'s the bf16's x2's)",
+             2 * union_attn_out_bytes(rows));
   {
     size_t core_dev = 0, core_pin = 0;
     const size_t targets = cfg.dspark_target_layer_ids.size();
@@ -947,19 +971,40 @@ void Dsv4Model::enqueue_layer(const Dsv4LayerResident& r, int layer, int T, cons
   float* index_scale = (index_cache != nullptr) ? index_scale_[static_cast<size_t>(cord)] : nullptr;
   csa2_->enqueue_decode(x_, main_cache, index_cache, index_scale, rows.req_ids, rows.pos, rows.spans, rows.num_requests,
                        T, attn_out, stream_, nullptr, tails, tails_w_);
-  // The DSpark union attention (2026-09-18, the dsv4 dspark + compressor
-  // wiring; the dsv4_dspark_union_attn's the 3-phase's single softmax's over
-  // [compressed | raw ring | block]'s): the draft stages' (43/44/45's)
-  // SWA-only's attention (the no-compressed-phase's, the no-raw-ring's, the
-  // in-memory block's). The q latent's + the block kv's stand in the csa2
-  // seam's (the parallel agent's the csa2 partial fills's) until the wiring's
-  // complete's (the csa2 projection's the 512-dim's latent's the csa2 layer's
-  // the private's, the model's staging's the csa2 seam's the fill's).
+  // The DSpark union attention (2026-09-20, the dsv4 S3's union-attn's
+  // q-latent's + the block-kv's wiring's; the dsv4_dspark_union_attn's the
+  // 3-phase's single softmax's over [compressed | raw ring | block]'s):
+  // the draft stages' (43/44/45's) SWA-only's attention (the no-
+  // compressed-phase's n_comp == 0's, the no-raw-ring's raw_n == 0's, the
+  // in-memory block's). The q latent's + the block kv's the csa2
+  // projection's real output's (the csa2 layer's q_latent's / the block_kv's
+  // the getter's — the 2026-09-18's stand-in's scratch's the csa2 seam's the
+  // fill's the replaced's): the q_latent's the csa2 q's (the wq_b's q
+  // latent's the RoPE'd's the G-q-renorm's gap's the absent's) + the
+  // block_kv's the csa2 kv's (the wkv's block kv's the in-memory's
+  // unquantized's the step's rows' own kv_latent's). The pool's (the C4A's
+  // compressed's the n_comp > 0's the VERIFY's phase's) + the raw ring's
+  // (the 584 B's projected-main-hidden's the ring's append's) stay null (the
+  // C4A's prefill's compressor's + the pool's geometry's the G-union-
+  // wiring's / the G-cache-format's the open's — the DRAFT's n_comp == 0's
+  // the ratio-0's class's, the pool's / the ring's the separate's named's
+  // gap's). The DSpark kernel's 64-head's form (the kHeads's) vs. the csa2
+  // layer's local_heads()'s (the 64/tp's): the real q-latent's the csa2
+  // q's only when they match (the tp=1's the 64's); the tp>1's the head
+  // count's the DSpark's replicated's 64-head's vs. the csa2's sharded's
+  // local's the geometry's delta's (the zeroed's q fallback's the no-OOB's
+  // safe's interim's, the parity's gate's settles's the DSpark's sharding's
+  // decision's). The block's the single-request's the groups == 1's the
+  // n_block == block_size's the in-memory's the step's m rows' own's;
+  // the groups > 1's the per-request's block's the kernel's shared's form's
+  // the delta's (the parity's gate's the batched's block's wiring's).
   if (layer >= cfg_.num_hidden_layers && dspark_ != nullptr && union_attn_scratch_ != nullptr) {
-    const size_t head_dim = 512;  // the dsv4 DSpark's kHeadDim's (the 448 NoPE + 64 RoPE's)
-    uint16_t* q_latent = static_cast<uint16_t*>(union_attn_scratch_);
-    uint16_t* block_kv = q_latent + head_dim * max_decode_rows_;
-    uint16_t* out_latent = block_kv + head_dim * cfg_.dspark_block_size;
+    const size_t per_row = static_cast<size_t>(Dsv4DsparkConfig::kHeads) * static_cast<size_t>(Dsv4DsparkConfig::kHeadDim);
+    uint16_t* q_fallback = static_cast<uint16_t*>(union_attn_scratch_);  // region 0's the zeroed's
+    uint16_t* out_latent = q_fallback + static_cast<size_t>(max_decode_rows_) * per_row;  // region 1's
+    const uint16_t* q_latent = (csa2_->config().local_heads() == Dsv4DsparkConfig::kHeads) ? csa2_->q_latent()
+                                                                                           : q_fallback;
+    const uint16_t* block_kv = csa2_->block_kv();
     dspark_->union_attn(q_latent, nullptr, nullptr, 0, nullptr, 0, block_kv, cfg_.dspark_block_size, out_latent, T,
                         stream_);
   }

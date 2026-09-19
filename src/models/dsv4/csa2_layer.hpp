@@ -182,6 +182,24 @@ class Dsv4Csa2Layer {
   int layer() const { return layer_; }
   // The index-key / q exactness violations so far (a host read; synchronizes).
   unsigned index_violations() const;
+  // The csa2 projection's staging outputs (the DSpark union attention's
+  // q-latent + block-kv's the real source's — the 2026-09-20's dsv4 S3's
+  // union-attn's q-latent's + the block-kv's wiring's, the 2026-09-18's
+  // stand-in's scratch's the csa2 seam's the fill's the replaced's):
+  //   q_latent  the wq_b's q latent's (the [tokens, local_heads, 512]'s
+  //                the RoPE'd's, the q-renorm's the G-q-renorm's gap's the
+  //                absent's — the DSpark union attention's q_latent's the
+  //                ready's 512-dim's latent's the caller's contract's).
+  //   block_kv  the wkv's block kv's (the [tokens, 512]'s the in-memory's
+  //                unquantized's the window's latent's — the DSpark union
+  //                attention's block phase's the in-memory's bf16's the
+  //                step's rows' own kv_latent's).
+  // The model's enqueue_layer's the draft stages' the DSpark union
+  // attention's the real input's (the q_latent's / the block_kv's the
+  // csa2 layer's the private's the 2026-09-18's the model's staging's the
+  // csa2 seam's the fill's the exposed's).
+  const uint16_t* q_latent() const { return q_; }
+  const uint16_t* block_kv() const { return kv_; }
 
  private:
   struct Layout;

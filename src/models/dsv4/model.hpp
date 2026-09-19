@@ -30,10 +30,15 @@
 // dsv4_dspark_union_attn) — the model now calls the union attention on
 // the decode/draft path (the 2026-09-18's dsv4 dspark + compressor
 // wiring's the enqueue_layer's the draft stages' the SWA-only's the no-
-// compressed-phase's, the no-raw-ring's, the in-memory block's), the q
-// latent's + the block kv's stand in the csa2 seam's (the parallel
-// agent's the csa2 partial fills's) until the wiring's complete's — the
-// model passes the planar cache pointers
+// compressed-phase's, the no-raw-ring's, the in-memory block's); the
+// 2026-09-20's dsv4 S3's union-attn's q-latent's + the block-kv's wiring's
+// the model's the csa2 projection's real output's (the csa2 layer's
+// q_latent's / the block_kv's the getter's the 2026-09-18's stand-in's
+// scratch's the csa2 seam's the fill's the replaced's) as the union
+// attention's q latent's + the block kv's (the draft stages' the SWA-only's
+// the n_comp == 0's the in-memory block's the pool's / the raw ring's the
+// null's the C4A's prefill's compressor's + the pool's geometry's the open's
+// gap's). The model passes the planar cache pointers
 // (nullptr for now, the layer's the caller's contract's) and runs the
 // draft stages' walk on the CSA2 decode enqueue. The numerics' the
 // committed surface's (the parity gate's the GPU's the morning's
@@ -141,6 +146,15 @@ class Dsv4Model : public SessionModel<Dsv4Model> {
   static Dsv4Csa2Config csa2_config(const Dsv4TextConfig& cfg, int tp_world);
   static Dsv4HashConfig hash_config(const Dsv4TextConfig& cfg, int tp_world);
   static Dsv4DsparkConfig dspark_config(const Dsv4TextConfig& cfg, int targets, int lm_vocab_begin, int lm_vocab_count);
+  // The DSpark union attention's out latent's byte's (the 2026-09-20's dsv4 S3's
+  // union-attn's q-latent's wiring's): the [max_rows, 64, 512]'s the bf16's
+  // (the Dsv4DsparkConfig's kHeads's x kHeadDim's the DSpark's 64-head's
+  // 512-dim's output's the one's the DSpark's union attention's out latent's).
+  // A pure host's formula's (the constructor's + the memory plan's share
+  // it's, the dspark_scratch_bytes's the same's pattern's) — public's the
+  // dsv4_model_state_test's the shape's pin's the same's session_snapshot_
+  // bytes's pattern's.
+  static size_t union_attn_out_bytes(int max_rows);
 
   const Dsv4TextConfig& config() const { return cfg_; }
 
@@ -250,13 +264,18 @@ class Dsv4Model : public SessionModel<Dsv4Model> {
   size_t hash_scratch_bytes_ = 0;
   void* dspark_scratch_ = nullptr;
   size_t dspark_scratch_bytes_ = 0;
-  // The DSpark union attention's staging (2026-09-18, the dsv4 dspark +
-  // compressor wiring; the dsv4_dspark_union_attn's the 3-phase's single
-  // softmax's the q latent's + the in-memory block's kv's + the out latent's,
-  // the 512-dim's the dsv4 DSpark's kHeadDim's): the csa2 projection's
-  // outputs (the q latent's, the block kv's) stand in the csa2 seam's
-  // (the parallel agent's the csa2 partial fills's) until the wiring's
-  // complete's.
+  // The DSpark union attention's staging (2026-09-20, the dsv4 S3's
+  // union-attn's q-latent's + the block-kv's wiring's): two's the
+  // [max_decode_rows, 64, 512]'s the bf16's regions' — region 0's the q
+  // fallback's (the zeroed's stand-in's the tp>1's the head count's the
+  // DSpark's replicated's 64-head's vs. the csa2's sharded's local's
+  // delta's the no-OOB's safe's interim's) + region 1's the out latent's
+  // (the DSpark's 64-head's the 512-dim's output's). The q latent's + the
+  // block kv's the csa2 projection's real output's (the csa2 layer's
+  // q_latent's / the block_kv's the getter's the 2026-09-18's stand-in's
+  // scratch's the csa2 seam's the fill's the removed's — the tp=1's the
+  // real q's the csa2 q's the 64's head's the match's, the tp>1's the
+  // head count's delta's the zeroed's fallback's the interim's).
   void* union_attn_scratch_ = nullptr;
   size_t union_attn_scratch_bytes_ = 0;
   float* inv_freq_window_ = nullptr;      // device [32]
