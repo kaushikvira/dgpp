@@ -72,3 +72,6 @@ scripts/maximize-cluster-memory.sh
 .pi/
 
 dsv4_loader_fixture/
+
+# The dsv4 GPU-window gate suite writes its run artifacts here.
+dsv4-gates/
