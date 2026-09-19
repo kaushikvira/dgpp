@@ -465,14 +465,17 @@ Dsv4Model::MemoryPlan Dsv4Model::plan_memory(const Dsv4TextConfig& cfg, int max_
 size_t Dsv4Model::session_snapshot_bytes(const Dsv4TextConfig& cfg, int, bool) {
   // The ratio-4 (C4A) overlapping compressor's per-request tails (2026-09-18,
   // the dsv4 dspark + compressor wiring; the dsv41 csa2_compress_decode_update's
-  // re-expression, the fp32 [2, 512]'s): the pending even's kv (the first 512)
-  // + the score (the second 512). The positional rings (the layer scratch's,
-  // the slot's the position's) need no snapshot (a rejected draft's slot is
-  // never read by a later query), so the tails are the only per-request state.
+  // re-expression on the C4A's width, the fp32 [2, kCsa2TailW]'s): the pending
+  // even's kv (the first W = 1024) + the score (the second W = 1024). The
+  // positional rings (the layer scratch's, the slot's the position's) need no
+  // snapshot (a rejected draft's slot is never read by a later query), so the
+  // tails are the only per-request state. W = kCsa2TailW = 1024 (the C4A's
+  // coff x kCsa2Latent; docs/dsv4_attention_spec.md §0.3) — kept in step with
+  // the instance's tails_w_ (the snapshot_state_bytes's the same formula's).
   size_t tails = 0;
   for (int l = 0; l < cfg.num_hidden_layers; ++l)
     if (cfg.is_index_layer(l)) ++tails;
-  return tails * 2 * 512 * sizeof(float);
+  return tails * 2 * static_cast<size_t>(kCsa2TailW) * sizeof(float);
 }
 
 size_t Dsv4Model::snapshot_state_bytes() const {

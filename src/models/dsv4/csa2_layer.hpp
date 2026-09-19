@@ -38,6 +38,14 @@
 
 namespace dgpp {
 
+// The C4A (ratio-4, coff 2) overlapping compressor's output width (the wkv /
+// wgate's [1024, 4096] census; docs/dsv4_attention_spec.md §0.3): W = coff *
+// kCsa2Latent = 2 * 512 = 1024. The per-request tail is fp32 [2, W] (the
+// pending even's kv (the first W) + the gate score (the second W)), and the
+// state row is the same 1024 (the checkpoint's kv_state / score_state's
+// (b, coff * ratio, coff * head_dim) = (b, 8, 1024)).
+inline constexpr int kCsa2TailW = 2 * kCsa2Latent;  // 1024 (the C4A's W)
+
 // The V4 CSA2 geometry (the dsv4 config's attention block, the world-2
 // deployment: the local_heads / local_groups are the per-rank slices).
 struct Dsv4Csa2Config {
