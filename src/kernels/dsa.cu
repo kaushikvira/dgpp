@@ -258,6 +258,67 @@ struct LatentTile<LatentFormat::kFp4Block> {
   }
 };
 
+// fp8_block_rope (2026-09-21, DeepSeek-V4-Flash's window ring's the
+// G8's close): the reference's act_quant(kv[..., :-rd], 64, ...)'s
+// record — the NoPE prefix's e4m3 with an e8m0 scale per 64 (the
+// kFp8Block's per-32's per-64's re-expression) + the RoPE tail raw
+// bf16 (the reference's "rope dims stay bf16 for positional
+// precision's" — the bit-exact half's). The 584 B envelope's (the
+// dsv4-native's KV record's, the DSpark union kernel's
+// dsv4_dspark_decode_record's the byte-compat's): [n e4m3 | 64 bf16 |
+// n/64 e8m0 + 1 pad]'s the row's 8-byte aligned's — the rope region's
+// reads' the uint2's (the 584's stride's the odd row's 16's
+// unaligned's, the uint4's the loads's the no's), the codes' the
+// uint2's (the 8's the aligned's). The decode's one exact fp32
+// multiply by a power of two and a bf16 rounding that changes
+// nothing (latent_fp8_block_decode_bf16), as for kFp8Block.
+template <>
+struct LatentTile<LatentFormat::kFp8BlockRope> {
+  static __device__ __forceinline__ uint32_t decode2(uint16_t codes, float s) {
+    const float2 v = fp8x2_to_float2(codes);
+    return pack_bf16x2(float_to_bf16_bits(v.x * s), float_to_bf16_bits(v.y * s));
+  }
+  static __device__ __forceinline__ uint4 load8(const uint8_t* cache,
+                                                const float*, int64_t phys,
+                                                size_t row_bytes, int kv_lora, int e) {
+    const uint8_t* row = cache + phys * int64_t(row_bytes);
+    const int n = latent_fp8blockrope_nope(kv_lora);
+    if (e >= n) {
+      // The raw-bf16 RoPE tail: the 584's row stride's the odd row's
+      // 16's unaligned's, so the two uint2's (8-byte aligned's) — the
+      // uint4's the load's the no's.
+      const uint2 a =
+          *reinterpret_cast<const uint2*>(row + latent_fp8blockrope_rope_offset(kv_lora) +
+                                           (e - n) * 2);
+      const uint2 b =
+          *reinterpret_cast<const uint2*>(row + latent_fp8blockrope_rope_offset(kv_lora) +
+                                           (e - n) * 2 + 8);
+      return make_uint4(a.x, a.y, b.x, b.y);
+    }
+    const uint2 raw = *reinterpret_cast<const uint2*>(row + e);
+    const float s = e8m0_byte_to_float(
+        row[latent_fp8blockrope_scale_offset(kv_lora) + (e / kLatentFp8BlockGroup64)]);
+    uint4 out;
+    out.x = decode2(static_cast<uint16_t>(raw.x & 0xFFFFu), s);
+    out.y = decode2(static_cast<uint16_t>(raw.x >> 16), s);
+    out.z = decode2(static_cast<uint16_t>(raw.y & 0xFFFFu), s);
+    out.w = decode2(static_cast<uint16_t>(raw.y >> 16), s);
+    return out;
+  }
+  static __device__ __forceinline__ uint16_t load1(const uint8_t* cache,
+                                                   const float*, int64_t phys,
+                                                   size_t row_bytes, int kv_lora, int e) {
+    const uint8_t* row = cache + phys * int64_t(row_bytes);
+    const int n = latent_fp8blockrope_nope(kv_lora);
+    if (e >= n)
+      return *reinterpret_cast<const uint16_t*>(
+          row + latent_fp8blockrope_rope_offset(kv_lora) + (e - n) * 2);
+    const float s = e8m0_byte_to_float(
+        row[latent_fp8blockrope_scale_offset(kv_lora) + (e / kLatentFp8BlockGroup64)]);
+    return latent_fp8_block_decode_bf16(row[e], s);
+  }
+};
+
 // The cache row's stride: the format's payload plus the bf16 rope tail.
 __host__ __device__ constexpr size_t latent_cache_row_bytes(LatentFormat f, int kv_lora,
                                                             int rope) {
@@ -892,6 +953,80 @@ __global__ void latent_append_fp4block_kernel(const uint16_t* latent_rows,
   for (int j = 0; j < 8; ++j) w1 |= static_cast<uint32_t>(latent_fp4_block_encode_abs(v[8 + j], S)) << (4 * j);
   *reinterpret_cast<uint32_t*>(row + (e0 >> 1)) = w0;
   *reinterpret_cast<uint32_t*>(row + (e0 >> 1) + 4) = w1;
+}
+
+// fp8_block_rope (2026-09-21, DeepSeek-V4-Flash's window ring's the
+// G8's close): the reference's act_quant(kv[..., :-rd], 64, ...)'s
+// record — the NoPE 448's e4m3 + the e8m0 per 64's (the release's
+// act_quant's block-64's ue8m0's bitwise), the RoPE 64's raw bf16's
+// (the positional's precision's the kept's — the reference's "rope
+// dims stay bf16 for positional precision's"). Thread t quantizes
+// elements [8t, 8t+8) with the e8m0 scale of its 64-element group
+// (eight consecutive lanes; kv_lora - 64 a multiple of 64); the RoPE
+// tail's the raw bf16's copy's (the 128's bytes' the 16's uint2's —
+// the 584's row stride's the 8-byte aligned's the uint2's the stores's,
+// the uint4's the no's); the pad's byte's the zero's (the initcheck's
+// discipline's — no byte's the row's the uninitialized's).
+__global__ void latent_append_fp8blockrope_kernel(const uint16_t* latent_rows,
+                                                 const int32_t* req_ids,
+                                                 const int64_t* pos,
+                                                 const int32_t* block_tables,
+                                                 int blocks_per_request,
+                                                 int block_tokens, uint8_t* latent_cache,
+                                                 int kv_lora, size_t cache_row_bytes) {
+  const int64_t i = blockIdx.x;
+  const int64_t phys = latent_physical_slot(req_ids, pos, block_tables,
+                                            blocks_per_request, block_tokens, i);
+  if (phys < 0) return;
+  const size_t row_bytes = latent_row_bytes(LatentFormat::kFp8BlockRope, kv_lora);  // the payload
+  uint8_t* row = latent_cache + phys * static_cast<int64_t>(cache_row_bytes);
+  const int n = latent_fp8blockrope_nope(kv_lora);  // the NoPE prefix
+  const size_t rope_off = latent_fp8blockrope_rope_offset(kv_lora);
+  const size_t scale_off = latent_fp8blockrope_scale_offset(kv_lora);
+  // The RoPE tail's the raw bf16's (the 64's dims' the 128's bytes' the
+  // 16's uint2's) + the pad's byte's the zero's (the scales' the
+  // 7's + the pad's 1's the row's 584's the 583's the last's — the
+  // initcheck's discipline's the written's once's).
+  {
+    const uint2* s2 = reinterpret_cast<const uint2*>(latent_rows + i * kv_lora + n);
+    uint2* d2 = reinterpret_cast<uint2*>(row + rope_off);
+    for (int j = threadIdx.x; j < kLatentRopeBf16 / 4; j += blockDim.x) d2[j] = s2[j];
+    if (threadIdx.x == 0)
+      for (size_t k = scale_off + static_cast<size_t>(n) / kLatentFp8BlockGroup64; k < row_bytes; ++k)
+        row[k] = 0;
+  }
+  const int e0 = threadIdx.x * 8;
+  const bool active = e0 < n;
+  float v[8];
+  float amax = 0.0f;
+  if (active) {
+    const uint4 raw = *reinterpret_cast<const uint4*>(latent_rows + i * kv_lora + e0);
+    const uint32_t* w = reinterpret_cast<const uint32_t*>(&raw);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      v[2 * j] = bf16_bits_to_float(static_cast<uint16_t>(w[j] & 0xFFFFu));
+      v[2 * j + 1] = bf16_bits_to_float(static_cast<uint16_t>(w[j] >> 16));
+      amax = fmaxf(amax, fmaxf(fabsf(v[2 * j]), fabsf(v[2 * j + 1])));
+    }
+  }
+  // The group's absmax across its eight lanes (exact, order-free).
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 4));
+  if (!active) return;
+  const uint8_t sb = latent_fp8_block_scale_byte(amax);
+  if ((threadIdx.x & 7) == 0) row[scale_off + static_cast<size_t>(e0 / kLatentFp8BlockGroup64)] = sb;
+  const float s = e8m0_byte_to_float(sb);
+  uint2 packed;
+  packed.x = 0;
+  packed.y = 0;
+#pragma unroll
+  for (int j = 0; j < 4; ++j)
+    packed.x |= static_cast<uint32_t>(latent_fp8_block_encode(v[j], s)) << (8 * j);
+#pragma unroll
+  for (int j = 0; j < 4; ++j)
+    packed.y |= static_cast<uint32_t>(latent_fp8_block_encode(v[4 + j], s)) << (8 * j);
+  *reinterpret_cast<uint2*>(row + e0) = packed;
 }
 
 __global__ void gather_index_pools_kernel(const int32_t* block_table,
@@ -2786,6 +2921,20 @@ void dsa_latent_append(const void* latent_rows, const int32_t* req_ids,
           blocks_per_request, block_tokens, static_cast<uint8_t*>(latent_cache),
           kv_lora, row_bytes, rr, rope_dim);
       break;
+    case LatentFormat::kFp8BlockRope:
+      // The record's self-contained (the RoPE tail's the format's, not
+      // the caller's rope_rows's) — the 584 B envelope's the 8-byte
+      // aligned's rows's the 16's unaligned's the odd's (the uint2's the
+      // loads's).
+      if (rope_dim != 0 || kv_lora <= kLatentRopeBf16 ||
+          (kv_lora - kLatentRopeBf16) % kLatentFp8BlockGroup64 != 0 ||
+          kv_lora > 8 * kLatentAppendThreads)
+        DGPP_CUDA_OK(cudaErrorInvalidValue);
+      latent_append_fp8blockrope_kernel<<<unsigned(tokens), kLatentAppendThreads, 0, stream>>>(
+          static_cast<const uint16_t*>(latent_rows), req_ids, pos, block_tables,
+          blocks_per_request, block_tokens, static_cast<uint8_t*>(latent_cache),
+          kv_lora, row_bytes);
+      break;
   }
   DGPP_CUDA_OK(cudaGetLastError());
 }
@@ -3059,6 +3208,9 @@ void dsa_attn_partial(const void* q_tilde, const void* latent_cache,
     case LatentFormat::kFp4Block:
       launch(std::integral_constant<LatentFormat, LatentFormat::kFp4Block>{});
       break;
+    case LatentFormat::kFp8BlockRope:
+      launch(std::integral_constant<LatentFormat, LatentFormat::kFp8BlockRope>{});
+      break;
   }
   DGPP_CUDA_OK(cudaGetLastError());
 }
@@ -3119,6 +3271,12 @@ void launch_attn_flash_format(LatentFormat format, dim3 grid, const void* q_tild
       break;
     case LatentFormat::kFp4Block:
       launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp4Block>(
+          grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk, topk_stride,
+          counts, rows, n_split, local_heads, block_tokens, block_tables,
+          blocks_per_request, scale, m_ws, l_ws, c_ws, stream);
+      break;
+    case LatentFormat::kFp8BlockRope:
+      launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp8BlockRope>(
           grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk, topk_stride,
           counts, rows, n_split, local_heads, block_tokens, block_tables,
           blocks_per_request, scale, m_ws, l_ws, c_ws, stream);
