@@ -45,7 +45,7 @@
 // never read by a later query). The ratio-4 (C4A) overlapping
 // compressor's per-request tails (the 2026-09-18's dsv4 dspark +
 // compressor wiring's, the dsv41 csa2_compress_decode_update's
-// re-expression's, the fp32 [2, 512]'s the pending even's kv + the
+// re-expression's, the fp32 [2, 1024]'s the pending even's kv + the
 // score's) are the only per-request state (the snapshot_state_bytes'
 // the tails' bytes's, the spec segments' the tails' the rollback's table
 // the 2026-09-18's, the write / read's the snapshot's the copy's) and
@@ -266,13 +266,14 @@ class Dsv4Model : public SessionModel<Dsv4Model> {
   int tails_ = 0;
   // The ratio-4 (C4A) overlapping compressor's per-request tails (2026-09-18,
   // the dsv4 dspark + compressor wiring; docs/dsv4_kernel_port_spec.md §2.1(b)):
-  // fp32 [tails_][max_requests][2][tails_w_] (tails_w_ = 512, the dsv41's
-  // kCsa2Latent's — the pending even's kv (the first W) + the score (the second
-  // W), the dsv41 csa2_compress_decode_update's re-expression). The spec rows'
+  // fp32 [tails_][max_requests][2][tails_w_] (tails_w_ = kCsa2TailW = 1024,
+  // the C4A's coff x kCsa2Latent's — the pending even's kv (the first W) + the
+  // score (the second W), the dsv41 csa2_compress_decode_update's re-expression
+  // on the C4A's width). The spec rows'
   // tails (the rollback's the table's the spec_rows_').
   float* d_tails_ = nullptr;
   float* spec_tails_ = nullptr;
-  int tails_w_ = 512;  // the W's (the compressor's output width's, the 512's the re-expression's)
+  int tails_w_ = kCsa2TailW;  // the W's (the C4A's compressor's output width's, the 1024's)
   int targets_ = 0;                       // dspark target layers (the draft width is targets_ * H)
   int draft_row_ = 0;                     // the next block row a chain call emits (0: no block stands)
   // The hash gate tables' device copies (the num_hash_layers' tid2eid's
