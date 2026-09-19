@@ -50,7 +50,35 @@ namespace dgpp {
 //              s = e4m3(max(absmax, 6 * 2^-9) / 6), code = e2m1(x / s)
 //              (a true fp32 division, as the reference's). The compressed
 //              main KV (288 bytes at 512: the card's number).
-enum class LatentFormat : int { kBf16 = 0, kFp8 = 1, kFp4 = 2, kFp8Block = 3, kFp4Block = 4 };
+//
+// A third family (2026-09-21, DeepSeek-V4-Flash, the G8's close) keeps
+// the RoPE dims EXACT — the reference's window KV quantizes ONLY the
+// non-RoPE dims (inference/model.py:512 `act_quant(kv[..., :-rd], 64,
+// scale_fmt, scale_dtype, True)`: "FP8-simulate non-rope dims to match
+// QAT; rope dims stay bf16 for positional precision"); quantizing the
+// RoPE 64 to e4m3 corrupted the positional signal that turns coherent
+// text into repetition (the 15-token degeneration's rank-2 candidate
+// after the two q-path gaps):
+//   fp8_block_rope  the window ring's mixed-precision record: the NoPE
+//              prefix (kv_lora - 64) in e4m3 with one e8m0 (power-of-two)
+//              scale per 64 elements (the release's act_quant(block 64,
+//              ue8m0) bitwise — the kFp8Block's per-32's per-64's
+//              re-expression), the RoPE 64 raw bf16 (bit-exact), and the
+//              scales inside the row (no row scale). The 584 B envelope
+//              (584 bytes at 512: 448 codes + 128 bf16 + 7 e8m0 + 1 pad),
+//              byte-compat with the dsv4-native KV record and the DSpark
+//              union kernel's dsv4_dspark_decode_record: the row's
+//              8-byte aligned (the 584's stride's the odd row's 16's
+//              unaligned's — the tile loader's uint2's, NOT uint4's,
+//              the vector loads's).
+enum class LatentFormat : int {
+  kBf16 = 0,
+  kFp8 = 1,
+  kFp4 = 2,
+  kFp8Block = 3,
+  kFp4Block = 4,
+  kFp8BlockRope = 5
+};
 
 constexpr const char* latent_format_name(LatentFormat f) {
   switch (f) {
@@ -59,6 +87,7 @@ constexpr const char* latent_format_name(LatentFormat f) {
     case LatentFormat::kFp4: return "fp4";
     case LatentFormat::kFp8Block: return "fp8_block";
     case LatentFormat::kFp4Block: return "fp4_block";
+    case LatentFormat::kFp8BlockRope: return "fp8_block_rope";
   }
   return "?";
 }
@@ -69,11 +98,14 @@ inline std::optional<LatentFormat> latent_format_from_string(std::string_view s)
   if (s == "fp4" || s == "nvfp4" || s == "e2m1") return LatentFormat::kFp4;
   if (s == "fp8_block" || s == "fp8_e8m0") return LatentFormat::kFp8Block;
   if (s == "fp4_block" || s == "fp4_e4m3") return LatentFormat::kFp4Block;
+  if (s == "fp8_block_rope" || s == "fp8_block_rope_bf16") return LatentFormat::kFp8BlockRope;
   return std::nullopt;
 }
 
 constexpr int kLatentFp4Block = 16;      // elements per e4m3 block scale (fp4, fp4_block)
-constexpr int kLatentFp8BlockGroup = 32; // elements per e8m0 scale (fp8_block)
+constexpr int kLatentFp8BlockGroup = 32;  // elements per e8m0 scale (fp8_block)
+constexpr int kLatentFp8BlockGroup64 = 64;  // elements per e8m0 scale (fp8_block_rope, the release's act_quant block 64)
+constexpr int kLatentRopeBf16 = 64;       // the raw-bf16 RoPE tail (fp8_block_rope, the release's rope_head_dim)
 constexpr float kLatentFp8Max = 448.0f;
 constexpr float kLatentFp4Max = 6.0f;
 
@@ -93,6 +125,17 @@ constexpr size_t latent_row_bytes(LatentFormat f, int kv_lora) {
                          static_cast<size_t>(kv_lora) / kLatentFp8BlockGroup;
       return (raw + 15) / 16 * 16;
     }
+    case LatentFormat::kFp8BlockRope: {
+      const int n = kv_lora - kLatentRopeBf16;  // the quantized NoPE prefix
+      // The 584 B envelope: [n e4m3 | kLatentRopeBf16 x bf16 | n/64 e8m0
+      // + 1 pad] (584 bytes at 512 — the dsv4-native record's, the DSpark
+      // union kernel's dsv4_dspark_decode_record's). 8-byte aligned (the
+      // tile loader's uint2 loads); NOT 16 (the 584's stride's the odd
+      // row's the 16's unaligned's — the uint4's the loads's the no's).
+      const size_t raw = static_cast<size_t>(n) + static_cast<size_t>(kLatentRopeBf16) * 2 +
+                         static_cast<size_t>(n) / kLatentFp8BlockGroup64 + 1;
+      return (raw + 7) / 8 * 8;
+    }
   }
   return 0;
 }
@@ -107,6 +150,22 @@ constexpr size_t latent_fp4_scale_offset(int kv_lora) {
 }
 constexpr size_t latent_fp8_block_scale_offset(int kv_lora) {
   return static_cast<size_t>(kv_lora);
+}
+// The fp8_block_rope's 584 B envelope's regions (the NoPE prefix's
+// quantized' the RoPE tail's raw bf16's the scales' the pad's the
+// dsv4-native's kv_cache.h's the dsv4_dspark_decode_record's the
+// byte-compat's):
+//   [0, n)              n e4m3 codes (n = kv_lora - 64, 7 groups of 64
+//                       at 512)
+//   [n, n + 128)        64 x bf16 RoPE (unquantized, bit-exact)
+//   [n + 128, n + 135)  7 x e8m0 (group g scales dims [64g, 64g + 64))
+//   [n + 135, n + 136)  1 pad byte (0)
+constexpr int latent_fp8blockrope_nope(int kv_lora) { return kv_lora - kLatentRopeBf16; }
+constexpr size_t latent_fp8blockrope_rope_offset(int kv_lora) {
+  return static_cast<size_t>(latent_fp8blockrope_nope(kv_lora));
+}
+constexpr size_t latent_fp8blockrope_scale_offset(int kv_lora) {
+  return latent_fp8blockrope_rope_offset(kv_lora) + static_cast<size_t>(kLatentRopeBf16) * 2;
 }
 
 // ---- e8m0 -----------------------------------------------------------------
@@ -303,6 +362,36 @@ inline void latent_quantize_row_host(LatentFormat f, const uint16_t* row,
     if (row_scale) *row_scale = 1.0f;
     return;
   }
+  if (f == LatentFormat::kFp8BlockRope) {
+    const size_t bytes = latent_row_bytes(f, kv_lora);
+    for (size_t i = 0; i < bytes; ++i) out[i] = 0;
+    const int n = latent_fp8blockrope_nope(kv_lora);
+    const size_t rope_off = latent_fp8blockrope_rope_offset(kv_lora);
+    const size_t scale_off = latent_fp8blockrope_scale_offset(kv_lora);
+    for (int b = 0; b < n / kLatentFp8BlockGroup64; ++b) {
+      float bmax = 0.0f;
+      for (int j = 0; j < kLatentFp8BlockGroup64; ++j) {
+        const float a = std::fabs(bf16_bits_to_float(row[b * kLatentFp8BlockGroup64 + j]));
+        bmax = a > bmax ? a : bmax;
+      }
+      const uint8_t sb = latent_fp8_block_scale_byte(bmax);
+      out[scale_off + static_cast<size_t>(b)] = sb;
+      const float s = e8m0_byte_to_float(sb);
+      for (int j = 0; j < kLatentFp8BlockGroup64; ++j) {
+        const int e = b * kLatentFp8BlockGroup64 + j;
+        out[static_cast<size_t>(e)] = latent_fp8_block_encode(bf16_bits_to_float(row[e]), s);
+      }
+    }
+    // The RoPE tail stays raw bf16 (the reference's positional precision
+    // — the bit-exact half the format exists for).
+    for (int i = 0; i < kLatentRopeBf16; ++i) {
+      const uint16_t v = row[static_cast<size_t>(n) + i];
+      out[rope_off + static_cast<size_t>(2 * i)] = static_cast<uint8_t>(v & 0xFFu);
+      out[rope_off + static_cast<size_t>(2 * i) + 1] = static_cast<uint8_t>(v >> 8);
+    }
+    if (row_scale) *row_scale = 1.0f;
+    return;
+  }
   if (f == LatentFormat::kFp4Block) {
     const size_t bytes = latent_row_bytes(f, kv_lora);
     for (size_t i = 0; i < bytes; ++i) out[i] = 0;
@@ -370,6 +459,21 @@ inline void latent_dequantize_row_host(LatentFormat f, const uint8_t* in,
       const float s = e8m0_byte_to_float(in[scale_off + static_cast<size_t>(i / kLatentFp8BlockGroup)]);
       out[i] = latent_fp8_block_decode_bf16(in[i], s);
     }
+    return;
+  }
+  if (f == LatentFormat::kFp8BlockRope) {
+    const int n = latent_fp8blockrope_nope(kv_lora);
+    const size_t rope_off = latent_fp8blockrope_rope_offset(kv_lora);
+    const size_t scale_off = latent_fp8blockrope_scale_offset(kv_lora);
+    for (int i = 0; i < n; ++i) {
+      const float s = e8m0_byte_to_float(
+          in[scale_off + static_cast<size_t>(i / kLatentFp8BlockGroup64)]);
+      out[i] = latent_fp8_block_decode_bf16(in[i], s);
+    }
+    for (int i = 0; i < kLatentRopeBf16; ++i)
+      out[static_cast<size_t>(n) + i] =
+          static_cast<uint16_t>(in[rope_off + static_cast<size_t>(2 * i)] |
+                                 (in[rope_off + static_cast<size_t>(2 * i) + 1] << 8));
     return;
   }
   if (f == LatentFormat::kFp4Block) {
