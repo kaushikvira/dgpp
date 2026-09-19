@@ -305,3 +305,60 @@ Next window, in order: (a) give the smoke gate a resident-image-matching shape
 (or promote the shape into the image key), (b) diagnose the missing DSpark
 `ensure_plan` shapes, (c) only then the parity/sanitizer/tps/reference gates —
 the reference gate's degraded path still has not run end to end.
+
+## Blocker 2's diagnosis (the DSpark plan's, from the code — the GPU window's confirmation pending)
+
+The `mtp_run_rows: DSpark plans unavailable` (model.cpp:805) is a single bad
+argument, not a missing shape family: **the failing call is (a), the
+main-projection plan** — `gemm_.ensure_plan(rows, 4096, 12288, BF16, BF16,
+stride=4096)` at dspark_layer.cu:92-94 — and the rejection condition is an
+**invalid cuBLASLt leading dimension: `act_row_stride` (4096) < `k` (12288)**.
+
+The mechanism (gemm_cublaslt.cpp, `Impl::get_plan`): the activation is
+described as a column-major `(k x m)` matrix with `ld = act_row_stride`
+(the `cublasLtMatrixLayoutCreate(&p.lb, ..., k, m, act_row_stride)` at
+lines 148-150, context "layout b"). For (a) that is `(12288 x rows,
+ld = 4096)`: cuBLASLt requires `ld >= rows` on a non-transposed layout,
+and the `rows` columns of `12288` elements each would overlap by `8192`
+elements, so `cublasLtMatmulAlgoGetHeuristic` rejects the shape (an
+INVALID_VALUE status, or success with zero results) and `get_plan` throws
+("cublasLt no heuristic for m=... n=4096 k=12288 dtype=bf16", lines 187-193).
+`CublasLtGemm::ensure_plan` (line 343) catches and returns false;
+`prepare` ANDs to false; model.cpp:805 throws. The failure is
+**independent of `m`** — it fires at every row count (the 8-row fixed
+batch, the 5-row block, or any), so the boot-time `graph_prepare` loop
+(model.cpp:743-744) would have failed identically; it simply never ran
+first: the first `prepare` call on this path is the prefill-path eager
+`session_draft` (graph_engine.hpp:1268 -> session_model.hpp:1572 ->
+`mtp_run_rows` -> `draft_first`), which lands before the first graph
+capture — hence the "mtp_run_rows:" prefix on the error.
+
+The wrong stride is a copy error in `prepare`: the main projection's
+activation is the **three target layers' stream mean** — the fused
+`[rows, num_targets x hidden] = [rows, 12288]` buffer (model.hpp:346
+`main_hidden_ [M, targets * H]`; `draft_first` computes it through
+`launch_scale_gemm_grid_bf16(src, W, ...)` at W = 12288) — so its
+`act_row_stride` must be `num_targets * hidden` (12288), not `hidden`
+(4096). The IGemm contract (gemm.hpp's `matmul` docs: "pass k for a
+contiguous [M,K] tensor; wider strides read K-column slices") only admits
+strides of at least `k`.
+
+Call (b) — the lm-head plan `(rows, lm_vocab_count, 4096, BF16, F32,
+stride=4096)` at dspark_layer.cu:95 — is a valid cuBLASLt shape: every
+layout satisfies `ld >= rows` (the B's `(4096 x rows, ld=4096)'s), the
+bf16-in / f32-out combination is supported, and `n` (64640 = 129280/2 on
+the w2 world) is a multiple of 8. It matches the runtime consumer
+`gemm_.matmul(h_, lm_head, ..., rows, lm_vocab_count_, H, BF16, F32, H,
+...)` (model.cpp:830) exactly, so it is the plan the head actually runs.
+
+The fix (one line, committed after the instrumentation so the window can
+capture the raw rejection at the instrumentation commit): pass
+`num_targets * hidden` as the main-projection plan's `act_row_stride`.
+Safe: plan (a) is a defensive pre-warm — the main projection executes
+through the fp8-grid kernel `launch_scale_gemm_grid_bf16`, not cuBLASLt —
+so no runtime numerics change, and the failure stays loud (`prepare`
+still returns false and model.cpp:805 still throws when cuBLASLt
+rejects anything). The instrumentation (the `prepare`'s per-call
+shape/result log + the `ensure_plan`'s rejection-reason WARN) lands
+first, so the window's run names the exact `(m, n, k, io, out, stride)`
+and the cuBLASLt status of the false.
