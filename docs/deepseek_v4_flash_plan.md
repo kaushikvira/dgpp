@@ -221,3 +221,32 @@ Order: (1)+(3)+(5)+(2) are one coherent "make the compressor and the caches
 real" change in `csa2_layer.{cu,hpp}` + `model.{cpp,hpp}`; (4) follows.
 `docs/dsv4_attention_spec.md` is the numeric oracle for all of them, and the
 GPU parity gate (`scripts/dsv4_gates.sh`) is the final arbiter.
+
+### Flagged divergences from the spec's GAPS section (actionable code fixes)
+
+`docs/dsv4_attention_spec.md` §5 records 13 gaps. These are the ones that are
+CODE defects rather than open questions, in rough priority order — each must be
+either fixed or explicitly justified before the parity gate can pass:
+
+- **G-tiebreak — the decode select's exact-tie order is wrong.**
+  `src/models/dsv4/csa2_layer.cu` (~427-534) builds `(sortable_fp32 << 21) |
+  entry_idx` and takes a MAX top-k, so an exact score tie resolves to the
+  HIGHER entry index; the dsv41 shared kernel (`src/kernels/csa2.cu:381-383`,
+  `src/kernels/dsa.cu:985-990`) uses `(~sortable << idx_bits) | idx` with a MIN
+  top-k, and BOTH the pinned CPU oracle
+  (`tests/unit/dsv4_csa2_oracle_test.cpp:611-655`) and the V4 prefill path
+  (`csa2_layer.cu:590-604`) resolve ties to the LOWER index. The kernel's own
+  comment claims "the exact ties to the lower entry index", so the comment and
+  the code disagree — the code is what runs.
+- **G5 — the indexer's q-side Hadamard is dropped** (`§2.1`). If the reference
+  applies it, every indexer logit is off, not just ties.
+- **G6 — the indexer's fp4 -> e4m3 re-expression** (`§2.1`): confirm it is a
+  faithful re-expression and not a different quantiser.
+- **G8 — the ring / main quant-class deltas** (`§1.2`/`§1.3`): the C++ ring and
+  main formats must match the reference's quant classes.
+- **G-q-renorm — the ad-hoc q re-normalisation is absent from the C++ q path.**
+- **G-union-wiring — the model wires only the BLOCK phase** of the union
+  attention (the seam item 4 above).
+- Open-by-design (no code owed yet, needed only if the model must serve them):
+  `G-tail-cadence`, `G-tail-pool`, `G-tail-ape`, `G-tail-prefill`,
+  `G-c128a-compressor`, `G3`, `G-cache-format`.
