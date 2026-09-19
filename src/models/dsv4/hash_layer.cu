@@ -180,22 +180,63 @@ void Dsv4HashLayer::route(const void* logits, const int64_t* tokens, int tokens_
 
 void Dsv4HashLayer::expert(const void* x, int tokens, const int32_t* topk_ids, const float* topk_w, void* out,
                            cudaStream_t stream) {
-  // The MXFP4 expert (the glm fp4 expert kernels' composition's): the
+  // The MXFP4 expert (the glm fp4 expert kernels' composition's, the
+  // slot (decode's) form's — the prefill's chunks' ride it too's): the
   // e2m1 x e8m0/32 decode's, the clamped SwiGLU's, the router weight's
-  // the down epilogue's fold's. The view table's (the MoeExpertView's
-  // the e2m1 pairs' the e8m0/32 scales' the fp4_group 32's) is the
-  // GPU-gate pending's completion's wiring (the w_.expert_payload's
-  // [n_experts * 3]'s the gate / up / down's); the glm fp4 expert's
-  // the launch_moe_grouped_mma_fp4's the gate + up's, the
-  // launch_moe_slot_gate_up_swiglu_fp4's the SwiGLU's, the
-  // launch_moe_slot_down_fp4's the down's, the launch_moe_slot_accum's
-  // the routed sum's (the all-reduce's the caller's).
-  (void)x;
-  (void)tokens;
-  (void)topk_ids;
-  (void)topk_w;
-  (void)out;
-  (void)stream;
+  // the down epilogue's fold's (the launch_moe_slot_accum's chain's),
+  // the fp8 shared expert's the sh_*'s arguments's (the
+  // shared_view_base's -1's) the fp4_group's 32's (the MXFP4's
+  // e8m0/32's, the no-global's). Kernels only's (the view table's the
+  // rebind's uploaded's — the no host-copy's on the captured's
+  // stream's).
+  if (tokens <= 0) return;
+  if (tokens > max_tokens_)
+    throw std::invalid_argument("dsv4 hash layer: expert tokens exceed max_tokens");
+  const int H = cfg_.hidden, E = cfg_.n_experts, K = cfg_.top_k;
+  const int I_r = static_cast<int>(w_.local_inter);  // the routed's inter's slice's
+  const int I_s = static_cast<int>(w_.local_shared_inter);  // the shared's inter's slice's
+  // The slot layout's: tokens*(K+1)'s, slot s = t*(K+1)+j's (the j<K's
+  // row t's routed expert j's, the j==K's the shared expert's the
+  // weight's 1's the accumulated's last's).
+  const int slots = tokens * (K + 1);
+  const int fp4_group = w_.experts[0].scale_group;  // the MXFP4's 32's
+  // The fp8 shared expert's own scale grid (the checkpoint's 128 x 128's
+  // the loader's decoded's F32's, rs = cs = 7's).
+  const int sh_rs = MoeExpertView::shift_of(static_cast<int>(w_.shared[0].scale_block_rows));
+  const int sh_cs = MoeExpertView::shift_of(static_cast<int>(w_.shared[0].scale_block_cols));
+  const uint8_t* sh_gate_p = w_.shared[0].payload;
+  const float* sh_gate_s = w_.shared[0].scales;
+  const uint8_t* sh_up_p = w_.shared[1].payload;
+  const float* sh_up_s = w_.shared[1].scales;
+  const uint8_t* sh_down_p = w_.shared[2].payload;
+  const float* sh_down_s = w_.shared[2].scales;
+  // Multi-row batches (the prefill's chunks's, the speculative's
+  // verify's) run their slots in expert order so an expert two rows
+  // share is read from DRAM once (see launch_moe_slot_order); one
+  // token has nothing to share. The order's kernel's the single-block's
+  // 1024-slot's bound's (the beyond's the identity's, the results's
+  // the logical slot's indexed's the bitwise's identical's).
+  const int32_t* order = nullptr;
+  if (tokens > 1 && slots <= 1024) {
+    launch_moe_slot_order(topk_ids, slot_order_, slots, K, E, stream);
+    order = slot_order_;
+  }
+  // Gate + up + swiglu in one launch (bit-identical to the three-launch
+  // chain — see the launcher): the routed's the fp4 core's (the
+  // MXFP4's), the shared's the fp8 core's the sh_*'s arguments's, the
+  // same's rows per block's.
+  launch_moe_slot_gate_up_swiglu_fp4(static_cast<const uint16_t*>(x), H, topk_ids, order, d_views_, I_r, H,
+                                     I_s, H, sh_gate_p, sh_gate_s, sh_up_p, sh_up_s, slot_act_, I_r, slots, K,
+                                     cfg_.swiglu_limit, stream, -1, fp4_group, sh_rs, sh_cs);
+  // The down projection's (the unrounded's fp32's, the accum's the
+  // single's rounding's owns's): the routed's the fp4 core's, the
+  // shared's the fp8 core's.
+  launch_moe_slot_down_fp4(slot_act_, I_r, topk_ids, order, d_views_, H, I_r, H, I_s, sh_down_p, sh_down_s,
+                           slot_down_, H, slots, K, stream, -1, fp4_group, sh_rs, sh_cs);
+  // The ordered's accumulation's (the router weight's the fold's, the
+  // shared's row's the weight's 1's, the bf16's the wire's buffer's —
+  // the all-reduce's the caller's).
+  launch_moe_slot_accum(static_cast<uint16_t*>(out), slot_down_, topk_w, tokens, H, K, stream);
 }
 
 // ---------------------------------------------------------------------------

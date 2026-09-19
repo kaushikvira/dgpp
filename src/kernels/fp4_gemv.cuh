@@ -554,8 +554,10 @@ __host__ inline void dispatch_k(int k, F&& f) {
 // The MXFP4 compiled set (2026-09-13): DeepSeek-V4.1-Flash's widths —
 // 5120 (hidden: w1/w3) and the expert down at worlds 4 / 2 / 1 (576 /
 // 1152 / 2304: 18 / 36 / 72 chunks — 2 x 9, 4 x 9 and 8 x 9 in passes of
-// four), plus the power-of-two test geometries. Its own switch keeps the
-// NVFP4 instantiation set as it is.
+// four), plus the power-of-two test geometries. 4096 (2026-09-24,
+// DeepSeek-V4-Flash, docs/dsv4_kernel_port_spec.md): V4's hidden (the
+// gate/up's w1/w3's K) + the expert down at world 2 (1024's already's
+// the set's). Its own switch keeps the NVFP4 instantiation set as it is.
 template <typename F>
 __host__ inline void dispatch_k_mx(int k, F&& f) {
   switch (k) {
@@ -568,16 +570,17 @@ __host__ inline void dispatch_k_mx(int k, F&& f) {
     case 1024: f(std::integral_constant<int, 1024>{}); return;
     case 1152: f(std::integral_constant<int, 1152>{}); return;
     case 2304: f(std::integral_constant<int, 2304>{}); return;
+    case 4096: f(std::integral_constant<int, 4096>{}); return;
     case 5120: f(std::integral_constant<int, 5120>{}); return;
     default:
       throw std::invalid_argument(
           "fp4_gemv: K is not in the MXFP4 compiled set (32, 64, 128, 256, 512, "
-          "576, 1024, 1152, 2304, 5120)");
+          "576, 1024, 1152, 2304, 4096, 5120)");
   }
 }
 __host__ __device__ constexpr bool k_compiled_mx(int k) {
   return k == 32 || k == 64 || k == 128 || k == 256 || k == 512 || k == 576 || k == 1024 ||
-         k == 1152 || k == 2304 || k == 5120;
+         k == 1152 || k == 2304 || k == 4096 || k == 5120;
 }
 // True when dispatch_k compiles a kernel for k.
 __host__ __device__ constexpr bool k_compiled(int k) {
