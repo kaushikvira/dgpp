@@ -880,6 +880,76 @@ DGPP_TEST(dsv4_csa2_planar_cache_geometry) {
     if (block >= max_blocks)
       throw std::runtime_error("the entry's block's out of the max_blocks' bound's (e " + std::to_string(e) + ")");
   }
+// ---- the decode select's tie-break (the dsv4_csa2_sortable_key's + the
+// dsv4_csa2_select_insert's — the real's layer code's, the CPU's
+// qualifiable's, no CUDA initialization) ------------------------------
+// The (score desc, index asc)'s total order's: the EXACT's score's ties'
+// the LOWER's entry index's (the dsv41's make_key's form's the
+// (~sortable << 21) | idx's the MIN's top-k's, the pinned's oracle's the
+// dsv4_indexer_topk_tiebreak_and_causal's the prefill's stable-sort's the
+// match's). The driven's micro-case's the pre-fix's the (sortable << 21) |
+// idx's MAX's top-k's the tie's the HIGHER's index's (this test's the
+// pre-fix's FAIL's, the post-fix's PASS's).
+DGPP_TEST(dsv4_csa2_select_decode_tiebreak) {
+  // The kernel's selection's the host's re-expression's (the sentinel's
+  // ~0's, the MIN-key's dsv4_csa2_select_insert's, the extraction's the
+  // (score desc, index asc)'s the -1's padding's — the csa2_layer.cu's
+  // dsv4_csa2_select_decode_kernel's the same's the form's).
+  auto run_decode_select = [](const float* logits, int visible, int select_k) {
+    std::vector<uint64_t> skeys(static_cast<size_t>(select_k), ~uint64_t(0));
+    std::vector<int> sidx(static_cast<size_t>(select_k), -1);
+    for (int e = 0; e < visible; ++e)
+      dgpp::dsv4_csa2_select_insert(skeys.data(), sidx.data(), select_k,
+                                    dgpp::dsv4_csa2_sortable_key(logits[e], e, 21), e);
+    std::vector<int> out(static_cast<size_t>(select_k), -1);
+    const int k = std::min(select_k, visible);
+    for (int j = 0; j < select_k; ++j)
+      out[static_cast<size_t>(j)] = (j < k && sidx[static_cast<size_t>(j)] >= 0) ? sidx[static_cast<size_t>(j)] : -1;
+    return out;
+  };
+  const int select_k = 4;
+  // Case 1 (the tie's -> the lower's index's): the 6's entries' logits' —
+  // entry 5's the 5.0's the top's, entries 1/2/3's TIE's 3.0's (the
+  // lower's index's must win in order's), entry 4's 2.0's, entry 0's
+  // 1.0's. The (score desc, index asc)'s top-4's [5, 1, 2, 3] (the tie's
+  // 1/2/3's to the ascending's index's) — the pre-fix's the [5, 3, 2, 1]'s
+  // (the tie's the HIGHER's index's first's).
+  const float logits_a[6] = {1.0f, 3.0f, 3.0f, 3.0f, 2.0f, 5.0f};
+  const auto out_a = run_decode_select(logits_a, 6, select_k);
+  const int want_a[4] = {5, 1, 2, 3};
+  for (int j = 0; j < select_k; ++j)
+    if (out_a[static_cast<size_t>(j)] != want_a[j])
+      throw std::runtime_error("the decode select's tie's topk's [" + std::to_string(out_a[0]) + "," +
+                               std::to_string(out_a[1]) + "," + std::to_string(out_a[2]) + "," +
+                               std::to_string(out_a[3]) +
+                               "] != the (score desc, index asc)'s [5,1,2,3] (the tie's 1/2/3's the lower's index's the first's)");
+  // Case 2 (the strictly's different's scores's the score's the dominant's,
+  // the index's the irrelevant's): the 4's entries' distinct's logits'
+  // [0.5, 0.25, 0.75, 1.0]'s (the idx 0/1/2/3's) -> the (score desc)'s
+  // [3, 2, 0, 1]'s (the 1.0's the idx 3's the top's, the 0.75's the idx
+  // 2's, the 0.5's the idx 0's, the 0.25's the idx 1's) — the score's the
+  // descending's the index's the irrelevant's (the no ties' the here's).
+  const float logits_b[4] = {0.5f, 0.25f, 0.75f, 1.0f};
+  const auto out_b = run_decode_select(logits_b, 4, select_k);
+  const int want_b[4] = {3, 2, 0, 1};
+  for (int j = 0; j < select_k; ++j)
+    if (out_b[static_cast<size_t>(j)] != want_b[j])
+      throw std::runtime_error("the decode select's score-dominance's topk's [" + std::to_string(out_b[0]) + "," +
+                               std::to_string(out_b[1]) + "," + std::to_string(out_b[2]) + "," +
+                               std::to_string(out_b[3]) +
+                               "] != the (score desc)'s [3,2,0,1] (the strictly's different's scores's the index's the irrelevant's)");
+  // Case 3 (the -1's padding's the visible's < select_k's): the 2's
+  // entries' [1.0, 2.0]'s -> the [1, 0, -1, -1]'s (the top-2's + the
+  // -1's padding's).
+  const float logits_c[2] = {1.0f, 2.0f};
+  const auto out_c = run_decode_select(logits_c, 2, select_k);
+  const int want_c[4] = {1, 0, -1, -1};
+  for (int j = 0; j < select_k; ++j)
+    if (out_c[static_cast<size_t>(j)] != want_c[j])
+      throw std::runtime_error("the decode select's padding's topk's [" + std::to_string(out_c[0]) + "," +
+                               std::to_string(out_c[1]) + "," + std::to_string(out_c[2]) + "," +
+                               std::to_string(out_c[3]) +
+                               "] != the [1,0,-1,-1] (the visible's 2's < select_k's 4's the -1's padding's)");
 }
 
 int main() { return ::dgpp::test::run_all(); }

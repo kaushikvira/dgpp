@@ -1,6 +1,7 @@
 #include "models/dsv4/csa2_layer.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -546,30 +547,64 @@ void Dsv4Csa2Layer::enqueue_decode(const void* hidden_in, void* main_cache, void
 // width). The decode's fused select streams the index cache's visible
 // entries per row, computes the 64-head fp8 dots' logits (the folded
 // weight, the entry's scale), and keeps a running top-select_k composite-
-// key selection (the (sortable_fp32 << 21) | entry_idx's total order,
-// the exact ties to the lower entry index — the shared kernel's
-// selection's 64-head re-expression). The kernel's numerics are
-// certified against the CPU oracle (tests/unit/dsv4_csa2_oracle_test.cpp
-// dsv4_indexer_topk_tiebreak_and_causal) — the GPU-gate pending's
-// completion runs the parity gate.
-namespace {
-// The composite sort key (the shared kernel's (sortable_fp32 << 21) |
-// idx's total order, the exact ties to the lower index by construction).
-__device__ __forceinline__ uint64_t dsv4_csa2_sortable_key(float logit, int idx, int idx_bits) {
-  // The sortable fp32 (the total order: the finite logits' magnitude,
-  // -inf -> 0, +inf -> the max). The shared kernel's sortable_f32_dev's
-  // re-expression.
-  uint32_t sortable;
-  if (std::isinf(logit) && logit < 0.f)
-    sortable = 0u;
-  else if (std::isinf(logit) && logit > 0.f)
-    sortable = 0xFFFFFFFFu;
-  else {
-    const uint32_t u = static_cast<uint32_t>(__float_as_uint(logit));
-    sortable = (logit < 0.f) ? (0x80000000u - u) : (0x7FFFFFFFu + u);
-  }
-  return (uint64_t(sortable) << idx_bits) | uint64_t(idx & ((1u << idx_bits) - 1u));
+// key selection (the dsv41's make_key's form's (~sortable_fp32 << 21) |
+// entry_idx's MIN top-k's total order, the exact ties to the lower entry
+// index — the shared kernel's selection's 64-head re-expression). The
+// kernel's numerics are certified against the CPU oracle (the
+// tests/unit/dsv4_csa2_oracle_test.cpp's dsv4_indexer_topk_tiebreak_and_
+// causal's the reference's + the driven's dsv4_csa2_select_decode_tiebreak's
+// micro-case's) — the GPU-gate pending's completion runs the parity gate.
+// The composite sort key (the dsv41's make_key's form — the shared
+// kernel's (~sortable << idx_bits) | idx, the src/kernels/csa2.cu's
+// 381-383's make_key's + the dsa.cu's 985-990's "ties -> lower pool
+// index's" comment's contract's V4 64-head re-expression): the SMALLEST
+// key is the HIGHEST logit, and an exact score tie's the LOWER entry
+// index (the selection's MIN top-k). Host's + device's (the decode
+// kernel's call's + the CPU oracle's driven micro-case's parity pin's).
+__host__ __device__ uint64_t dsv4_csa2_sortable_key(float logit, int idx, int idx_bits) {
+  // The sortable fp32 (the shared kernel's sortable_f32_dev's exact form
+  // — the (u >> 31) ? ~u : (u | 0x80000000)'s the float's total order's,
+  // the -inf / +inf's the extremes's the natural's). The dsv41's
+  // make_key's transform's re-expression (the V4's the 64-head's
+  // re-expression's) — the negative's the branch's the dsv41's ~u's the
+  // exact's (the pre-fix's (0x80000000 - u)'s the negative's the
+  // scrambled's the total order's, the cross-sign's the mis-ordered's).
+  // std::bit_cast's the float's bits's (the host's + device's the
+  // portable's, the dtypes.hpp's the DGPP_HD's the same's — the
+  // __float_as_uint's the device-only's, the __host__ __device__'s
+  // the not's allowed's).
+  const uint32_t u = std::bit_cast<uint32_t>(logit);
+  const uint32_t sortable = (u >> 31) ? ~u : (u | 0x80000000u);
+  // The inversion's (the dsv41's make_key's): the smallest's key's the
+  // highest's logit's, the exact ties' the lower's idx's (the MIN's
+  // top-k's the selection's).
+  return (uint64_t(~sortable) << idx_bits) | uint64_t(idx & ((1u << idx_bits) - 1u));
 }
+// The running top-select_k's MIN-key's insertion (the dsv41's make_key's
+// form's the selection's body's, shared by the decode kernel's mutex-
+// guarded's call's and the CPU oracle's driven micro-case's): find the
+// first j's key < skeys[j]'s, the shift-down's (the j's the new's
+// slot's, the tail's the evicted's), the insert's. Returns the j's
+// (select_k's: no room's — the key's at or below the running's k-th's,
+// the no-op's). skeys' the select_k's the running's smallest's keys's the
+// ascending's order's (the empty's slot's the sentinel's ~0's), sidx' the
+// entry's index's (the empty's slot's the -1's).
+__host__ __device__ int dsv4_csa2_select_insert(uint64_t* skeys, int* sidx, int select_k,
+                                                                 uint64_t key, int idx) {
+  for (int j = 0; j < select_k; ++j) {
+    if (key < skeys[j]) {
+      for (int m = select_k - 1; m > j; --m) {
+        skeys[m] = skeys[m - 1];
+        sidx[m] = sidx[m - 1];
+      }
+      skeys[j] = key;
+      sidx[j] = idx;
+      return j;
+    }
+  }
+  return select_k;
+}
+namespace {
 // The 64-head's per-entry logit (the e4m3 x e4m3's exact in fp32, the
 // folded weight's, the relu's clamp at zero, the entry's scale). The
 // scalar form (the GPU-gate pending's completion replaces it with the
@@ -613,14 +648,14 @@ extern "C" __global__ void dsv4_csa2_select_decode_kernel(const uint8_t* __restr
   if (r >= rows) return;
   const int64_t visible = pos_sel[r] + 1;  // the visible entries' count
   // The block's shared running top-select_k (the dynamic shared memory's
-  // keys + indices + the mutex). The keys' 0's the -1's sentinel (the
-  // empty slot's);
+  // keys + indices + the mutex). The keys' ~0's the -1's sentinel (the
+  // empty slot's, the MIN-key's selection's the largest's key's);
   extern __shared__ unsigned char smem[];
   uint64_t* skeys = reinterpret_cast<uint64_t*>(smem);
   int* sidx = reinterpret_cast<int*>(smem + size_t(select_k) * sizeof(uint64_t));
   unsigned* smutex = reinterpret_cast<unsigned*>(smem + size_t(select_k) * (sizeof(uint64_t) + sizeof(int)));
   if (threadIdx.x < select_k) {
-    skeys[threadIdx.x] = 0;
+    skeys[threadIdx.x] = ~uint64_t(0);
     sidx[threadIdx.x] = -1;
   }
   if (threadIdx.x == 0) *smutex = 0;
@@ -638,32 +673,23 @@ extern "C" __global__ void dsv4_csa2_select_decode_kernel(const uint8_t* __restr
                              : block;
     const uint8_t* k_row = index_k + int64_t(phys * entries_per_block + off) * kCsa2IndexDim;
     const float k_scale = index_scale[int64_t(phys * entries_per_block + off)];
-    const uint64_t key = dsv4_csa2_sortable_key(dsv4_csa2_entry_logit(q_row, w_row, k_row, k_scale, heads), e, 21);
-    if (key == 0) continue;  // the -inf's logit (no contribution, the sink's limit's)
-    // The mutex-guarded's running top-k's insertion (the key's the
-    // composite's; the exact ties' to the lower index's by the key's
-    // construction). The block's threads' the contention's the GPU-gate
-    // pending's completion's lock-free's form's.
+    const float logit = dsv4_csa2_entry_logit(q_row, w_row, k_row, k_scale, heads);
+    if (std::isinf(logit) && logit < 0.f) continue;  // the -inf's logit (no contribution, the sink's limit's)
+    const uint64_t key = dsv4_csa2_sortable_key(logit, e, 21);
+    // The mutex-guarded's running top-k's MIN-key's insertion (the dsv41's
+    // make_key's form's key's, the smallest's key's the highest's logit's,
+    // the exact ties' to the lower index's by the key's construction's).
+    // The block's threads' the contention's the GPU-gate pending's
+    // completion's lock-free's form's.
     while (atomicOr(smutex, 1u))
       ;
-    for (int j = 0; j < select_k; ++j) {
-      if (key > skeys[j]) {
-        // The shift-down's (the j's the new's slot's, the tail's the
-        // evicted's).
-        for (int m = select_k - 1; m > j; --m) {
-          skeys[m] = skeys[m - 1];
-          sidx[m] = sidx[m - 1];
-        }
-        skeys[j] = key;
-        sidx[j] = e;
-        break;
-      }
-    }
+    dsv4_csa2_select_insert(skeys, sidx, select_k, key, e);
     atomicAnd(smutex, 0u);
   }
   __syncthreads();
-  // The selection's extraction (the descending's keys' the ascending's
-  // entry indices' the -1's padding's).
+  // The selection's extraction (the keys' ascending's order's the
+  // score's descending's the ties' the entry index's ascending's the
+  // -1's padding's).
   const int64_t k = std::min<int64_t>(select_k, visible);
   for (int j = threadIdx.x; j < select_k; j += blockDim.x)
     topk_out[int64_t(r) * select_k + j] = (j < k && sidx[j] >= 0) ? sidx[j] : -1;
