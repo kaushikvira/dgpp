@@ -305,3 +305,45 @@ Next window, in order: (a) give the smoke gate a resident-image-matching shape
 (or promote the shape into the image key), (b) diagnose the missing DSpark
 `ensure_plan` shapes, (c) only then the parity/sanitizer/tps/reference gates —
 the reference gate's degraded path still has not run end to end.
+
+## 2026-09-19, second window: dsv4 BOOTS AND GENERATES — the numerics are the wall
+
+The two blockers in the section above were walked past in one window, and the
+result is decisive: **DeepSeek-V4-Flash now serves end to end on the dgpp
+engine — but its output is degenerate.** That is a numerics failure, not a
+plumbing failure, and the spec's §5 gaps are the cause list.
+
+What it took to get it serving (all three are needed):
+1. **MTP off** (`engine.mtp: false`): with MTP on, the boot dies at
+   `mtp_run_rows: DSpark plans unavailable` (`model.cpp:805`).
+2. **decode graph off** (`engine.decode_graph: false`): with the graph on, the
+   capture is rejected — `graph variant 0 captured 21 memcpy ... the decode
+   graph must be kernels-only`. The memcpy is `SessionModel::push_position`
+   (`src/engine/session_model.hpp:348-352`): an 8-byte H2D `cudaMemcpyAsync` of
+   the session position per token, inside the captured region. (This is the
+   same call site the Sept-18 OOB error was reported at — the sticky error
+   surfaced there because it is the only host copy on the capture stream.)
+   Fixing it properly means getting the session position onto the device
+   without a host copy inside the region.
+3. **The world-2 / kv-262144 shape** — the resident image
+   (`5c67fe8d85a3cf87.img`, 46/46 layers) matches it and only it. MTP off does
+   NOT change the image key (verified: `constructed in 13.1s (resident, ...)`),
+   so the image survives the MTP-off experiment. The world-1 / kv-8192 shape the
+   gate runner used has NO image and streams during prefill.
+
+The evidence, with the shape `world 2, kv 262144, max_concurrency 2, mtp off,
+decode_graph off` (config `q-dgx-gateway/config/dgpp-dsv4-w2-eager.json`):
+- `rank 0 serving: ok (16s)`, the model served as `deepseek-v4-flash`.
+- a request returns in ~2.0 s with `completion_tokens: 24` — prefill, decode,
+  sampling, the renderer and the API all work.
+- the text is degenerate: `reasoning_content` is `"...”\n\n...”\n\n...”...`
+  repeated, for both a prose prompt and a `2+2` prompt, at `temperature 0`.
+- the engine logs no quant-class or index-exactness warning, so nothing in the
+  served path is self-reporting a violation.
+
+Therefore the next work is exactly the spec's code-level gaps, in the order the
+attention path is exercised: `G5` (the indexer's q-side Hadamard is dropped),
+`G6` (the indexer's fp4 -> e4m3 re-expression), `G8` (the ring/main quant-class
+deltas), `G-q-renorm`, then the compressor/partials items (`G-tail-cadence`,
+`G-tail-pool`, `G-tail-ape`, `G3`, `G-cache-format`). The parity gate against the
+checkpoint's own `inference/` is the arbiter — it has still never run.
