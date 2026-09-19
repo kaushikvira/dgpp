@@ -839,8 +839,21 @@ void Dsv4Model::enqueue_layer(const Dsv4LayerResident& r, int layer, int T, cons
   // the 64-head selection's skipped until then, the window source's always
   // runs). index_scale's the index cache's fp32 row-scale's (the planar
   // index cache's the e4m3 codes' + the fp32 scale's the two arrays's).
+  // The compressor's per-request tail (the ratio-4's overlapping's, the
+  // model's d_tails_'s the tail's ordinal's plane's — the dsv41's
+  // pool.tails(w_.tail_ord)'s no-pool's re-expression's): the live per-request
+  // tails (the main walk's) at this layer's tail ordinal (tail_ord_'s the
+  // -1's the SWA-only's / the draft stages' the no-tail's layers'), the
+  // model's tails_w_'s (the C4A's kCsa2TailW's 1024's). The spec rows' tails
+  // (spec_tails_'s the DSpark verify's rollback's) ride the pending's verify's
+  // call site's.
+  const int tord = tail_ord_[static_cast<size_t>(layer)];
+  float* tails = (tord >= 0 && d_tails_ != nullptr)
+                     ? d_tails_ + static_cast<size_t>(tord) * static_cast<size_t>(max_requests_) * 2 *
+                           static_cast<size_t>(tails_w_)
+                     : nullptr;
   csa2_->enqueue_decode(x_, nullptr, nullptr, nullptr, rows.req_ids, rows.pos, rows.spans, rows.num_requests, T, attn_out,
-                       stream_, nullptr);
+                       stream_, nullptr, tails, tails_w_);
   // The DSpark union attention (2026-09-18, the dsv4 dspark + compressor
   // wiring; the dsv4_dspark_union_attn's the 3-phase's single softmax's over
   // [compressed | raw ring | block]'s): the draft stages' (43/44/45's)

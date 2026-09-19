@@ -134,10 +134,28 @@ class Dsv4Csa2Layer {
   // The window ring is the layer's own scratch (the no-pool model's
   // positional state, the model's "the window ring's the layer scratch's")
   // — it is always available, so the window source always runs.
+  //
+  // The compressor's per-request tail (the ratio-4's overlapping's, the
+  // model's d_tails_'s the tail's ordinal's plane's the model's state's):
+  //   tails    the per-request tail's base (fp32 [max_requests][2][W], the
+  //                model's d_tails_'s the tail's ordinal's plane's, the
+  //                dsv41's pool.tails(w_.tail_ord)'s the no-pool's
+  //                re-expression's); null: the tail's update's skipped (the
+  //                ratio-4's layers' the model's always's passes it's, the
+  //                ratio-0 / ratio-128's pass null's).
+  //   tails_w  the W's (the compressor's output width's, the C4A's
+  //                kCsa2TailW's 1024's, the model's tails_w_'s); 0: the
+  //                tail's update's skipped (the ratio-4's layers' the
+  //                model's always's passes kCsa2TailW's).
+  // The tail's update (the dsv4_compress_tail_update's) runs on the ratio-4's
+  // branch (the wkv / wgate's F32 out's + the tail's even-stash / odd-pool's),
+  // using the layer's own w_.comp_norm / cfg_.eps / w_.ratio (the dsv41's
+  // contract's — the layer's the rebound's the values's) + the caller's tails /
+  // tails_w (the model's state's).
   void enqueue_decode(const void* hidden_in, void* main_cache, void* index_cache, const float* index_scale,
                       const int32_t* req_ids, const int64_t* pos, const int32_t* req_spans,
                       int num_requests, int tokens, void* out, cudaStream_t stream,
-                      float* tail_snapshots = nullptr);
+                      float* tail_snapshots = nullptr, float* tails = nullptr, int tails_w = 0);
 
   const Dsv4Csa2Config& config() const { return cfg_; }
   int layer() const { return layer_; }
@@ -197,7 +215,11 @@ class Dsv4Csa2Layer {
   float* q_scale_ = nullptr;   // [T * 64]
   uint16_t* iw_ = nullptr;     // [T, 64] the indexer's weights
   float* w_folded_ = nullptr;  // [T * 64]
-  uint16_t* latent_ = nullptr; // [T, 512]
+  uint16_t* latent_ = nullptr; // [T, kCsa2TailW] the compressor's latent (the C4A's 1024's)
+  float* comp_kv_ = nullptr;   // [T, kCsa2TailW] fp32 the wkv's F32 out (the C4A's tail's comp_kv's)
+  float* comp_score_ = nullptr;  // [T, kCsa2TailW] fp32 the wgate's F32 out (the C4A's tail's comp_score's)
+  int64_t* entries_ = nullptr;   // [T] the entry's ordinal's (p / 2 on the odd's, -1 otherwise)
+  int64_t* ent_pos_ = nullptr;    // [T] the entry's rotation position's (entries * ratio)
   uint16_t* ik_ = nullptr;     // [T, 128]
   int64_t* pos_ = nullptr;     // [T]
   int32_t* req_ids_ = nullptr; // [T]
