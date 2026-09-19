@@ -258,15 +258,17 @@ print("%s %s %s %s %s" % (d.get("world_size"), e.get("kv_capacity"), e.get("max_
 PYSHAPE
 ) || { log "cannot read the shape out of $FABRIC_CONFIG (is it a deployment JSON?)"; return 1; }
   read -r w kv mc mtp md <<< "$shape"
-  # The image's key (resident_image_key()) does not include mtp OR its depth:
-  # verified on hardware 2026-09-19 — the mtp-1, the nomtp and the mtp-5
-  # variants all restore the same image (`46/46 layers present`, constructed
-  # resident in 13-14 s), because the key is the per-rank tensor set. Any
-  # depth matches; only the shape does.
-  if [ "$w" = "2" ] && [ "$kv" = "262144" ] && [ "$mc" = "2" ]; then
+  # The image's key (resident_image_key()) is the per-rank TENSOR SET: the
+  # format version, the loader format, the world size, the rank, the head
+  # sharding and the checkpoint's config + shard headers. Serving knobs do
+  # NOT enter it — verified on hardware 2026-09-19/20: the kv-262144/C2,
+  # the kv-1048576/C6, the mtp-1, the nomtp and the mtp-5 shapes all restore
+  # the same image (`46/46 layers present`, resident in 13-16 s). So only the
+  # world size is checked here; anything else would refuse a valid shape.
+  if [ "$w" = "2" ]; then
     return 0
   fi
-  log "fabric config $FABRIC_CONFIG is world $w / kv $kv / max_concurrency $mc / mtp $mtp (depth $md) — the resident images in ${DGPP_RESIDENT_CACHE_DIR:-$HOME/.cache/dgpp/resident} were captured for the w2 dsv4 shape (world 2 / kv 262144 / max_concurrency 2; mtp and its depth do not enter the image key)"
+  log "fabric config $FABRIC_CONFIG is world $w / kv $kv / max_concurrency $mc / mtp $mtp (depth $md) — the resident images in ${DGPP_RESIDENT_CACHE_DIR:-$HOME/.cache/dgpp/resident} were captured for the world-2 dsv4 shape (per-rank tensor set; the serving knobs do not enter the key)"
   log "  -> point DSV4_FABRIC_CONFIG at the w2 dsv4 deployment (the site's $SITE_FABRIC_CONFIG when present), or capture an image for this shape first"
   return 1
 }
