@@ -1341,6 +1341,12 @@ foreach(_dsv4_oracle dsv4_csa2_oracle_test dsv4_dspark_oracle_test dsv4_mhc_orac
   set_tests_properties(${_dsv4_oracle} PROPERTIES LABELS "host")
 endforeach()
 
+# The csa2 oracle links the v4 layer library (the six-partials' layout's
+# scratch_bytes's + the 64-head select's host's dsv4_csa2_select_prefill's —
+# the real layer code's, the CPU-qualifiable's: the test calls only host
+# functions, no CUDA initialization, so it runs without a GPU).
+target_link_libraries(dsv4_csa2_oracle_test PRIVATE dgpp_models_dsv4_layers)
+
 # mHC module parity (M4): compute/update/final-mean kernels vs the double
 # oracle; real geometry, edge cases, determinism.
 add_executable(glm_mhc_test tests/cuda/glm_mhc_test.cu)

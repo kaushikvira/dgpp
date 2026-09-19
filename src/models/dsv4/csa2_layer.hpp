@@ -107,12 +107,26 @@ class Dsv4Csa2Layer {
   // The GEMM plans for `tokens` rows (outside capture).
   bool prepare(int tokens);
   // The decode batch (the hot path, graph-capturable): the projections,
-  // the window ring's append, the compressor (the ratio-4's overlapping
-  // / the ratio-128's plain), the indexer's 64-head query + the v4-
-  // owned 64-head selection, the two-source attention (the window ring
-  // + the selected main rows, the sink in the denominator), the grouped
-  // wo. `out`: bf16 [tokens, hidden].
-  void enqueue_decode(const void* hidden_in, void* main_cache, void* index_cache,
+  // the window ring's append (the layer's own ring, the no-pool positional
+  // state), the compressor (the ratio-4's overlapping / the ratio-128's
+  // plain), the indexer's 64-head query + the v4-owned 64-head selection,
+  // the two-source attention (the window ring + the selected main rows, the
+  // sink in the denominator), the grouped wo. `out`: bf16 [tokens, hidden].
+  //
+  // The caches (the model's, the no-pool positional state — the dsv41
+  // pool's planes' raw-pointer re-expression):
+  //   main_cache  the compressed main KV (the kv sources' entries), the
+  //                kFp4Block main format (the scales' inside the row's,
+  //                self-describing); null: the main source is skipped
+  //                (the window-only attention, the SWA layers' form).
+  //   index_cache / index_scale  the planar index cache (the e4m3 codes'
+  //                [entries, 128] + the fp32 row-scale's [entries]), the
+  //                the 64-head selection's stream; null: the selection's
+  //                the main source's skipped (the window-only attention).
+  // The window ring is the layer's own scratch (the no-pool model's
+  // positional state, the model's "the window ring's the layer scratch's")
+  // — it is always available, so the window source always runs.
+  void enqueue_decode(const void* hidden_in, void* main_cache, void* index_cache, const float* index_scale,
                       const int32_t* req_ids, const int64_t* pos, const int32_t* req_spans,
                       int num_requests, int tokens, void* out, cudaStream_t stream,
                       float* tail_snapshots = nullptr);
@@ -132,9 +146,22 @@ class Dsv4Csa2Layer {
   // tail's rotation -> the fp8 quant -> the folded weights (the 64-head
   // fold width the spec §2.1(d) flags as NEW).
   void indexer_query(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream);
-  // The attention of the current call's rows (the window ring + the
-  // selected main rows, the sink in the denominator, the finish).
-  void attend(int tokens, const int64_t* pos, cudaStream_t stream);
+  // The decode window's key-dimension split (the dsv41 kWinDecodeSplit's
+  // V4 re-expression): a one-row window is not a single latency-bound
+  // block, so the window's 128 keys are split across the key dimension to
+  // fill the SMs. A FIXED count, independent of the row count, so a token's
+  // window is computed identically whether it is a one-row decode step or
+  // row 0 of a multi-row MTP verify (the speculative transcript must equal
+  // the plain greedy one).
+  static constexpr int kWinDecodeSplit = 8;
+
+  // The attention of the current call's rows: the window ring's partials
+  // (always, the ring is the layer scratch's) and — when the model has
+  // allocated the main cache (main_cache non-null, the kFp4Block main
+  // format, self-describing) — the selected main rows' partials, the sink
+  // in the denominator, the finish. `req_ids` the caller's (the decode
+  // batch's, the member req_ids_'s the prefill staging's only).
+  void attend(int tokens, const int64_t* pos, const int32_t* req_ids, void* main_cache, cudaStream_t stream);
   // The grouped wo_a / wo_b (the block-diagonal over the groups).
   void project_out(int tokens, void* out, cudaStream_t stream);
 
@@ -144,6 +171,7 @@ class Dsv4Csa2Layer {
   int layer_ = -1;
   int max_tokens_ = 0;
   int64_t max_cache_tokens_ = 0;
+  int64_t max_entries_ = 0;  // the round-up-to-256 entry capacity (the select's ws_max_entries's)
   int max_decode_rows_ = 16;
   int decode_n_split_ = 32;
   float attn_scale_ = 0.f;
@@ -174,6 +202,22 @@ class Dsv4Csa2Layer {
   float* m_win_ = nullptr;
   float* l_win_ = nullptr;
   float* c_win_ = nullptr;
+  // The window ring's per-call slot lists (csa2_window_slots_decode's
+  // output) and the layer's own window ring (the no-pool positional state:
+  // [max_decode_rows][ring_slots] rows of the fp8_block form, one block per
+  // request — the dsv41 pool's ring's V4 re-expression, the model's
+  // "the window ring's the layer scratch's"). max_decode_rows safely
+  // upper-bounds the distinct-request count (the model's max_requests <=
+  // decode_rows_cap() == max_decode_rows).
+  int32_t* wlist_ = nullptr;  // [max_decode_rows, window] the slot lists
+  int32_t* wcounts_ = nullptr;  // [max_decode_rows]
+  uint8_t* ring_ = nullptr;  // [max_decode_rows, ring_slots] fp8_block rows
+  int32_t* ring_table_ = nullptr;  // [max_decode_rows] identity (one block per request)
+  int32_t* main_block_table_ = nullptr;  // [max_decode_rows, max_blocks] identity (the planar main cache's)
+  int64_t* pos_sel_ = nullptr;  // [max_decode_rows] the compressed entries' visible position
+  void* select_ws_ = nullptr;  // the v4 select's workspace (the dsa_select_workspace_bytes's)
+  int32_t* counter_ws_ = nullptr;  // [2] the select's counters (zeroed once)
+  int max_blocks_ = 0;  // the planar main cache's block count (max_cache_tokens / block_tokens)
   unsigned* violations_ = nullptr;
 };
 

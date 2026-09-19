@@ -5,6 +5,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
@@ -40,8 +41,10 @@ void Dsv4Csa2Config::validate(const Dsv4Csa2Config& c) {
 struct Dsv4Csa2Layer::Layout {
   size_t total = 0;
   size_t qr, kv, q, o, oa, idx_q, q_fp8, q_scale, w, w_folded, latent, ik, pos, req_ids, slots, topk, counts,
-       m_main, l_main, c_main, m_win, l_win, c_win, violations;
+       m_main, l_main, c_main, m_win, l_win, c_win,
+       wlist, wcounts, ring, ring_table, pos_sel, select_ws, counter, main_block_table, violations;
   int64_t max_entries = 0;
+  int max_blocks = 0;  // the planar main cache's block count (max_cache_tokens / block_tokens)
 };
 
 Dsv4Csa2Layer::Layout Dsv4Csa2Layer::layout(const Dsv4Csa2Config& cfg, int max_tokens, int64_t max_cache_tokens,
@@ -62,6 +65,14 @@ Dsv4Csa2Layer::Layout Dsv4Csa2Layer::layout(const Dsv4Csa2Config& cfg, int max_t
     return at;
   };
   L.max_entries = round_up_to(max_cache_tokens, 256);
+  // The planar main cache's identity block table (the no-pool positional
+  // state: the main cache is a flat [entries] array, the dsa attention
+  // kernels' block-table's the identity's re-expression — every request's
+  // block b is physical b, so entry e is at slot e). The block count is
+  // max_cache_tokens / block_tokens (independent of the ratio: a block is
+  // 128 tokens at every ratio), so it is small and shared across layers.
+  L.max_blocks = static_cast<int>((max_cache_tokens + cfg.block_tokens - 1) / cfg.block_tokens);
+  L.main_block_table = alloc(size_t(max_decode_rows) * size_t(L.max_blocks) * 4);
   L.qr = alloc(T * cfg.q_lora * 2);
   L.kv = alloc(T * kCsa2Latent * 2);
   L.q = alloc(T * lh * kCsa2Latent * 2);
@@ -83,8 +94,10 @@ Dsv4Csa2Layer::Layout Dsv4Csa2Layer::layout(const Dsv4Csa2Config& cfg, int max_t
   // attn_finish kernel's [r * n_split + s]'s (row, split)'s index's — the
   // dsv41's Csa2Layer's ws_slots' sizing (the max_decode_rows's x the
   // decode_n_split's the (row, split)'s pairs' the product's, NOT the
-  // max's — the dsv4's former ws_rows' max's the 32x's under-allocation's,
-  // the GPU-gate pending's parity gate's the OOB's). The dsv4's prefill's
+  // max's — the dsv4's former ws_rows' max's the 32x's under-allocation's
+  // FIXED here: the product's suffices for the [r * n_split + s]'s
+  // indexing's, the OOB's the 2026-09-18 GPU window's resolved's, the
+  // numerics' the parity gate's the pending's). The dsv4's prefill's
   // the <= max_decode_rows rows' enqueue_decode's, so the product's
   // suffices (the dsv41's kPrefillAttnRows * kPrefillSplit's term's the
   // dsv4's absent's prefill-split's attention's).
@@ -95,6 +108,24 @@ Dsv4Csa2Layer::Layout Dsv4Csa2Layer::layout(const Dsv4Csa2Config& cfg, int max_t
   L.m_win = alloc(ws_slots * lh * 4);
   L.l_win = alloc(ws_slots * lh * 4);
   L.c_win = alloc(ws_slots * lh * kCsa2Latent * 4);
+  // The window ring's per-call slot lists (csa2_window_slots_decode's
+  // [rows, window] lists + [rows] counts) and the layer's own window ring
+  // (the no-pool positional state: [max_decode_rows][ring_slots] rows of
+  // the fp8_block form + the identity ring table, one block per request —
+  // the dsv41 pool's ring's V4 re-expression). max_decode_rows safely
+  // upper-bounds the distinct-request count (the model's max_requests <=
+  // decode_rows_cap() == max_decode_rows).
+  L.wlist = alloc(size_t(max_decode_rows) * size_t(cfg.window) * 4);
+  L.wcounts = alloc(size_t(max_decode_rows) * 4);
+  L.ring = alloc(size_t(max_decode_rows) * size_t(cfg.ring_slots) * latent_row_bytes(LatentFormat::kFp8Block, kCsa2Latent));
+  L.ring_table = alloc(size_t(max_decode_rows) * 4);
+  L.pos_sel = alloc(size_t(max_decode_rows) * 8);
+  // The v4-owned 64-head selection's workspace + counters (the dsa_select
+  // workspace's the running top-select_k's, sized for the caller's largest
+  // row count and pool count; the counters' the scoring ticket's + the
+  // rows-done count's, zeroed once at allocation).
+  L.select_ws = alloc(dsa_select_workspace_bytes(max_decode_rows, L.max_entries));
+  L.counter = alloc(8);
   L.violations = alloc(16);
   L.total = align256(off);
   return L;
@@ -114,6 +145,7 @@ Dsv4Csa2Layer::Dsv4Csa2Layer(IGemm& gemm, const Dsv4Csa2Config& cfg, int max_tok
   const Layout L = layout(cfg, max_tokens, max_cache_tokens, max_decode_rows, decode_n_split, dot_budget);
   if (scratch == nullptr || scratch_capacity < L.total) throw std::invalid_argument("dsv4 csa2 layer: scratch too small");
   scratch_ = static_cast<uint8_t*>(scratch);
+  max_entries_ = L.max_entries;
   attn_scale_ = static_cast<float>(std::pow(static_cast<double>(kCsa2Latent), -0.5));
   const auto at = [&](size_t off) { return scratch_ + off; };
   qr_ = reinterpret_cast<uint16_t*>(at(L.qr));
@@ -139,10 +171,33 @@ Dsv4Csa2Layer::Dsv4Csa2Layer(IGemm& gemm, const Dsv4Csa2Config& cfg, int max_tok
   m_win_ = reinterpret_cast<float*>(at(L.m_win));
   l_win_ = reinterpret_cast<float*>(at(L.l_win));
   c_win_ = reinterpret_cast<float*>(at(L.c_win));
+  wlist_ = reinterpret_cast<int32_t*>(at(L.wlist));
+  wcounts_ = reinterpret_cast<int32_t*>(at(L.wcounts));
+  ring_ = at(L.ring);
+  ring_table_ = reinterpret_cast<int32_t*>(at(L.ring_table));
+  main_block_table_ = reinterpret_cast<int32_t*>(at(L.main_block_table));
+  pos_sel_ = reinterpret_cast<int64_t*>(at(L.pos_sel));
+  select_ws_ = at(L.select_ws);
+  counter_ws_ = reinterpret_cast<int32_t*>(at(L.counter));
   violations_ = reinterpret_cast<unsigned*>(at(L.violations));
-  // The constants (the zeroed counters).
+  max_blocks_ = L.max_blocks;
+  // The constants (the zeroed counters, the identity ring table's the
+  // ring's one-block-per-request's the dsv41 pool's ring_table's V4
+  // re-expression's, the identity main block table's the planar main
+  // cache's (every request's block b is physical b, so entry e is at
+  // slot e), the select's workspace's + counters' zeroed once's).
+  std::vector<int32_t> ring_table(static_cast<size_t>(max_decode_rows));
+  for (int i = 0; i < max_decode_rows; ++i) ring_table[static_cast<size_t>(i)] = i;
+  DGPP_CUDA_OK(cudaMemcpy(ring_table_, ring_table.data(), ring_table.size() * 4, cudaMemcpyHostToDevice));
+  std::vector<int32_t> main_bt(static_cast<size_t>(max_decode_rows) * static_cast<size_t>(L.max_blocks));
+  for (int r = 0; r < max_decode_rows; ++r)
+    for (int b = 0; b < L.max_blocks; ++b)
+      main_bt[static_cast<size_t>(r) * L.max_blocks + b] = b;
+  DGPP_CUDA_OK(cudaMemcpy(main_block_table_, main_bt.data(), main_bt.size() * 4, cudaMemcpyHostToDevice));
   DGPP_CUDA_OK(cudaMemset(violations_, 0, 16));
   DGPP_CUDA_OK(cudaMemset(counts_, static_cast<size_t>(max_tokens) * 4, 0));
+  DGPP_CUDA_OK(cudaMemset(select_ws_, dsa_select_workspace_bytes(max_decode_rows, max_entries_), 0));
+  DGPP_CUDA_OK(cudaMemset(counter_ws_, 0, 8));
 }
 
 void Dsv4Csa2Layer::rebind(const Dsv4Csa2LayerWeights& w, int layer) {
@@ -232,19 +287,47 @@ void Dsv4Csa2Layer::indexer_query(const void* hidden_in, int tokens, const int64
   csa2_fold_weights(iw_, q_scale_, w_folded_, int64_t(tokens) * heads, stream);
 }
 
-void Dsv4Csa2Layer::attend(int tokens, const int64_t* pos, cudaStream_t stream) {
+void Dsv4Csa2Layer::attend(int tokens, const int64_t* pos, const int32_t* req_ids, void* main_cache, cudaStream_t stream) {
   const int lh = cfg_.local_heads();
-  // The two-source attention's finish (the window ring's partials + the
-  // selected main's partials, the sink in the denominator, the inverse
-  // rotation). The partials (m_win_ / c_win_ / m_main_ / c_main_) are
-  // filled by the attention kernels (the dsa_attn_partial over the ring
-  // + the dsa_attn_listed over the main cache — the dsv41 layer's
-  // Csa2StatePool's wiring, the GPU-gate pending's completion); the
-  // finish's contract (the csa2_attn_finish's merge + the sink's
-  // exactly-once) is pinned by the CPU oracle (tests/unit/
+  // The two-source attention (the dsv41 layer's Csa2StatePool's wiring's
+  // V4 re-expression, the no-pool positional state):
+  //   * the window source: dsa_attn_partial over the layer's own ring
+  //     (the fp8_block ring format, the window slot lists wlist_ / wcounts_
+  //     the csa2_window_slots_decode's, the n_split_win the decode's
+  //     key-dimension split's the kWinDecodeSplit's) -> m_win_ / l_win_ /
+  //     c_win_. The ring is always available (the layer scratch's), so the
+  //     window source always runs.
+  //   * the main source: dsa_attn_listed over the planar main cache (the
+  //     kFp4Block main format, the identity block table's the no-pool
+  //     positional state's) + the selected topk_ / counts_ -> m_main_ /
+  //     l_main_ / c_main_. Runs only when the model has allocated the main
+  //     cache (main_cache non-null) and the layer is a kv source (ratio > 0).
+  // The finish (the csa2_attn_finish's merge + the sink's exactly-once, the
+  // inverse rotation) is pinned by the CPU oracle (tests/unit/
   // dsv4_csa2_oracle_test.cpp's dsv4_sparse_attn_sink_exactly_once).
-  csa2_attn_finish(m_main_, l_main_, c_main_, decode_n_split_, m_win_, l_win_, c_win_, decode_n_split_,
-                   w_.attn_sink, tokens, lh, pos, w_.inv_freq, o_, stream);
+  const int n_split_win = std::min(decode_n_split_, kWinDecodeSplit);
+  dsa_attn_partial(q_, ring_, req_ids, wlist_, cfg_.window, wcounts_, tokens, n_split_win, lh, kCsa2Latent,
+                   cfg_.ring_slots, ring_table_, 1, attn_scale_, m_win_, l_win_, c_win_, stream,
+                   LatentFormat::kFp8Block, nullptr, 0);
+  int n_main = 0;
+  if (main_cache != nullptr && w_.ratio > 0) {
+    // The planar main cache's entries-per-block (the 128-token block's the
+    // ratio's compressed entries), the identity block table (the no-pool
+    // positional state), the dsa_attn_listed's the 16-head-multiple's
+    // fallback to the dsa_attn_partial's (the dsv41 layer's contract).
+    const int epb = cfg_.block_tokens / w_.ratio;
+    n_main = decode_n_split_;
+    const bool ok = (lh >= 16 && lh % 16 == 0 &&
+                     dsa_attn_listed(q_, main_cache, req_ids, topk_, cfg_.index_topk, counts_, tokens, n_main, lh,
+                                     kCsa2Latent, epb, main_block_table_, max_blocks_, attn_scale_, m_main_, l_main_,
+                                     c_main_, stream, LatentFormat::kFp4Block, nullptr, 0));
+    if (!ok)
+      dsa_attn_partial(q_, main_cache, req_ids, topk_, cfg_.index_topk, counts_, tokens, n_main, lh, kCsa2Latent, epb,
+                       main_block_table_, max_blocks_, attn_scale_, m_main_, l_main_, c_main_, stream,
+                       LatentFormat::kFp4Block, nullptr, 0);
+  }
+  csa2_attn_finish(n_main ? m_main_ : nullptr, n_main ? l_main_ : nullptr, n_main ? c_main_ : nullptr, n_main, m_win_,
+                   l_win_, c_win_, n_split_win, w_.attn_sink, tokens, lh, pos, w_.inv_freq, o_, stream);
 }
 
 void Dsv4Csa2Layer::project_out(int tokens, void* out, cudaStream_t stream) {
@@ -263,32 +346,48 @@ void Dsv4Csa2Layer::project_out(int tokens, void* out, cudaStream_t stream) {
                               cfg_.dense_mma);
 }
 
-void Dsv4Csa2Layer::enqueue_decode(const void* hidden_in, void* main_cache, void* index_cache, const int32_t* req_ids,
-                                   const int64_t* pos, const int32_t* req_spans, int num_requests, int tokens,
-                                   void* out, cudaStream_t stream, float* tail_snapshots) {
-  (void)main_cache;
-  (void)index_cache;
+void Dsv4Csa2Layer::enqueue_decode(const void* hidden_in, void* main_cache, void* index_cache, const float* index_scale,
+                                   const int32_t* req_ids, const int64_t* pos, const int32_t* req_spans, int num_requests,
+                                   int tokens, void* out, cudaStream_t stream, float* tail_snapshots) {
   (void)req_spans;
-  (void)num_requests;
   (void)tail_snapshots;
   if (tokens <= 0 || tokens > max_decode_rows_) throw std::invalid_argument("dsv4 csa2 layer: decode rows out of range");
+  if (num_requests <= 0 || num_requests > max_decode_rows_)
+    throw std::invalid_argument("dsv4 csa2 layer: request count out of range (the ring's request bound's)");
   if (!hidden_in || !req_ids || !pos || !out) throw std::invalid_argument("dsv4 csa2 layer: null buffer");
-  // The decode's hot path (the graph-capturable one): the projections,
-  // the window ring's slots, the compressor, the indexer's 64-head query
-  // + the v4-owned 64-head selection, the two-source attention's finish,
-  // the grouped wo. The main / index caches' planar forms (the paged
-  // pool's block tables' resolution) are the caller's (the dsv41 layer's
-  // Csa2StatePool's contract, the GPU-gate pending's completion).
+  // The decode's hot path (the graph-capturable one), the dsv41 layer's
+  // Csa2StatePool's wiring's V4 re-expression (the no-pool positional state):
+  //   1. the projections (q, the window latent kv).
+  //   2. the window ring's append (the layer's own ring, the fp8_block ring
+  //      format, the ring slot = pos % ring_slots) — the ring is read after
+  //      the append, so this batch's rows are visible to its own queries.
+  //   3. the window slot lists (csa2_window_slots_decode).
+  //   4. the compressor (the ratio-4's overlapping / the ratio-128's plain)
+  //      — the latent for the window ring's append (the publish into the
+  //      main / index cache is the model's, the GPU-gate pending's).
+  //   5. the indexer's 64-head query + the v4-owned 64-head selection
+  //      (dsv4_csa2_select_decode over the planar index cache) -> topk_ /
+  //      counts_. The selection's numerics are certified against the CPU
+  //      oracle's (score desc, index asc)'s total order (the GPU-gate
+  //      pending's completion runs the parity gate).
+  //   6. the two-source attention (the window ring + the selected main rows)
+  //      + the finish (attend).  7. the grouped wo.
   project_q_kv(hidden_in, tokens, pos, stream);
   csa2_ring_slot_positions(pos, slots_, tokens, cfg_.ring_slots, stream);
+  // The window ring's append (the layer's own ring, the no-pool positional
+  // state; the fp8_block ring format, one block per request — the dsv41
+  // pool's ring's V4 re-expression).
+  dsa_latent_append(kv_, req_ids, slots_, tokens, ring_table_, 1, cfg_.ring_slots, ring_, kCsa2Latent, stream,
+                    LatentFormat::kFp8Block);
+  csa2_window_slots_decode(pos, tokens, cfg_.window, cfg_.ring_slots, wlist_, wcounts_, stream);
   if (w_.ratio > 0 && w_.kv_source) {
     if (w_.ratio == 4) {
       // The ratio-4's overlapping compressor (coff 2 — the dsv41's
-      // ratio-2's pair pooling, the V4's one geometry swap): the wkv /
-      // wgate's pair + the per-request tail's update (the dsv41's
-      // csa2_compress_decode_update's V4 ratio-4's re-expression — the
-      // tail's fp32 [2, 512]'s per-request ring, the GPU-gate pending's
-      // completion wires the tail's ordinal + the wgate's plane).
+      // ratio-2's pair pooling, the V4's one geometry swap): the wkv / wgate's
+      // pair + the per-request tail's update (the dsv41's
+      // csa2_compress_decode_update's V4 ratio-4's re-expression — the tail's
+      // fp32 [2, 512]'s per-request ring, the wgate's plane + the tail's
+      // ordinal's the model's publish's, the GPU-gate pending's completion's).
       gemm_.matmul(hidden_in, w_.comp_wkv, latent_, tokens, kCsa2Latent, cfg_.hidden, DType::BF16, GemmOut::F32,
                    size_t(cfg_.hidden), gemm_ws_, gemm_ws_bytes_, stream);
     } else {
@@ -301,15 +400,20 @@ void Dsv4Csa2Layer::enqueue_decode(const void* hidden_in, void* main_cache, void
     }
   }
   if (w_.index_source) {
+    if (index_cache == nullptr || index_scale == nullptr)
+      throw std::invalid_argument("dsv4 csa2 layer: an index source needs the model's index cache");
     indexer_query(hidden_in, tokens, pos, stream);
-    // The v4-owned 64-head selection (the shared csa2_select's 32-head
-    // pin's V4 re-expression; the numerics certified against the CPU
-    // oracle's (score desc, index asc)'s total order — the GPU-gate
-    // pending's completion runs the parity gate). The visible entries'
-    // count per row (the compressed entries' pos_sel) is the caller's
-    // (the csa2_entry_positions' V4 ratio's).
+    // The visible entries' count per row (the compressed entries' pos_sel =
+    // (pos + 1) / ratio - 1, the selection's causal bound).
+    csa2_entry_positions(pos, pos_sel_, tokens, w_.ratio, stream);
+    // The v4-owned 64-head selection (the shared csa2_select's 32-head pin's
+    // V4 re-expression, the planar index cache's the block_tables' null's
+    // identity's): the running top-select_k composite-key's the (score desc,
+    // index asc)'s total order, the exact ties to the lower entry index.
+    dsv4_csa2_select_decode(q_fp8_, w_folded_, req_ids, pos_sel_, tokens, nullptr, 0, index_cache, index_scale, 1,
+                           cfg_.index_topk, topk_, counts_, select_ws_, max_entries_, counter_ws_, stream);
   }
-  attend(tokens, pos, stream);
+  attend(tokens, pos, req_ids, main_cache, stream);
   project_out(tokens, out, stream);
 }
 

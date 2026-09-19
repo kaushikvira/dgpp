@@ -744,10 +744,14 @@ void Dsv4Model::enqueue_layer(const Dsv4LayerResident& r, int layer, int T, cons
   mhc_site(cur_, aw, r.attn_norm, T, rows.decode);
   uint16_t* attn_out = stage(y_, T, H, rows.capture);
   if (!csa2_->prepare(T)) throw std::runtime_error("run_rows: CSA2 GEMM plans unavailable");
-  // The decode path (the prefill's chunks ride it too): the planar cache
-  // pointers stand for the paged pool's (the wiring's the GPU-gate
-  // pending's completion's).
-  csa2_->enqueue_decode(x_, nullptr, nullptr, rows.req_ids, rows.pos, rows.spans, rows.num_requests, T, attn_out,
+  // The decode path (the prefill's chunks ride it too): the window ring's
+  // the layer scratch's (always available), the main / index cache's the
+  // model's planar positional state's (nullptr for now — the model's cache
+  // allocation's the GPU-gate pending's completion's, the main source's +
+  // the 64-head selection's skipped until then, the window source's always
+  // runs). index_scale's the index cache's fp32 row-scale's (the planar
+  // index cache's the e4m3 codes' + the fp32 scale's the two arrays's).
+  csa2_->enqueue_decode(x_, nullptr, nullptr, nullptr, rows.req_ids, rows.pos, rows.spans, rows.num_requests, T, attn_out,
                        stream_, nullptr);
   fold(attn_out, T, H, rows.capture);  // block boundary 1: wo_b's partial
   stream_update(attn_out, T);

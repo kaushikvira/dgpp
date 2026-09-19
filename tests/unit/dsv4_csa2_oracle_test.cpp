@@ -32,6 +32,8 @@
 
 #include "common/dtypes.hpp"
 #include "common/test.hpp"
+#include "kernels/csa2.hpp"
+#include "models/dsv4/csa2_layer.hpp"
 
 namespace {
 
@@ -703,6 +705,101 @@ DGPP_TEST(dsv4_sparse_attn_sink_exactly_once) {
                                  std::to_string(out_sink[static_cast<size_t>(h) * kHeadDim + d]) + ")");
     }
   (void)s;
+}
+
+// ---- the six decode attention partials' layout (the scratch's the
+// (row, split)'s indexing's, the dsa_attn_partial / dsa_attn_listed's
+// m_ws / l_ws / c_ws's, the csa2_attn_finish's merge's) -----------------
+// The six partials (m_main_ / l_main_ / c_main_ + the m_win_ / l_win_ /
+// c_win_) are sized by ws_slots (the max_decode_rows's x the decode_n_split's
+// (row, split)'s pairs' PRODUCT's, NOT the max's — the 32x's under-
+// allocation's the 2026-09-18 GPU window's OOB's regression) and indexed
+// [r * n_split + s]. This pins the contract on a small synthetic shape (the
+// CPU-qualifiable's: the scratch_bytes's the host's, the indexing's the
+// arithmetic's) so the under-allocation's regression's caught here, not on
+// the GPU.
+DGPP_TEST(dsv4_csa2_partial_layout) {
+  using dgpp::Dsv4Csa2Config;
+  using dgpp::Dsv4Csa2Layer;
+  Dsv4Csa2Config cfg;
+  cfg.hidden = 256;
+  cfg.q_lora = 128;
+  cfg.o_lora = 128;
+  cfg.num_heads = 8;
+  cfg.o_groups = 2;
+  cfg.index_heads = 64;  // the V4's 64 (the NEW fold width's the validate's pin's)
+  cfg.index_topk = 8;
+  cfg.window = 8;
+  cfg.ring_slots = 32;  // >= window + 16
+  cfg.block_tokens = 8;  // positive even
+  cfg.eps = 1e-6f;
+  cfg.tp = 2;  // local_heads 4 (power of two >= 4), local_groups 1
+  Dsv4Csa2Config::validate(cfg);
+  const int max_decode_rows = 4, decode_n_split = 4;
+  const int lh = cfg.local_heads();  // 4
+  // The six partials' ws_slots (the (row, split)'s pairs' the PRODUCT's —
+  // the 32x's under-allocation's the regression's guard's).
+  const size_t ws_slots = std::max<size_t>(max_decode_rows, 8) * std::max<size_t>(decode_n_split, 8);
+  const size_t m_bytes = ws_slots * static_cast<size_t>(lh) * 4;
+  const size_t c_bytes = ws_slots * static_cast<size_t>(lh) * static_cast<size_t>(dgpp::kCsa2Latent) * 4;
+  const size_t six = 4 * m_bytes + 2 * c_bytes;  // m / l x the 2 sources + c x the 2 sources
+  const size_t total = Dsv4Csa2Layer::scratch_bytes(cfg, /*max_tokens=*/16, /*max_cache_tokens=*/256, max_decode_rows,
+                                                    decode_n_split, 64ull << 20);
+  if (total < six)
+    throw std::runtime_error("the six partials' layout under-allocated (the total's " + std::to_string(total) +
+                              " < the six's " + std::to_string(six) + " — the 32x's under-allocation's regression's)");
+  // The (row, split)'s indexing's [r * n_split + s]'s the max offset's fits
+  // the region's (the rows's <= max_decode_rows's, the n_split's <=
+  // decode_n_split's, so r * n_split < ws_slots's).
+  const size_t max_split_idx = static_cast<size_t>(max_decode_rows) * static_cast<size_t>(decode_n_split);
+  if (max_split_idx > ws_slots)
+    throw std::runtime_error("the (row, split)'s indexing's the max offset's out of the ws_slots's bound's");
+}
+
+// ---- the 64-head select's output layout (the topk_out's [rows, select_k]'s
+// the -1's padding's, the counts's, the (score desc, index asc)'s total
+// order's) the host's dsv4_csa2_select_prefill's (the real code's, the CPU-
+// qualifiable's — no CUDA initialization) ------------------------------
+DGPP_TEST(dsv4_csa2_select_prefill_layout) {
+  const int rows = 2, n_entries = 8, select_k = 4, heads = 64;
+  const int64_t dot_stride = n_entries;
+  // The dot's [rows * heads, dot_stride] (row r head h at r * heads + h).
+  // The logit's entry j's = sum_h w_folded[r,h] * relu(dot) * k_scale[j]'s,
+  // so with w_folded = 1's + k_scale = 1's, logit_j = heads * dot[r*heads+h, j]'s.
+  // The dyadic values (x / 64's) are exact in fp32, so the ties' exact's
+  // (the 2/7's tie's the index's asc's preserved's).
+  std::vector<float> dot(static_cast<size_t>(rows) * heads * dot_stride, 0.0f);
+  const float row0_logit[8] = {3, 1, 2, 1, 5, 0, 4, 2};  // entry 4's 5's the top's, the 2/7's tie's
+  for (int j = 0; j < n_entries; ++j)
+    for (int h = 0; h < heads; ++h)
+      dot[static_cast<size_t>(h) * dot_stride + j] = row0_logit[j] / heads;
+  const float row1_logit[2] = {2, 1};  // the visible's 2's (pos_sel 1's), the rest's -1's the padding's
+  for (int j = 0; j < 2; ++j)
+    for (int h = 0; h < heads; ++h)
+      dot[static_cast<size_t>(heads + h) * dot_stride + j] = row1_logit[j] / heads;
+  std::vector<float> w_folded(static_cast<size_t>(rows) * heads, 1.0f);
+  std::vector<float> k_scale(n_entries, 1.0f);
+  std::vector<int64_t> pos_sel = {n_entries - 1, 1};  // row 0's visible 8's, row 1's visible 2's
+  std::vector<int32_t> topk_out(static_cast<size_t>(rows) * select_k, -77);
+  std::vector<int32_t> counts(rows, -77);
+  dgpp::dsv4_csa2_select_prefill(dot.data(), dot_stride, w_folded.data(), k_scale.data(), pos_sel.data(), rows,
+                                 n_entries, select_k, topk_out.data(), counts.data(), nullptr);
+  // Row 0: the (score desc, index asc)'s top-4's [4, 6, 0, 2]'s (the tie's
+  // 2/7's the index's asc's the 2's first's), the counts's 4's.
+  const int32_t want0[4] = {4, 6, 0, 2};
+  for (int j = 0; j < select_k; ++j)
+    if (topk_out[static_cast<size_t>(j)] != want0[j])
+      throw std::runtime_error("the select's row 0's topk's [" + std::to_string(topk_out[0]) + "," +
+                               std::to_string(topk_out[1]) + "," + std::to_string(topk_out[2]) + "," +
+                               std::to_string(topk_out[3]) + "] != the (score desc, index asc)'s [4,6,0,2]");
+  if (counts[0] != 4) throw std::runtime_error("the select's row 0's counts's != 4's");
+  // Row 1: the visible's 2's < select_k's 4's, so the top-2's [0, 1]'s +
+  // the -1's padding's [0, 1, -1, -1]'s, the counts's 2's.
+  const int32_t want1[4] = {0, 1, -1, -1};
+  for (int j = 0; j < select_k; ++j)
+    if (topk_out[static_cast<size_t>(1) * select_k + j] != want1[j])
+      throw std::runtime_error("the select's row 1's topk's != the (top-2's + the -1's padding's) [0,1,-1,-1]");
+  if (counts[1] != 2) throw std::runtime_error("the select's row 1's counts's != 2's");
 }
 
 int main() { return ::dgpp::test::run_all(); }
