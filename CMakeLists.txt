@@ -1363,6 +1363,22 @@ dgpp_set_common(dsv4_compress_tail_test)
 add_test(NAME dsv4_compress_tail_test COMMAND dsv4_compress_tail_test)
 set_tests_properties(dsv4_compress_tail_test PROPERTIES LABELS "host")
 
+# The model-level pin for the C4A tail width W = 1024 (the coff x
+# kCsa2Latent's, docs/dsv4_attention_spec.md §0.3): the static
+# session_snapshot_bytes' (the per-request tails' the only per-request
+# state's) returns tails * 2 * kCsa2TailW * sizeof(float). Host-only, no
+# GPU: the test calls only the static session_snapshot_bytes' (a pure host
+# function's), no CUDA initialization (the dsv4_csa2_oracle_test's the
+# same's the pattern's — it links the v4 model's library's but calls only
+# host's the functions's). Links the v4 model's library (the model.cpp's
+# session_snapshot_bytes's) for the model/state's level's W's pin's.
+add_executable(dsv4_model_state_test tests/unit/dsv4_model_state_test.cpp)
+target_include_directories(dsv4_model_state_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit)
+dgpp_set_common(dsv4_model_state_test)
+target_link_libraries(dsv4_model_state_test PRIVATE dgpp_models_dsv4_model)
+add_test(NAME dsv4_model_state_test COMMAND dsv4_model_state_test)
+set_tests_properties(dsv4_model_state_test PROPERTIES LABELS "host")
+
 # mHC module parity (M4): compute/update/final-mean kernels vs the double
 # oracle; real geometry, edge cases, determinism.
 add_executable(glm_mhc_test tests/cuda/glm_mhc_test.cu)
