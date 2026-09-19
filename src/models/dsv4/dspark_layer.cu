@@ -304,7 +304,12 @@ extern "C" __global__ void dsv4_dspark_union_attn_kernel(const uint16_t* __restr
   const float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
   for (int d = 0; d < dims_per_thread; ++d) {
     const int dim = dim_chunk * dims_per_thread + d;
-    const float v = acc[dim] * inv_l;
+    // acc's the thread's own dims_per_thread's (64's) slots — the dim's the
+    // head's 512-dim's index's, the acc's slot's the thread's d's. (The
+    // 2026-09-19 sanitizer's Invalid __local__ read of 16 bytes at thread
+    // 33's block 4's: acc[dim]'s read past the 64-entry local array for
+    // every dim_chunk > 0's — the union attention's head's output's.)
+    const float v = acc[d] * inv_l;
     out_row[head * 512 + dim] = dgpp::float_to_bf16_bits(v);
   }
 }
