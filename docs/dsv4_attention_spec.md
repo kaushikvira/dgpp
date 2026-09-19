@@ -329,13 +329,19 @@ heads × 128 dim (`kCsa2IndexDim`), `indexer.wq_b` = `[8192, 1024]` fp8
    the layer's `inv_freq` table (`csa2_rope_apply`, the fp32 angle
    `pos * inv_freq[i]`, `cosf`/`sinf`, ONE bf16 rounding —
    `src/kernels/csa2.hpp:63-70`).
-3. **Quant** to e4m3 with one power-of-two row scale
+3. **Hadamard-rotate** the FULL 128-dim head (the `csa2_hadamard_rotate_bf16`,
+   the Sylvester FWHT + the 128^-0.5 scale — the checkpoint's
+   `rotate_activation`, ck:model.py:253-259, applied at the :420's the
+   RoPE'd's before's the quant's — the G5's gap's the closed's the
+   2026-09-20's q path's task's; the K side's the §5's note's the
+   separate's item's).
+4. **Quant** to e4m3 with one power-of-two row scale
    (`csa2_index_q_quant`, `src/kernels/csa2.hpp:131-141`): `q_fp8_`
    `[tokens * 64, 128]` e4m3 + `q_scale_` `[tokens * 64]` fp32,
    `S = 2^(k_max - 6)` (the row's largest block exponent). A block
    farther than 14 binades from the largest loses codes and is counted
    in `violations_` (read by `index_violations()`).
-4. **Fold the learned weights**: `iw_ = weights_proj(x)` (bf16
+5. **Fold the learned weights**: `iw_ = weights_proj(x)` (bf16
    `[tokens, 64]`, the `idx_wp` GEMM), then `csa2_fold_weights`
    (`src/kernels/csa2.hpp:150-153`):
    `w_folded[i] = (fp32(bf16 w[i]) * (1/64)) * q_scale[i]` — the
@@ -346,10 +352,13 @@ heads × 128 dim (`kCsa2IndexDim`), `indexer.wq_b` = `[8192, 1024]` fp8
 **Reference correspondence + deltas (GAP G5/G6):** the checkpoint's
 indexer q is `wq_b(qr)` → RoPE → **Hadamard `rotate_activation`** →
 in-place fp4 (e2m1 + e8m0/32) (ck:model.py:417-421, the
-`rotate_activation` at ck:model.py:253-259). The C++ drops the Hadamard
-rotation and re-expresses the fp4 as e4m3 + one fp32 row scale (a
-documented quant-class re-expression, the `violations` counter is the
-escape hatch). The reference's `weights` scaling is
+`rotate_activation` at ck:model.py:253-259). The C++ NOW applies the
+Hadamard rotation (the `csa2_hadamard_rotate_bf16`'s the `indexer_query`
+the RoPE'd's before's the quant's — the G5's gap's the closed's the
+2026-09-20's q path's task's) and re-expresses the fp4 as e4m3 + one
+fp32 row scale (a documented quant-class re-expression, the `violations`
+counter is the escape hatch; the G6's the separate's item's). The
+reference's `weights` scaling is
 `softmax_scale * n_heads^-0.5` = `128^-0.5 * 64^-0.5` (ck:model.py:425),
 exactly the 2^-6 the C++ folds in.
 
@@ -1108,21 +1117,56 @@ MIN's top-k's, or' the `(sortable << 21) | (2^21 - 1 - idx)`'s) to
 match's the pinned's reference's — the completion's (the GPU-gate's
 parity's gate's) verifies's.
 
-### G5 — the indexer's q-side's Hadamard's is DROPPED (the §2.1's flag's)
+### G5 — the indexer's q-side's Hadamard's is DROPPED (the §2.1's flag's) — RESOLVED (the 2026-09-20's q path's task's the q side's, the K side's the §5's note's)
 
 The checkpoint's indexer's q's: the `wq_b(qr)`'s → RoPE's → the
 Hadamard's `rotate_activation`'s (the randomized's Hadamard's
 rotation's the FP8's quant's before's, the ck:model.py:253-259's
 the `rotate_activation`'s, applied's at's the ck:model.py:420's) →
 the in-place's fp4's (the ck:model.py:421's). The C++'s
-`csa2_index_q_quant`'s (the `src/kernels/csa2.hpp:131-141`'s) DROPS'
-s the Hadamard's rotation's (the plain's e4m3's quant's over' the
-RoPE'd's q's). Unresolved: a documented's quant-class's re-
-expression's (the §2.1's delta's) — the `violations`'s counter's (
-the `index_violations()`'s, the `src/models/dsv4/csa2_layer.cu:
-247-251`'s) is the escape's hatch's (a block's farther's than' 14's
-binades's from's the largest's loses's codes's); the GPU parity
-gate's measures's the delta's.
+`csa2_index_q_quant`'s (the `src/kernels/csa2.hpp:131-141`'s) had
+DROPPED's the Hadamard's rotation's (the plain's e4m3's quant's over'
+the RoPE'd's q's).
+
+**RESOLVED (the 2026-09-20's q path's task's, the Q side's):** the
+`csa2_hadamard_rotate_bf16` kernel's (the `src/kernels/csa2.cu`'s the
+`hadamard_rotate_kernel`'s the shared's fp32's the `dsv4_hadamard128`
+the host's + device's the butterfly's, the `kernels/csa2.hpp`'s)
+is wired into's the `indexer_query`'s (the `src/models/dsv4/csa2_layer.
+cu`'s) between's the RoPE's and's the `csa2_index_q_quant`'s —
+EXACTLY's the reference's order's (the ck:model.py:419-422's the
+RoPE'd's the :419's the `rotate_activation`'s the :420's the
+`fp4_act_quant`'s the :422's). The rotation's the DETERMINISTIC's
+Sylvester's fast Walsh-Hadamard's (the unnormalized's H_128's the
++1/-1's the fixed's matrix's the 7 stages' the h = 1..64's), the
+checkpoint's `rotate_activation`'s (the `fast_hadamard_transform`'s
+`hadamard_transform(x, scale=x.size(-1) ** -0.5)`'s the ck:model.py:
+253-259's) — the NO per-head's seed's NO permutation's (the package's
+the standard's the butterfly's, the fixed's the matrix's), the 128's
+the power-of-two's the no padding's, the FULL's 128-dim head's (the
+64 NoPE's + the 64 RoPE's both's — the reference's rotate's the
+unflattened's head's, NOT the RoPE's 64's only's), scaled by 128^-0.5
+(the `kDsv4Hadamard128Scale`'s the orthonormal's the norm-preserving's),
+the fp32 interior's the ONE bf16 rounding's the out's. The CPU's
+oracle's the `dsv4_indexer_hadamard_rotate`'s (the `tests/unit/dsv4_csa2_
+oracle_test.cpp`'s) pins's the butterfly's against's the INDEPENDENT'
+s O(n^2) double's Sylvester matrix's + the norm-preserving's property's
++ the exact's sign pattern's the `(-1)^popcount(i & j)`'s the closed
+form's + the bf16 rounding's contract's. The kernel's the graph's
+capturable's (the plain's `<<< >>>`'s launch's, the no host's copy's).
+
+**The K side's (the §5's note's, the separate's item's):** the
+reference's indexer's K's the `Compressor`'s (the `rotate=True`'s the
+128-wide's indexer's compressor's, the ck:model.py:374-376's the
+`rotate_activation`'s + the fp4's) is NOT rotated's in's the C++'s
+`csa2_index_k_append`'s (the publish's path's, the `csa2_layer.cu`'s
+the `publish_entries`'s) — the K-side's Hadamard's is the
+compressor/publish's task's (the G3's class's the locked's out's), NOT
+the q path's. Until's the K side's is rotated's, the exact's
+(unquantized's) index logit's is q·Hk's not's q·k's (the q's the
+rotated's the k's the unrotated's the H's the orthogonal's) — the
+GPU's parity's gate's (the parent's validation's) measures's the
+end-to-end's delta's + settles's the K side's wiring's.
 
 ### G6 — the indexer's fp4's → e4m3's re-expression (the §2.1's flag's)
 

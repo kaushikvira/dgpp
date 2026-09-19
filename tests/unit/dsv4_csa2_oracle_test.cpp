@@ -986,6 +986,115 @@ DGPP_TEST(dsv4_q_renorm_contract) {
   }
 }
 
+// ---- the 128-wide Hadamard rotation (the checkpoint's rotate_activation,
+// the G5's) — the butterfly's the CPU's pin's (the device's kernel's
+// csa2_hadamard_rotate_bf16's the GPU's; the host's dsv4_hadamard128's the
+// shared's host's + device's the butterfly's the driven's, no CUDA
+// initialization) -------------------------------------------------------
+DGPP_TEST(dsv4_indexer_hadamard_rotate) {
+  // The independent O(n^2) DOUBLE matrix reference (the Sylvester's H_128'
+  // the H_1's [1]'s the H_2n's the [H_n H_n; H_n -H_n]'s recursion's —
+  // a DIFFERENT construction's from the butterfly's the cross-check's).
+  std::vector<double> h(1, 1.0);
+  for (int n = 1; n < 128; n <<= 1) {
+    std::vector<double> h2(static_cast<size_t>(2 * n) * (2 * n));
+    for (int i = 0; i < 2 * n; ++i)
+      for (int j = 0; j < 2 * n; ++j) {
+        const double v = h[static_cast<size_t>(i % n) * n + (j % n)];
+        h2[static_cast<size_t>(i) * (2 * n) + j] = ((i / n) == 1 && (j / n) == 1) ? -v : v;
+      }
+    h.swap(h2);
+  }
+  if (h.size() != 128 * 128) throw std::runtime_error("the Sylvester H_128's matrix is mis-sized");
+  // A deterministic fp32 head (an O(1)'s magnitude's the LCG's).
+  std::vector<float> x(128);
+  std::uint32_t s = 0x0BAD;
+  auto next = [&]() {
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    return s;
+  };
+  for (int i = 0; i < 128; ++i) x[static_cast<size_t>(i)] = static_cast<float>(next() % 4096) / 1024.0f - 2.0f;
+  // The production's fp32 butterfly's (the host's form's the device's
+  // kernel's the smem's the SAME stage order's the same per-pair's
+  // arithmetic's the + the kDsv4Hadamard128Scale's the SAME point's).
+  std::vector<float> y(128);
+  dgpp::dsv4_hadamard128(x.data(), y.data());
+  // The O(n^2) double matrix's the y_d's H @ x * 128^-0.5's (the
+  // reference's hadamard_transform's the scale's the x.size(-1) ** -0.5's
+  // the orthonormal's).
+  const double scale_d = std::pow(128.0, -0.5);
+  double max_abs = 0.0;
+  for (int i = 0; i < 128; ++i) {
+    double acc = 0.0;
+    for (int j = 0; j < 128; ++j) acc += h[static_cast<size_t>(i) * 128 + j] * static_cast<double>(x[static_cast<size_t>(j)]);
+    const double want = acc * scale_d;
+    const double got = y[static_cast<size_t>(i)];
+    max_abs = std::max(max_abs, std::fabs(want));
+    // The fp32 butterfly's the double's within the fp32 budget's (the
+    // 127's additions' the 2^-24's the quantum's the documented's
+    // class's — the 1e-4's relative's the loose's the order-of-stage's
+    // corruption's the would's the O(1)'s the caught's).
+    if (std::fabs(got - want) > max_abs * 1e-4 + 1e-6)
+      throw std::runtime_error("hadamard: the fp32 butterfly diverged from the double matrix at i=" +
+                               std::to_string(i) + " (want " + std::to_string(want) + ", got " + std::to_string(got) +
+                               ")");
+  }
+  // The rotation's property's (the orthonormal's the H's the norm's
+  // preserving's — the reference's "spread information across dims"'s the
+  // norm's invariant's): the ||y||'s the ||x||'s (the independent's
+  // norm's the check's the element-wise's the different's path's).
+  double nx = 0.0, ny = 0.0;
+  for (int i = 0; i < 128; ++i) {
+    nx += static_cast<double>(x[static_cast<size_t>(i)]) * static_cast<double>(x[static_cast<size_t>(i)]);
+    ny += static_cast<double>(y[static_cast<size_t>(i)]) * static_cast<double>(y[static_cast<size_t>(i)]);
+  }
+  if (std::fabs(std::sqrt(ny) - std::sqrt(nx)) > std::sqrt(nx) * 1e-4)
+    throw std::runtime_error("hadamard: the rotation is not norm-preserving (||x|| " + std::to_string(std::sqrt(nx)) +
+                             ", ||y|| " + std::to_string(std::sqrt(ny)) + ")");
+  // The EXACT matrix's pin's (the Sylvester's characters' the
+  // H[i][j] = (-1)^popcount(i & j)'s — an INDEPENDENT closed form's from
+  // the recursion's + the butterfly's): the unit input's e_j's the
+  // rotated's the H's column j's the sign pattern's the / 128^-0.5's.
+  for (const int j : {0, 1, 2, 3, 64, 127}) {
+    std::vector<float> e(128, 0.0f);
+    e[static_cast<size_t>(j)] = 1.0f;
+    std::vector<float> ye(128);
+    dgpp::dsv4_hadamard128(e.data(), ye.data());
+    for (int i = 0; i < 128; i += 17) {  // a stride sample (the pattern's periodic's the 17's stride's the covers's)
+      const int pc = __builtin_popcount(static_cast<unsigned>(i & j));
+      const double want = (pc & 1) ? -scale_d : scale_d;
+      const double got = ye[static_cast<size_t>(i)];
+      // The unit input's the butterfly's the EXACT's in fp32's (the
+      // integer's sums' the 128's bound's the exact's), the ONE's fp32's
+      // rounding's the scale's multiply's — the double's within's the
+      // fp32's ulp's.
+      if (std::fabs(got - want) > std::fabs(want) * 1e-6 + 1e-9)
+        throw std::runtime_error("hadamard: the e_" + std::to_string(j) + "'s column sign pattern is wrong at i=" +
+                                 std::to_string(i) + " (want " + std::to_string(want) + ", got " + std::to_string(got) + ")");
+    }
+  }
+  // The bf16 kernel's contract's (the device's kernel's ONE's bf16
+  // rounding's the out's the float_to_bf16_bits's the v's the scale's
+  // product's — the host's the same's the form's the pin's): the bf16's
+  // word's the y's within's ONE's the bf16's ulp's the double's
+  // reference's (the fp32's interior's the budget's).
+  for (int i = 0; i < 128; i += 37) {
+    double acc = 0.0;
+    for (int j = 0; j < 128; ++j) acc += h[static_cast<size_t>(i) * 128 + j] * static_cast<double>(x[static_cast<size_t>(j)]);
+    const double want_d = acc * scale_d;
+    const uint16_t got_word = float_to_bf16_bits(y[static_cast<size_t>(i)]);
+    const uint16_t want_word = float_to_bf16_bits(static_cast<float>(want_d));
+    const double got = bf16_bits_to_float(got_word);
+    const double want = bf16_bits_to_float(want_word);
+    const double mag = std::max({std::fabs(got), std::fabs(want), 1e-30});
+    if (std::fabs(got - want) > mag / 128.0)
+      throw std::runtime_error("hadamard: the bf16-rounded output diverged from the double reference at i=" +
+                               std::to_string(i) + " (want " + std::to_string(want) + ", got " + std::to_string(got) + ")");
+  }
+}
+
 // ---- the decode select's tie-break (the dsv4_csa2_sortable_key's + the
 // dsv4_csa2_select_insert's — the real's layer code's, the CPU's
 // qualifiable's, no CUDA initialization) ------------------------------

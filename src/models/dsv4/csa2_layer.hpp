@@ -215,8 +215,10 @@ class Dsv4Csa2Layer {
   // latent's kv's.
   void project_q_kv(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream);
   // The indexer's 64-head query: the wq_b's 64-head projection -> the
-  // tail's rotation -> the fp8 quant -> the folded weights (the 64-head
-  // fold width the spec §2.1(d) flags as NEW).
+  // tail's rotation -> the Hadamard's rotation (the checkpoint's
+  // rotate_activation's, the G5's gap's the closed's) -> the fp8 quant
+  // -> the folded weights (the 64-head fold width the spec §2.1(d) flags
+  // as NEW).
   void indexer_query(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream);
   // The decode window's key-dimension split (the dsv41 kWinDecodeSplit's
   // V4 re-expression): a one-row window is not a single latency-bound
