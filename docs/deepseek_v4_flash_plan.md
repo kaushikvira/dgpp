@@ -187,3 +187,37 @@ on the way, all committed on `dsv4-flash`:
 The **qwen3.8-flash-next production lane is up** (`:8888` + the TLS front
 door) and stays up — one stack at a time, so the dsv4 re-test needs the GPU
 window free again.
+
+## The seam reconciliation (opened 2026-09-19 after the two coder worktrees merged)
+
+The csa2 partial-fill work (c965c4f) and the dspark/compressor work (d3e30d6)
+landed from two parallel worktrees, split along the file boundary. The seam
+between them is now the gate, and it is itemized here so it cannot be lost:
+
+1. **`tails_w_` must be 1024, not 512** (`src/models/dsv4/model.hpp:275`, and
+   the `[2, tails_w_]` state in `model.cpp`). `W = coff x kCsa2Latent = 2 x 512`
+   for C4A. Proof: the repo's own `tests/unit/dsv4_csa2_oracle_test.cpp:191`
+   (`state_row() = 2 * coff() * 512`, its "W = 1024" comment) and the
+   checkpoint's `inference/model.py` (`kv = wkv(x)` with `wkv [1024, 4096]`;
+   the overlap/normal plane split at `dim=512`). The spec doc's geometry
+   section records the full chain. A 512 tail silently halves the compressor
+   state.
+2. **The csa2 layer's `enqueue_decode` still no-ops `main_cache`/`index_cache`**
+   (`src/models/dsv4/csa2_layer.cu`), and the model's call site passes
+   `nullptr, nullptr, nullptr` (`model.cpp:839`) with no cache allocated: the
+   model has no main/index cache members at all. The window source runs; the
+   main source and the 64-head selection do not.
+3. **The compressor's tail update is implemented but never invoked**
+   (`src/models/dsv4/compress.cu`'s `dsv4_compress_tail_update`): the csa2
+   ratio-4 branch is still the stub, and `enqueue_decode` lacks the
+   `tails`/`W`/`ratio`/`eps` parameters it needs.
+4. **The union-attn call site passes stand-in scratch** (`model.cpp`'s draft
+   path): the csa2 projection's 512-dim q-latent / block-kv is private to the
+   csa2 layer and is not yet handed to `dsv4_dspark_union_attn`.
+5. **The main/index cache publish** (the compressor's output -> the planar
+   caches, the dsv41 `publish_entries` equivalent) is the other half of (2).
+
+Order: (1)+(3)+(5)+(2) are one coherent "make the compressor and the caches
+real" change in `csa2_layer.{cu,hpp}` + `model.{cpp,hpp}`; (4) follows.
+`docs/dsv4_attention_spec.md` is the numeric oracle for all of them, and the
+GPU parity gate (`scripts/dsv4_gates.sh`) is the final arbiter.
