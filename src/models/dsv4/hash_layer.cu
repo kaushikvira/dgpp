@@ -41,13 +41,15 @@ void Dsv4HashConfig::validate(const Dsv4HashConfig& c) {
 
 struct Dsv4HashLayer::Layout {
   size_t total = 0;
-  size_t topk_ids, topk_w, gate, up, down;
+  size_t topk_ids, topk_w, slot_act, slot_down, slot_order, views;
 };
 
 Dsv4HashLayer::Layout Dsv4HashLayer::layout(const Dsv4HashConfig& cfg, int max_tokens) {
   Dsv4HashConfig::validate(cfg);
   if (max_tokens <= 0) throw std::invalid_argument("dsv4 hash layer: max_tokens must be positive");
   const size_t T = static_cast<size_t>(max_tokens);
+  const size_t K = static_cast<size_t>(cfg.top_k);
+  const size_t slots = T * (K + 1);  // the routed's slots' + the shared's row's, per token
   Layout L;
   size_t off = 0;
   const auto alloc = [&](size_t bytes) {
@@ -56,11 +58,12 @@ Dsv4HashLayer::Layout Dsv4HashLayer::layout(const Dsv4HashConfig& cfg, int max_t
     off += std::max<size_t>(bytes, 16);
     return at;
   };
-  L.topk_ids = alloc(T * cfg.top_k * 4);
-  L.topk_w = alloc(T * cfg.top_k * 4);
-  L.gate = alloc(T * cfg.local_inter() * 2);
-  L.up = alloc(T * cfg.local_inter() * 2);
-  L.down = alloc(T * cfg.hidden * 2);
+  L.topk_ids = alloc(T * K * 4);
+  L.topk_w = alloc(T * K * 4);
+  L.slot_act = alloc(slots * static_cast<size_t>(cfg.local_inter()) * 2);  // bf16
+  L.slot_down = alloc(slots * static_cast<size_t>(cfg.hidden) * 4);  // fp32
+  L.slot_order = alloc(slots * 4);  // int32
+  L.views = alloc((static_cast<size_t>(cfg.n_experts) + 1) * 3 * sizeof(MoeExpertView));
   L.total = align256(off);
   return L;
 }
@@ -69,17 +72,37 @@ Dsv4HashLayer::Dsv4HashLayer(IGemm& gemm, const Dsv4HashConfig& cfg, int max_tok
                              size_t scratch_capacity, void* gemm_workspace, size_t gemm_ws_bytes)
     : gemm_(gemm), cfg_(cfg), max_tokens_(max_tokens), gemm_ws_(gemm_workspace), gemm_ws_bytes_(gemm_ws_bytes) {
   const Layout L = layout(cfg, max_tokens);
-  if (scratch == nullptr || scratch_capacity < L.total) throw std::invalid_argument("dsv4 hash layer: scratch too small");
+  if (scratch == nullptr || scratch_capacity < L.total)
+    throw std::invalid_argument("dsv4 hash layer: scratch too small (" + std::to_string(scratch_capacity) +
+                                " bytes available, " + std::to_string(L.total) + " required)");
   scratch_ = static_cast<uint8_t*>(scratch);
   const auto at = [&](size_t off) { return scratch_ + off; };
   topk_ids_ = reinterpret_cast<int32_t*>(at(L.topk_ids));
   topk_w_ = reinterpret_cast<float*>(at(L.topk_w));
-  gate_ = reinterpret_cast<uint16_t*>(at(L.gate));
-  up_ = reinterpret_cast<uint16_t*>(at(L.up));
-  down_ = reinterpret_cast<uint16_t*>(at(L.down));
+  slot_act_ = reinterpret_cast<uint16_t*>(at(L.slot_act));
+  slot_down_ = reinterpret_cast<float*>(at(L.slot_down));
+  slot_order_ = reinterpret_cast<int32_t*>(at(L.slot_order));
+  d_views_ = reinterpret_cast<MoeExpertView*>(at(L.views));
+  // The view table's upload ring (the GLM layer's h_view_ring_'s
+  // mirror's): the eager's upload's H2D source's (the pinned's, the
+  // async copy's in-flight's the host's not overwriting's) + the
+  // per-slot's event's (the previous's upload's the executed's before
+  // the fill's the overwrite's).
+  const size_t entries = static_cast<size_t>(cfg_.n_experts) * 3 + 3;
+  DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&h_view_ring_),
+                             static_cast<size_t>(kViewRing) * entries * sizeof(MoeExpertView),
+                             cudaHostAllocDefault));
+  for (int i = 0; i < kViewRing; ++i)
+    DGPP_CUDA_OK(cudaEventCreateWithFlags(&view_ring_event_[i], cudaEventDisableTiming));
 }
 
-void Dsv4HashLayer::rebind(const Dsv4HashWeights& w, int layer) {
+Dsv4HashLayer::~Dsv4HashLayer() {
+  if (h_view_ring_) cudaFreeHost(h_view_ring_);
+  for (int i = 0; i < kViewRing; ++i)
+    if (view_ring_event_[i]) cudaEventDestroy(view_ring_event_[i]);
+}
+
+void Dsv4HashLayer::rebind(const Dsv4HashWeights& w, int layer, cudaStream_t stream) {
   if (!w.router_gate) throw std::invalid_argument("dsv4 hash layer: a null router gate");
   // The hash layers' (the layer's < num_hash_layers's) need the tid2eid
   // table's; the non-hash's the bias's (the noaux_tc's selection's).
@@ -90,8 +113,52 @@ void Dsv4HashLayer::rebind(const Dsv4HashWeights& w, int layer) {
     throw std::invalid_argument("dsv4 hash layer: a non-hash layer needs the router bias (the noaux_tc's)");
   if (w.expert_payload == nullptr || w.expert_scales == nullptr)
     throw std::invalid_argument("dsv4 hash layer: the MXFP4 expert's payload + scales are required");
+  // The slot path's views (the MXFP4 table's + the fp8 shared's
+  // triple's + the slice's dims's): the expert's the layer's FFN's the
+  // required's.
+  if (w.experts == nullptr || w.shared == nullptr || w.n_experts <= 0 || w.n_experts != cfg_.n_experts)
+    throw std::invalid_argument("dsv4 hash layer: the MXFP4 expert table + the shared triple are required");
+  if (w.local_inter <= 0 || w.local_shared_inter <= 0)
+    throw std::invalid_argument("dsv4 hash layer: the expert slice dims must be positive");
   w_ = w;
   layer_ = layer;
+  // The device's expert view table (the GLM layer's d_expert_views_'s
+  // upload's re-expression's): the (E+1)*3's MoeExpertView's — the
+  // routed's MXFP4's triples' (the w1's w3's w2's per expert's, the
+  // e2m1's pairs' + the e8m0/32's scales' the fp4_group's 32's) +
+  // the fp8 shared's triple's (the table's tail's, the inert's — the
+  // shared's runs the fp8 core's the sh_*'s launch arguments's, the
+  // shared_view_base's -1's). The upload's the pinned's ring's H2D's
+  // (the stream's ordered's): the pointer set's unchanged's (the
+  // resident's rebind's, the capture's walk's) the hit's — the no
+  // copy's on the captured's stream's.
+  const bool hit = (w.experts == views_experts_ && w.shared == views_shared_ && w.n_experts == views_n_experts_ &&
+                    layer == views_layer_);
+  if (!hit) {
+    const size_t entries = static_cast<size_t>(w.n_experts) * 3 + 3;
+    const int slot = view_ring_next_;
+    view_ring_next_ = (view_ring_next_ + 1) % kViewRing;
+    // The entry's previous upload's must have executed's before the
+    // fill's overwrites's its source's; the host's only ever made to
+    // wait's here's when it's kViewRing uploads ahead's of the stream's.
+    if (view_ring_armed_[slot])
+      DGPP_CUDA_OK(cudaEventSynchronize(view_ring_event_[slot]));
+    MoeExpertView* h = h_view_ring_ + static_cast<size_t>(slot) * entries;
+    for (int e = 0; e < w.n_experts; ++e) {
+      h[static_cast<size_t>(e) * 3 + 0] = MoeExpertView::of(w.experts[static_cast<size_t>(e) * 3 + 0]);  // w1 gate
+      h[static_cast<size_t>(e) * 3 + 1] = MoeExpertView::of(w.experts[static_cast<size_t>(e) * 3 + 1]);  // w3 up
+      h[static_cast<size_t>(e) * 3 + 2] = MoeExpertView::of(w.experts[static_cast<size_t>(e) * 3 + 2]);  // w2 down
+    }
+    for (int m = 0; m < 3; ++m)
+      h[static_cast<size_t>(w.n_experts) * 3 + static_cast<size_t>(m)] = MoeExpertView::of(w.shared[m]);
+    DGPP_CUDA_OK(cudaMemcpyAsync(d_views_, h, entries * sizeof(MoeExpertView), cudaMemcpyHostToDevice, stream));
+    DGPP_CUDA_OK(cudaEventRecord(view_ring_event_[slot], stream));
+    view_ring_armed_[slot] = true;
+    views_experts_ = w.experts;
+    views_shared_ = w.shared;
+    views_n_experts_ = w.n_experts;
+    views_layer_ = layer;
+  }
 }
 
 bool Dsv4HashLayer::prepare(int tokens) {

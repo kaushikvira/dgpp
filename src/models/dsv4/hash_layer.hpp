@@ -24,6 +24,7 @@
 #include <cuda_runtime.h>
 
 #include "kernels/gemm.hpp"
+#include "models/glm/moe.hpp"
 #include "models/quant_matrix.hpp"
 
 namespace dgpp {
@@ -81,15 +82,22 @@ struct Dsv4HashWeights {
 // The hash-routing MoE layer (the dsv4-native ops/moe's V4 re-expression,
 // the world-2 deployment). The router's the fused top-k's (the
 // learned gate's the non-hash layers' the tid2eid table's the hash
-// layers' — the v4-owned dsv4_moe_router kernel's, the GPU-gate
-// pending's); the expert's the MXFP4's (the glm fp4 expert kernels'
-// composition's).
+// layers' — the v4-owned dsv4_moe_router kernel's); the expert's the
+// MXFP4's (the glm fp4 slot kernels' composition's — the slot
+// (decode's) form's, the prefill's chunks' ride it too's: the fp4 slot
+// gate/up/SwiGLU's + the fp4 slot down's + the slot accum's, the fp8
+// shared expert's the sh_*'s arguments's, the view table's the
+// rebind's upload's the device's).
 class Dsv4HashLayer {
  public:
   Dsv4HashLayer(IGemm& gemm, const Dsv4HashConfig& cfg, int max_tokens, void* scratch, size_t scratch_capacity,
                 void* gemm_workspace, size_t gemm_ws_bytes);
+  ~Dsv4HashLayer();
 
-  void rebind(const Dsv4HashWeights& w, int layer);
+  // `stream`'s the view table's upload's stream (the stream-ordered's
+  // H2D's, the no-copy's on the captured's stream's when the pointer
+  // set's unchanged's — the resident's rebind's the hit's).
+  void rebind(const Dsv4HashWeights& w, int layer, cudaStream_t stream);
   bool prepare(int tokens);
 
   // The fused top-k router (the v4-owned dsv4_moe_router's): the
@@ -100,11 +108,14 @@ class Dsv4HashLayer {
   // bias's). `out_ids` [tokens, top_k], `out_w` [tokens, top_k].
   void route(const void* logits, const int64_t* tokens, int tokens_n, int32_t* out_ids, float* out_w,
              cudaStream_t stream);
-  // The MXFP4 expert (the glm fp4 expert kernels' composition's): the
+  // The MXFP4 expert (the glm fp4 slot kernels' composition's): the
   // e2m1 x e8m0/32 decode's, the clamped SwiGLU's, the router weight's
-  // the down epilogue's fold's. `x` [tokens, hidden] bf16, `out`
-  // [tokens, hidden] bf16 (the routed sum's, the all-reduce's the
-  // caller's).
+  // the down epilogue's fold's, the fp8 shared expert's the chain's
+  // (the accum's the shared row's the weight's 1's). Kernels only's
+  // (the view table's the rebind's uploaded's, the no host-copy's on
+  // the captured's stream's). `x` [tokens, hidden] bf16, `out`
+  // [tokens, hidden] bf16 (the routed + shared sum's, the all-reduce's
+  // the caller's).
   void expert(const void* x, int tokens, const int32_t* topk_ids, const float* topk_w, void* out,
               cudaStream_t stream);
 
@@ -115,6 +126,12 @@ class Dsv4HashLayer {
  private:
   struct Layout;
   static Layout layout(const Dsv4HashConfig& cfg, int max_tokens);
+  // The view table's upload ring (the GLM layer's h_view_ring_'s
+  // mirror's): the eager's upload's H2D source's (the pinned's) + the
+  // per-slot's event's (the previous's upload's the executed's before
+  // the fill's the overwrite's). The host's only waits's when it's
+  // kViewRing uploads ahead's of the stream's.
+  static constexpr int kViewRing = 4;
   IGemm& gemm_;
   Dsv4HashConfig cfg_;
   int max_tokens_;
@@ -125,9 +142,24 @@ class Dsv4HashLayer {
   uint8_t* scratch_ = nullptr;
   int32_t* topk_ids_ = nullptr;
   float* topk_w_ = nullptr;
-  uint16_t* gate_ = nullptr;
-  uint16_t* up_ = nullptr;
-  uint16_t* down_ = nullptr;
+  // The slot path's planes (the tokens*(top_k + 1)'s slots' — the
+  // routed's + the shared expert's row's, per token's; the prefill's
+  // chunks' ride the decode's bound's, so the max_tokens's sizing's).
+  uint16_t* slot_act_ = nullptr;   // bf16 [slots, local_inter]
+  float* slot_down_ = nullptr;  // fp32 [slots, hidden] (the unrounded's)
+  int32_t* slot_order_ = nullptr;  // int32 [slots] (the execution's order's)
+  MoeExpertView* d_views_ = nullptr;  // the device table's (E+1)*3 (scratch's)
+  // The upload ring's + the last-uploaded table's key (the capture's
+  // walk's rebind's the same's resident's pointers's — the hit's, the
+  // no-copy's on the captured's stream's).
+  MoeExpertView* h_view_ring_ = nullptr;  // [kViewRing][(E+1)*3] pinned
+  cudaEvent_t view_ring_event_[kViewRing] = {};
+  bool view_ring_armed_[kViewRing] = {};
+  int view_ring_next_ = 0;
+  const GlmFp4Matrix* views_experts_ = nullptr;
+  const GlmQuantMatrix* views_shared_ = nullptr;
+  int views_n_experts_ = 0;
+  int views_layer_ = -1;
 };
 
 // The v4-owned fused top-k router kernel (the dsv4-native
