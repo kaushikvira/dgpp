@@ -310,6 +310,7 @@ class Dsv4Model : public SessionModel<Dsv4Model> {
   // ride the pending's verify's call site's.
   std::vector<int> tail_ratio_;  // per tail ordinal: the ratio (4 C4A / 128 C128A)
   Dsv4LayerDump dump_;  // the debug per-layer dump (DGPP_DSV4_DUMP_LAYERS; the doc's layer_dump.hpp's)
+  bool dump_this_pass_ = false;  // the current pass is a dumped prefill (the sub-step dumps' gate)
   std::vector<size_t> tail_off_;  // per tail ordinal: the float's offset's into d_tails_'s (the max_requests's the per-ordinal's)
   std::vector<size_t> spec_off_;  // per tail ordinal: the float's offset's into spec_tails_'s (the max_decode_rows_'s the per-ordinal's)
   float* d_tails_ = nullptr;

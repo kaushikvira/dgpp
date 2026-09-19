@@ -131,12 +131,14 @@ class Dsv4HashLayer {
  private:
   struct Layout;
   static Layout layout(const Dsv4HashConfig& cfg, int max_tokens);
-  // The view table's upload ring (the GLM layer's h_view_ring_'s
-  // mirror's): the eager's upload's H2D source's (the pinned's) + the
-  // per-slot's event's (the previous's upload's the executed's before
-  // the fill's the overwrite's). The host's only waits's when it's
-  // kViewRing uploads ahead's of the stream's.
-  static constexpr int kViewRing = 4;
+  // The view table's per-layer slots (2026-09-20): one device table per
+  // layer, prepared OUTSIDE the capture. The eager path's per-call upload
+  // (the GLM layer's ring) is what broke the decode graph here — an upload
+  // during a capture enqueues a memcpy node and its host sync invalidates
+  // the capture (cudaErrorStreamCaptureInvalidated). With a slot per layer
+  // every rebind after the first is a pure pointer select: nothing is
+  // enqueued, so a capture is safe by construction.
+  static constexpr int kViewSlots = 64;
   IGemm& gemm_;
   Dsv4HashConfig cfg_;
   int max_tokens_;
@@ -154,17 +156,15 @@ class Dsv4HashLayer {
   float* slot_down_ = nullptr;  // fp32 [slots, hidden] (the unrounded's)
   int32_t* slot_order_ = nullptr;  // int32 [slots] (the execution's order's)
   MoeExpertView* d_views_ = nullptr;  // the device table's (E+1)*3 (scratch's)
-  // The upload ring's + the last-uploaded table's key (the capture's
+  // The view table's + the last-uploaded table's key (the capture's
   // walk's rebind's the same's resident's pointers's — the hit's, the
   // no-copy's on the captured's stream's).
-  MoeExpertView* h_view_ring_ = nullptr;  // [kViewRing][(E+1)*3] pinned
-  cudaEvent_t view_ring_event_[kViewRing] = {};
-  bool view_ring_armed_[kViewRing] = {};
-  int view_ring_next_ = 0;
-  const GlmFp4Matrix* views_experts_ = nullptr;
-  const GlmQuantMatrix* views_shared_ = nullptr;
-  int views_n_experts_ = 0;
-  int views_layer_ = -1;
+  MoeExpertView* d_view_table_ = nullptr;  // [kViewSlots][(E+1)*3] device (scratch)
+  MoeExpertView* h_view_stage_ = nullptr;  // [(E+1)*3] pinned (one upload at a time)
+  const GlmFp4Matrix* prepared_experts_[kViewSlots] = {};
+  const GlmQuantMatrix* prepared_shared_[kViewSlots] = {};
+  int prepared_n_experts_[kViewSlots] = {};
+  bool prepared_[kViewSlots] = {};
 };
 
 // The v4-owned fused top-k router kernel (the dsv4-native

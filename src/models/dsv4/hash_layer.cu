@@ -63,7 +63,7 @@ Dsv4HashLayer::Layout Dsv4HashLayer::layout(const Dsv4HashConfig& cfg, int max_t
   L.slot_act = alloc(slots * static_cast<size_t>(cfg.local_inter()) * 2);  // bf16
   L.slot_down = alloc(slots * static_cast<size_t>(cfg.hidden) * 4);  // fp32
   L.slot_order = alloc(slots * 4);  // int32
-  L.views = alloc((static_cast<size_t>(cfg.n_experts) + 1) * 3 * sizeof(MoeExpertView));
+  L.views = alloc(static_cast<size_t>(kViewSlots) * (static_cast<size_t>(cfg.n_experts) + 1) * 3 * sizeof(MoeExpertView));
   L.total = align256(off);
   return L;
 }
@@ -84,24 +84,18 @@ Dsv4HashLayer::Dsv4HashLayer(IGemm& gemm, const Dsv4HashConfig& cfg, int max_tok
   slot_act_ = reinterpret_cast<uint16_t*>(at(L.slot_act));
   slot_down_ = reinterpret_cast<float*>(at(L.slot_down));
   slot_order_ = reinterpret_cast<int32_t*>(at(L.slot_order));
-  d_views_ = reinterpret_cast<MoeExpertView*>(at(L.views));
-  // The view table's upload ring (the GLM layer's h_view_ring_'s
-  // mirror's): the eager's upload's H2D source's (the pinned's, the
-  // async copy's in-flight's the host's not overwriting's) + the
-  // per-slot's event's (the previous's upload's the executed's before
-  // the fill's the overwrite's).
+  d_view_table_ = reinterpret_cast<MoeExpertView*>(at(L.views));
+  d_views_ = d_view_table_;
+  // One pinned staging buffer: an upload happens only at prepare time
+  // (outside any capture) and is followed by a synchronize, so a single
+  // buffer is never in flight twice.
   const size_t entries = static_cast<size_t>(cfg_.n_experts) * 3 + 3;
-  DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&h_view_ring_),
-                             static_cast<size_t>(kViewRing) * entries * sizeof(MoeExpertView),
+  DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&h_view_stage_), entries * sizeof(MoeExpertView),
                              cudaHostAllocDefault));
-  for (int i = 0; i < kViewRing; ++i)
-    DGPP_CUDA_OK(cudaEventCreateWithFlags(&view_ring_event_[i], cudaEventDisableTiming));
 }
 
 Dsv4HashLayer::~Dsv4HashLayer() {
-  if (h_view_ring_) cudaFreeHost(h_view_ring_);
-  for (int i = 0; i < kViewRing; ++i)
-    if (view_ring_event_[i]) cudaEventDestroy(view_ring_event_[i]);
+  if (h_view_stage_) cudaFreeHost(h_view_stage_);
 }
 
 void Dsv4HashLayer::rebind(const Dsv4HashWeights& w, int layer, cudaStream_t stream) {
@@ -130,22 +124,24 @@ void Dsv4HashLayer::rebind(const Dsv4HashWeights& w, int layer, cudaStream_t str
   // e2m1's pairs' + the e8m0/32's scales' the fp4_group's 32's) +
   // the fp8 shared's triple's (the table's tail's, the inert's — the
   // shared's runs the fp8 core's the sh_*'s launch arguments's, the
-  // shared_view_base's -1's). The upload's the pinned's ring's H2D's
-  // (the stream's ordered's): the pointer set's unchanged's (the
-  // resident's rebind's, the capture's walk's) the hit's — the no
-  // copy's on the captured's stream's.
-  const bool hit = (w.experts == views_experts_ && w.shared == views_shared_ && w.n_experts == views_n_experts_ &&
-                    layer == views_layer_);
+  // shared_view_base's -1's). One slot per layer, filled the first time
+  // the layer is bound and never re-enqueued: a rebind is a pure pointer
+  // select, so it is safe inside a capture (2026-09-20 — the per-call
+  // upload's memcpy node + host sync invalidated the decode graph).
+  const size_t entries = static_cast<size_t>(w.n_experts) * 3 + 3;
+  if (layer < 0 || layer >= kViewSlots)
+    throw std::invalid_argument("dsv4 hash layer: layer " + std::to_string(layer) +
+                                " is outside the view table's " + std::to_string(kViewSlots) + " slots");
+  const size_t slot = static_cast<size_t>(layer);
+  const bool hit = prepared_[slot] && prepared_experts_[slot] == w.experts &&
+                   prepared_shared_[slot] == w.shared && prepared_n_experts_[slot] == w.n_experts;
   if (!hit) {
-    const size_t entries = static_cast<size_t>(w.n_experts) * 3 + 3;
-    const int slot = view_ring_next_;
-    view_ring_next_ = (view_ring_next_ + 1) % kViewRing;
-    // The entry's previous upload's must have executed's before the
-    // fill's overwrites's its source's; the host's only ever made to
-    // wait's here's when it's kViewRing uploads ahead's of the stream's.
-    if (view_ring_armed_[slot])
-      DGPP_CUDA_OK(cudaEventSynchronize(view_ring_event_[slot]));
-    MoeExpertView* h = h_view_ring_ + static_cast<size_t>(slot) * entries;
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    DGPP_CUDA_OK(cudaStreamIsCapturing(stream, &status));
+    if (status != cudaStreamCaptureStatusNone)
+      throw std::logic_error("dsv4 hash layer: the expert view table for layer " + std::to_string(layer) +
+                             " was not prepared before the capture (run the model's graph prepare first)");
+    MoeExpertView* h = h_view_stage_;
     for (int e = 0; e < w.n_experts; ++e) {
       h[static_cast<size_t>(e) * 3 + 0] = MoeExpertView::of(w.experts[static_cast<size_t>(e) * 3 + 0]);  // w1 gate
       h[static_cast<size_t>(e) * 3 + 1] = MoeExpertView::of(w.experts[static_cast<size_t>(e) * 3 + 1]);  // w3 up
@@ -153,14 +149,15 @@ void Dsv4HashLayer::rebind(const Dsv4HashWeights& w, int layer, cudaStream_t str
     }
     for (int m = 0; m < 3; ++m)
       h[static_cast<size_t>(w.n_experts) * 3 + static_cast<size_t>(m)] = MoeExpertView::of(w.shared[m]);
-    DGPP_CUDA_OK(cudaMemcpyAsync(d_views_, h, entries * sizeof(MoeExpertView), cudaMemcpyHostToDevice, stream));
-    DGPP_CUDA_OK(cudaEventRecord(view_ring_event_[slot], stream));
-    view_ring_armed_[slot] = true;
-    views_experts_ = w.experts;
-    views_shared_ = w.shared;
-    views_n_experts_ = w.n_experts;
-    views_layer_ = layer;
+    DGPP_CUDA_OK(cudaMemcpyAsync(d_view_table_ + slot * entries, h, entries * sizeof(MoeExpertView),
+                                 cudaMemcpyHostToDevice, stream));
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));  // prepare time only, never inside a capture
+    prepared_[slot] = true;
+    prepared_experts_[slot] = w.experts;
+    prepared_shared_[slot] = w.shared;
+    prepared_n_experts_[slot] = w.n_experts;
   }
+  d_views_ = d_view_table_ + slot * entries;
 }
 
 bool Dsv4HashLayer::prepare(int tokens) {

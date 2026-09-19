@@ -27,12 +27,18 @@ SITE_KEYS = (
     # session-core families, kernels/gemm.hpp): every rank the same, or the
     # ranks' walks differ.
     "DGPP_BUS_TIMELINE", "DGPP_DSV41_DENSE_GEMV", "DGPP_DENSE_GEMV_ROWS", "DGPP_DSV41_EAGER_FOLD",
+    # The dsv4 per-layer hidden-state dump (src/models/dsv4/layer_dump.hpp): the
+    # degenerate-output localizer, a debug knob like the ones above.
+    "DGPP_DSV4_DUMP_LAYERS",
 )
 NODE_KEYS = ("DGPP_ROCE_DEVICES", "DGPP_ROCE_GID_INDICES", "HF_HUB_CACHE", "DGPP_RESIDENT_CACHE_DIR",
     # The engine's L2 weight-prefetch knobs (src/kernels/l2_prefetch.hpp): an A/B runs
     # with the same setting on every rank.
     "DGPP_L2_PREFETCH", "DGPP_L2_PREFETCH_MB", "DGPP_L2_PREFETCH_BOUNDARY", "DGPP_L2_PREFETCH_LAYER",
     "DGPP_BUS_TIMELINE", "DGPP_DSV41_DENSE_GEMV", "DGPP_DENSE_GEMV_ROWS", "DGPP_DSV41_EAGER_FOLD",
+    # The dsv4 per-layer hidden-state dump (src/models/dsv4/layer_dump.hpp): the
+    # degenerate-output localizer, a debug knob like the ones above.
+    "DGPP_DSV4_DUMP_LAYERS",
 )
 DEFAULTS = {
     "DGPP_HTTP_PORT": "18080", "DGPP_FABRIC_PORT": "29970",

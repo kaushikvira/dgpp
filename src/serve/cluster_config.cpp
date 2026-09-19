@@ -133,7 +133,10 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
             "DGPP_ROCE_DEVICES", "DGPP_ROCE_GID_INDICES", "HF_HUB_CACHE", "DGPP_RESIDENT_CACHE_DIR",
             "DGPP_L2_PREFETCH", "DGPP_L2_PREFETCH_MB", "DGPP_L2_PREFETCH_BOUNDARY", "DGPP_L2_PREFETCH_LAYER",
             // The bus timeline switch and the dense-lowering A/B switches: every rank the same.
-            "DGPP_BUS_TIMELINE", "DGPP_DSV41_DENSE_GEMV", "DGPP_DENSE_GEMV_ROWS", "DGPP_DSV41_EAGER_FOLD"};
+            "DGPP_BUS_TIMELINE", "DGPP_DSV41_DENSE_GEMV", "DGPP_DENSE_GEMV_ROWS", "DGPP_DSV41_EAGER_FOLD",
+            // The dsv4 per-layer hidden-state dump (models/dsv4/layer_dump.hpp): the
+            // degenerate-output localizer, a debug knob like the ones above.
+            "DGPP_DSV4_DUMP_LAYERS"};
         for (const Member& setting : node.members()) {
           bool known = false;
           for (const char* key : kNodeKeys) known = known || setting.key == key;

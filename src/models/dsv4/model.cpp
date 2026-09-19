@@ -620,7 +620,7 @@ size_t Dsv4Model::snapshot_state_bytes() const {
 }
 
 void Dsv4Model::init_layer_dump() {
-  dump_ = Dsv4LayerDump::from_env(tp_rank(), world_, cfg_.num_hidden_layers, cfg_.hidden_size, lm_vocab_begin_,
+  dump_ = Dsv4LayerDump::from_env(tp_rank(), world_, cfg_.hidden_size, cfg_.num_hidden_layers, lm_vocab_begin_,
                                   lm_vocab_count_);
 }
 
@@ -1105,6 +1105,8 @@ void Dsv4Model::enqueue_layer(const Dsv4LayerResident& r, int layer, int T, cons
                static_cast<size_t>(H), gemm_ws_, gemm_ws_bytes_, stream_);
   moe_->route(gate_logits_, rows.tokens, T, topk_ids_, topk_w_, stream_);
   moe_->expert(x_, T, topk_ids_, topk_w_, ffn_out, stream_);
+  if (dump_this_pass_ && layer == 0)
+    dump_.write_named("moe_out_l0", ffn_out + static_cast<size_t>(T - 1) * H, H, stream_);
   fold(ffn_out, T, H, rows.capture);  // block boundary 2: the sliced experts
   stream_update(ffn_out, T);
 }
@@ -1147,6 +1149,7 @@ Dsv4Model::Outputs Dsv4Model::run_rows(const RowRun& run) {
   // capture's (the D2H's copies' must stay out of the graph's — the
   // serve app's the decode_graph's the refuse's) nor the decode's rows's.
   const bool dump_pass = dump_.active() && !rows.capture && !rows.decode && run.last_chunk;
+  dump_this_pass_ = dump_pass;
   if (dump_pass) dump_.begin_pass(run.ids, T, run.pos0);
   for (int layer = 0; layer < cfg_.num_hidden_layers; ++layer) {
     const Dsv4LayerResident& r = loader_.load_layer(layer);
@@ -1155,6 +1158,13 @@ Dsv4Model::Outputs Dsv4Model::run_rows(const RowRun& run) {
       launch_mhc_collapse_normed(cur_, pre_cur_, nullptr, cfg_.rms_norm_eps, collapsed_, nullptr, mhc_cfg_, T,
                                  stream_);
       dump_.write_layer(layer, collapsed_ + static_cast<size_t>(T - 1) * H, stream_);
+      // The raw 4-stream state of the same row too: the collapse above is a
+      // WEIGHTED+normed combination (the layer's own pre coefficients), so it
+      // is not comparable with the reference's plain stream mean — the raw
+      // state is (the reference writes the same thing as layer_NN_hc.f32).
+      // cur_'s layout is [T][hc_mult][H] (a row's streams contiguous).
+      dump_.write_layer_hc(layer, cur_ + static_cast<size_t>(T - 1) * static_cast<size_t>(mhc_cfg_.hc_mult) * H,
+                           mhc_cfg_.hc_mult, stream_);
     }
   }
   // The head: the weighted collapse with the last site's pre, the final

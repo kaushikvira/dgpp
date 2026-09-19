@@ -136,6 +136,54 @@ class Dsv4LayerDump {
     std::fclose(f);
   }
 
+  // A generic named f32 widening dump (the same bf16->f32 form as above):
+  // for the sub-step bisection (e.g. the MoE site's output vs the reference's).
+  void write_named(const char* name, const uint16_t* src_bf16, int n, cudaStream_t stream) {
+    if (!active_) return;
+    std::vector<uint16_t> row(static_cast<size_t>(n));
+    DGPP_CUDA_OK(cudaMemcpyAsync(row.data(), src_bf16, static_cast<size_t>(n) * 2, cudaMemcpyDeviceToHost, stream));
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    const std::string path = pass_dir_ + "/" + name + ".f32";
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (f == nullptr) { DGPP_LOG_WARN("dsv4 layer dump: cannot write {}", path); return; }
+    std::vector<float> out(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+      const uint32_t bits = static_cast<uint32_t>(row[static_cast<size_t>(i)]) << 16;
+      std::memcpy(&out[static_cast<size_t>(i)], &bits, sizeof(float));
+    }
+    if (std::fwrite(out.data(), sizeof(float), out.size(), f) != out.size())
+      DGPP_LOG_WARN("dsv4 layer dump: short write of {}", path);
+    std::fclose(f);
+  }
+
+  // The RAW hc_mult-stream state of the pass's last row (the same row
+  // write_layer collapses), widened to f32: `state_bf16` is
+  // [hc_mult, hidden] contiguous (the model's cur_ row layout). This is the
+  // quantity comparable with the reference's own `layer_NN_hc.f32` — the
+  // collapsed file above carries the layer's WEIGHTED pre combination and
+  // the norm, so the two sides are not the same vector.
+  void write_layer_hc(int layer, const uint16_t* state_bf16, int hc, cudaStream_t stream) {
+    if (!active_) return;
+    const size_t n = static_cast<size_t>(hc) * static_cast<size_t>(hidden_);
+    std::vector<uint16_t> row(n);
+    DGPP_CUDA_OK(cudaMemcpyAsync(row.data(), state_bf16, n * 2, cudaMemcpyDeviceToHost, stream));
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    const std::string path = pass_dir_ + "/layer_" + pad2(layer) + "_hc.f32";
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (f == nullptr) {
+      DGPP_LOG_WARN("dsv4 layer dump: cannot write {} — the layer's file is missing", path);
+      return;
+    }
+    std::vector<float> out(n);
+    for (size_t i = 0; i < n; ++i) {
+      const uint32_t bits = static_cast<uint32_t>(row[i]) << 16;
+      std::memcpy(&out[i], &bits, sizeof(float));
+    }
+    if (std::fwrite(out.data(), sizeof(float), out.size(), f) != out.size())
+      DGPP_LOG_WARN("dsv4 layer dump: short write of {}", path);
+    std::fclose(f);
+  }
+
   // After the lm head: `logits_row` is the pass's last row's final-logit
   // slice on the device (this rank's [lm_vocab_count] f32; the sharded
   // head's slice's). Writes the top-20's (the absolute's token id's,
