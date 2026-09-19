@@ -405,7 +405,7 @@ selection and the pinned CPU oracle both resolve ties to the **LOWER**
 index (`dsv4_csa2_select_prefill`'s `(score desc, index asc)`
 stable-sort, `src/models/dsv4/csa2_layer.cu:590-600`; the
 `dsv4_indexer_topk_tiebreak_and_causal` oracle,
-`tests/unit/dsv4_csa2_oracle_test.cpp:489-558`). So the V4 DECODE
+`tests/unit/dsv4_csa2_oracle_test.cpp:611-655`). So the V4 DECODE
 kernel's tie-break (higher index) DISAGREES with the pinned reference /
 prefill / dsv41-base tie-break (lower index). See GAPS G-tiebreak.
 
@@ -697,9 +697,10 @@ the GPU-gate pending runs the parity gate.
 The three KV sources (the phases), in order:
 
 1. **The compressed pool (optional)**: the `n_comp` records of `pool`
-   (the 584 B kFp8 paged pool, the C4A selection's `kv_slots` [n_rows,
-   n_comp] list — the same records the csa2's main phase reads, §1.3's
-   record's the 584 B's byte-compat's). The DSpark DRAFT's `n_comp ==
+   (the 584 B kFp8 paged pool, the dsv4-native's C4A pool's record
+   format, the C4A selection's `kv_slots` [n_rows, n_comp] list — the
+   C++'s csa2 main cache's the §1.3's kFp4Block's 288 B's re-
+   expression's, the two's formats' coexist, §5's G-cache-format's). The DSpark DRAFT's `n_comp ==
    0`'s skip's (the DSpark layers' ratio-0's class's, the pool /
    `kv_slots`'s may be null's); the VERIFY's C4A's phase's the
    `n_comp > 0`'s (the dsv4-native's verify's m = 6's the C4A's
