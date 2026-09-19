@@ -68,6 +68,8 @@ Dsv4HashLayer::Layout Dsv4HashLayer::layout(const Dsv4HashConfig& cfg, int max_t
   return L;
 }
 
+size_t Dsv4HashLayer::scratch_bytes(const Dsv4HashConfig& cfg, int max_tokens) { return layout(cfg, max_tokens).total; }
+
 Dsv4HashLayer::Dsv4HashLayer(IGemm& gemm, const Dsv4HashConfig& cfg, int max_tokens, void* scratch,
                              size_t scratch_capacity, void* gemm_workspace, size_t gemm_ws_bytes)
     : gemm_(gemm), cfg_(cfg), max_tokens_(max_tokens), gemm_ws_(gemm_workspace), gemm_ws_bytes_(gemm_ws_bytes) {

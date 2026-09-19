@@ -1336,7 +1336,7 @@ add_test(NAME dsv4_fp8_scale_test COMMAND dsv4_fp8_scale_test)
 # is oracle-qualified on CPU before consumption).
 foreach(_dsv4_oracle dsv4_csa2_oracle_test dsv4_dspark_oracle_test dsv4_mhc_oracle_test dsv4_moe_oracle_test)
   add_executable(${_dsv4_oracle} tests/unit/${_dsv4_oracle}.cpp)
-  target_include_directories(${_dsv4_oracle} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_include_directories(${_dsv4_oracle} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit)
   dgpp_set_common(${_dsv4_oracle})
   add_test(NAME ${_dsv4_oracle} COMMAND ${_dsv4_oracle})
   set_tests_properties(${_dsv4_oracle} PROPERTIES LABELS "host")
@@ -1347,6 +1347,22 @@ endforeach()
 # the real layer code's, the CPU-qualifiable's: the test calls only host
 # functions, no CUDA initialization, so it runs without a GPU).
 target_link_libraries(dsv4_csa2_oracle_test PRIVATE dgpp_models_dsv4_layers)
+
+# The MXFP4 slot expert's GPU gate (2026-09-24, the dsv4 MoE slot's the
+# completion's): the slot (decode's) composition's (the fp4 slot
+# gate/up/SwiGLU's + the fp4 slot down's + the slot accum's, the fp8
+# shared expert's the sh_*'s arguments's) vs the CPU's oracle's (the
+# dsv4_moe_expert_oracle.hpp's moe_mxfp4_ref's, the shared header's the
+# unit test's the same's reference's). Two deterministic small cases' (the
+# zeroed's shared's + the live's shared's), the max error's printed's
+# against the 2%'s threshold's. GPU-only (the ctest's skip's the 2's
+# no-GPU's contract's).
+add_executable(dsv4_moe_slot_test tests/cuda/dsv4_moe_slot_test.cu)
+target_include_directories(dsv4_moe_slot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit)
+target_link_libraries(dsv4_moe_slot_test PRIVATE dgpp_models_dsv4_layers dgpp_kernels CUDA::cudart)
+dgpp_set_common(dsv4_moe_slot_test)
+add_test(NAME dsv4_moe_slot_test COMMAND dsv4_moe_slot_test)
+set_tests_properties(dsv4_moe_slot_test PROPERTIES SKIP_RETURN_CODE 2)
 
 # DeepSeek-V4-Flash ratio-4 (C4A) overlapping compressor's tail-ring update
 # (2026-09-18, the dsv4 dspark + compressor wiring; docs/dsv4_kernel_port_spec.md

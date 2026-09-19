@@ -94,6 +94,11 @@ class Dsv4HashLayer {
                 void* gemm_workspace, size_t gemm_ws_bytes);
   ~Dsv4HashLayer();
 
+  // The scratch's byte's count (the layout's total's — the model's
+  // hash_scratch_bytes' the formula's the shared's, the test's the
+  // same's).
+  static size_t scratch_bytes(const Dsv4HashConfig& cfg, int max_tokens);
+
   // `stream`'s the view table's upload's stream (the stream-ordered's
   // H2D's, the no-copy's on the captured's stream's when the pointer
   // set's unchanged's — the resident's rebind's the hit's).

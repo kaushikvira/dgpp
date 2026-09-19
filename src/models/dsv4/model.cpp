@@ -93,29 +93,10 @@ Dsv4DsparkConfig Dsv4Model::dspark_config(const Dsv4TextConfig& cfg, int targets
 }
 
 size_t Dsv4Model::hash_scratch_bytes(const Dsv4TextConfig& cfg, int tp_world, int max_tokens) {
-  // Mirrors Dsv4HashLayer::layout: the fused router's per-row top-k
-  // staging (ids + weights) and the MXFP4 expert's slot planes (the
-  // slot act's the bf16's, the slot down's the fp32's, the execution's
-  // order's the int32's — the tokens*(top_k + 1)'s slots' the routed's
-  // + the shared expert's row's) + the device's expert view table's
-  // (the (E+1)*3's MoeExpertView's).
-  const int64_t inter = cfg.moe_intermediate_size / tp_world;
-  const size_t T = static_cast<size_t>(max_tokens);
-  const size_t K = static_cast<size_t>(cfg.num_experts_per_tok);
-  const size_t E = static_cast<size_t>(cfg.n_routed_experts);
-  const size_t slots = T * (K + 1);
-  size_t off = 0;
-  const auto alloc = [&](size_t bytes) {
-    off = (off + 255) / 256 * 256;
-    off += std::max<size_t>(bytes, 16);
-  };
-  alloc(T * K * 4);  // topk_ids
-  alloc(T * K * 4);  // topk_w
-  alloc(slots * static_cast<size_t>(inter) * 2);  // slot_act (bf16)
-  alloc(slots * static_cast<size_t>(cfg.hidden_size) * 4);  // slot_down (fp32)
-  alloc(slots * 4);  // slot_order (int32)
-  alloc((E + 1) * 3 * sizeof(dgpp::MoeExpertView));  // the device view table
-  return (off + 255) / 256 * 256;
+  // The layer's layout's (the Dsv4HashLayer::scratch_bytes' the single's
+  // source's the formula's — the model's plan's + the constructor's the
+  // shared's, the test's the same's).
+  return Dsv4HashLayer::scratch_bytes(hash_config(cfg, tp_world), max_tokens);
 }
 
 size_t Dsv4Model::dspark_scratch_bytes(const Dsv4TextConfig& cfg, int lm_vocab_count, int max_rows) {
