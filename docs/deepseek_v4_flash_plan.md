@@ -1,5 +1,9 @@
 # DeepSeek-V4-Flash on dgpp — plan and status (2026-09-18)
 
+> **START HERE for a new session: [`docs/dsv4_HANDOFF.md`](dsv4_HANDOFF.md)** — the current state,
+> the one open bug with its evidence, the copy-paste rig, the invariants and the definition of done.
+> This file below is the chronological evidence trail.
+
 Branch `dsv4-flash`. Target: serve **DeepSeek-V4-Flash** (`deepseek_v4`,
 `DeepseekV4ForCausalLM`) at **world 2** on the two-Spark kit, from the local
 checkpoint `/data/models/DeepSeek-V4-Flash-0731` (156 GB, 48 shards, flat
