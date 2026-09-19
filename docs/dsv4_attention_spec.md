@@ -677,3 +677,219 @@ ratio > 1's). The checkpoint's reference's the PARITY's oracle's
 pool's, the APE's, the [b, 8, 1024]'s state's) is the checkpoint's
 only's; where's they's disagree's this's doc's follows's the
 checkpoint's (the §0.1's rule's).
+
+## 4. The DSpark union attention over the three KV sources
+
+The DSpark draft/verify attention is a SINGLE softmax over the UNION of
+three KV sources — the locked "fact #3" the dsv4-native production-
+reference read (2026-09-09) pinned and the port spec `spec:§2.2(c)`
+adopts as the contract (the dsv4-native `src/ops/dspark_attn/
+dspark_attn.h:1-120` header + `docs/KNOWLEDGE.md` D30, the port spec's
+oracle source, `~/work/dsv4-native/`). The v4-owned
+`dsv4_dspark_union_attn` (`src/models/dsv4/dspark_layer.cu`) is the V4
+re-expression (the shared dgpp kernels have no union attention yet,
+`src/models/dsv4/dspark_layer.hpp:10-12`); its numerics are certified
+against the CPU oracle (`tests/unit/dsv4_dspark_oracle_test.cpp`) —
+the GPU-gate pending runs the parity gate.
+
+### 4.1 The locked "fact #3" contract (the single-softmax-over-the-union's)
+
+The three KV sources (the phases), in order:
+
+1. **The compressed pool (optional)**: the `n_comp` records of `pool`
+   (the 584 B kFp8 paged pool, the C4A selection's `kv_slots` [n_rows,
+   n_comp] list — the same records the csa2's main phase reads, §1.3's
+   record's the 584 B's byte-compat's). The DSpark DRAFT's `n_comp ==
+   0`'s skip's (the DSpark layers' ratio-0's class's, the pool /
+   `kv_slots`'s may be null's); the VERIFY's C4A's phase's the
+   `n_comp > 0`'s (the dsv4-native's verify's m = 6's the C4A's
+   2,048-compressed's + the ring's + the 6-block's probe's,
+   `spec:§2.2(c)`'s the `tests/test_op_dspark_attn.cpp:20-25`'s).
+2. **The raw ring (optional)**: the `raw_n` records of `raw_ring` —
+   the per-DSpark-layer 128-slot RING of the PROJECTED MAIN HIDDEN
+   STATE (the DSpark stage's `main_proj`'s the 3×4096's target-
+   layer's features' concatenated's → 4096's, the `spec:§1`'s, the
+   checkpoint's `main_kv = self.kv_norm(self.wkv(main_x))`'s,
+   ck:model.py:759's). The ring's token list is the LINEAR's 0..raw_n-
+   1's (the official reference's `get_dspark_topk_idxs`'s
+   `arange(min(window_size, start_pos + 1))`'s, ck:model.py:746's —
+   the ring's content IS the most recent raw_n positions at every
+   anchor, the wrap's fills all 128's at anchor >= 127's, the prefix's
+   fill's at's the short's context's — NOT's a wrap-around's window's
+   fill's).
+3. **The block (the non-causal's all-queries-see-all's)**: the
+   `n_block` IN-MEMORY bf16 block KVs of `block_kv` [n_block, 512]
+   (the step's m rows' own kv_latent — the layer's `kv_norm` + RoPE's
+   output's, UNQUANTIZED — the in-memory's, no-cache's phase's).
+   SHARED across the query rows: the NON-CAUSAL's every-query-sees-
+   all-block-KVs's (the draft's all 5 queries' see all 5 block KVs's,
+   the verify's m = 6's rows' all-6's INCLUDING'S the future's
+   tokens's — the production's `is_dspark`'s non-causal's block's,
+   `spec:§2.2(c)`'s).
+
+**The single softmax**: the SHARED online-softmax state (the running
+max m + the normalizer l + the 512-dim fp32 accumulator) spans ALL
+THREE phases — NO per-phase rescale boundary, the merged-denominator's
+rule. The phase order's the compressed's -> the ring's -> the block's
+(the official reference's `torch.cat([self.kv_cache, kv], dim=1)`'s
+the ring's BEFORE'S the block's, ck:model.py:784's, the production's
+topk list's the [compressed | raw | block]'s) — the phases' fp32
+accumulation order is the list's order (the online-softmax's math-
+equivalence class, the oracle's max-shift union's tolerance's).
+
+### 4.2 The checkpoint reference's mapping (the 2-source's union's)
+
+The checkpoint's `DSparkAttention` (ck:model.py:750-795) is a
+ratio-0's layer (the `assert self.compress_ratio == 0`'s,
+ck:model.py:753's) — its union is the 2-source's `kv = torch.cat(
+[self.kv_cache[:bsz], kv], dim=1)` (ck:model.py:784's: the ring's +
+the block's; the DSpark layer's has NO compressor's, so the C4A's
+compressed's phase's is absent's — the 3-source's contract's is the
+dsv4-native / production's generalization's to's a third's, IN-
+MEMORY's phase's, the VERIFY's C4A's phase's).
+
+- **The topk list**: `get_dspark_topk_idxs` (ck:model.py:744-748):
+  `matrix = torch.cat([torch.arange(min(window_size, start_pos + 1)),
+  window_size + torch.arange(block_size)])` (ck:model.py:746's) —
+  the ring's slots' 0..min(128, start_pos + 1) - 1's followed's by
+  the block's at's the list's positions' 128..132's (the `win +
+  arange(block_size)`'s), ONE single `sparse_attn(q, kv, attn_sink,
+  topk_idxs, softmax_scale)` over the whole list (ck:model.py:785's)
+  — the single's softmax's over's the union's.
+- **The ring's content's**: the `main_kv`'s the projected's main's
+  hidden's state's (ck:model.py:759-761's the `wkv`'s + the
+  `kv_norm`'s + RoPE's at's the main's position's + the
+  `act_quant(main_kv[..., :-rd], 64, ...)`'s the NoPE's 448's
+  per-64's fp8-simulated's the RoPE's 64's the bf16's — the 584 B's
+  record's layout's, §4.5's), written's to's the ring's at's the
+  `start_pos % win`'s slot's (ck:model.py:783's).
+- **The block's KV's**: the `kv = self.kv_norm(self.wkv(x))`'s +
+  RoPE's + the `act_quant`'s (ck:model.py:778-780's) — IN-MEMORY's
+  (the not's cached's), the x's the draft's block's rows's (the
+  [next, noise, ...]'s block rows's, the `dsv41_dspark_block_rows`'s
+  the `src/kernels/dsv41_dspark.hpp`'s, the C++'s glue's the
+  `Dsv4DsparkLayer::block_rows`'s the `src/models/dsv4/dspark_layer.
+  cu:107-115`'s).
+- **The q side's**: the ad-hoc q's re-normalization's `q *=
+  torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)` (
+  ck:model.py:775-776's, the §0.1's "the ad-hoc q re-normalization"
+  's) + RoPE's (ck:model.py:777's) — the C++'s kernel's takes the q's
+  as's the ready's 512-dim's latent's (the wq_b's output's + the q-
+  renorm's + the RoPE's, the caller's, the `src/models/dsv4/dspark_
+  layer.cu:207-210`'s comment's).
+
+### 4.3 The shared online-softmax state (the NO per-phase's rescale's boundary's)
+
+`dsv4_dspark_union_attn_kernel` (`src/models/dsv4/dspark_layer.cu:
+195-282`): one CTA per row, 512 threads (the thread t's owns (head
+t/8, dim-chunk t%8)'s 64 output dims' — the 512-dim's latent's the
+8 threads' 64 dims' each's, the C5.5's CTA geometry's):
+
+- **The state's**: `m` (the running max's) + `l` (the normalizer's) +
+  the 64-dim fp32 accumulator's `acc` (the per-thread's), initialized
+  ONCE before phase 1 (`dspark_layer.cu:217-220`), and the `phase`
+  lambda (the `dspark_layer.cu:229-252`'s) applied's sequentially's
+  over's the three's phase's iterators's — the m / l / acc's CARRIES
+  ACROSS'S the phases's (the rescale's the `rescale = exp(m - m_new)`'
+  s the FlashAttention-2's rescale's, `dspark_layer.cu:246-249`'s) —
+  the phase's boundary's is INVISIBLE to's the state's (the single's
+  softmax's, NO'S per-phase's rescale's boundary's).
+- **The q's**: read's from's global's per's phase's (the SMEM's
+  staging's the completion's — the dsv4-native's contract's stages'
+  the q's in SMEM ONCE's (read once across ALL phases, the
+  BANDWIDTH-FIRST rule's); the numerics' identical's, the
+  `src/models/dsv4/dspark_layer.cu:146-152`'s comment's).
+- **The phases' bodies'**: phase 1's the compressed's pool's (the
+  `kv_slots`'s the physical's pool's token's indices' the 584 B's
+  fp8's, `dspark_layer.cu:253-257`'s), phase 2's the raw ring's (the
+  linear's 0..raw_n - 1's, `dspark_layer.cu:258-262`'s), phase 3's
+  the block's (the in-memory's bf16's, `dspark_layer.cu:263-266`'s).
+- **The output's**: `out = acc / l`'s the ONE's bf16's rounding's (
+  the `dspark_layer.cu:275-281`'s the `inv_l = (l > 0) ? (1 / l) :
+  0`'s), the `l == 0`'s the no-tokens's 0.0f's the documented's
+  edge's (the not's an error's).
+
+### 4.4 The sink's exactly-once
+
+- **The init's**: the sink's (nullable's, the per-head's [64]'s fp32
+  's, the layer's own's `attn_sink`'s REPLICATED's, the DSpark's
+  layers' artifact's `mtp.N.attn.attn_sink`'s) initializes the state
+  BEFORE phase 1 (the `dspark_layer.cu:221-224`'s the `m =
+  attn_sink[head], l = 1`'s) — the sink's mass's enters the MERGED
+  denominator's EXACTLY ONCE's (the `exp(sink - m')`'s term's, the
+  closed form's `m' = max(max_t S[t], sink[h])`'s). Null's = the
+  pre-sink's numerics's (the `m = -inf, l = 0`'s the bit-exact's
+  regression's guard's); the per-head's `-inf`'s entry's a no-op's,
+  bit-exact's vs's null's; the per-head's `+inf`'s entry's the
+  degenerate's limit's — the sink's mass's dominates the denominator's,
+  the EXACTLY-zero's output's.
+- **The oracle's**: `dsv4_dspark_union_attn_sink_exactly_once` (
+  `tests/unit/dsv4_dspark_oracle_test.cpp:324-387`'s): a three-
+  phase's union's (the n_comp = 2 compressed's, raw_n = 2 ring's,
+  n_block = 1 in-memory's block's = 5 tokens' total's) with's a
+  single's KV's latent's so's the softmax's is's a known's closed
+  form's — the null / `-inf` sink's the no-op's (the bit-identical's,
+  :342-352's), the `+inf` sink's the EXACTLY-zero's output's (
+  :354-360's), a finite's sink's adds exactly ONE's `exp(sink - m')`'
+  s to's the MERGED's denominator's (the :362-378's the closed
+  form's the `denom = n_tokens + exp(sink - s)`'s at :370's), the
+  all-zero's no-tokens's edge's the `l == 0`'s 0.0's (the :380-
+  387's).
+- **The double's oracle's**: `dspark_attn_ref` (the
+  `tests/unit/dsv4_dspark_oracle_test.cpp:177-209`'s the max-shift's
+  union's one list's, the dsv4-native's `ops/common/op_test.h:1990`'
+  s `dspark_attn_ref`'s the closed form's the `sum += std::exp(sink
+  - m)`'s the exactly-once's term's at's the :199's, the kernel's
+  parity's gate's the `tests/test_op_dspark_attn.cpp:205-214`'s).
+
+### 4.5 The 584 B record's decode (the fp8 phase's)
+
+`dsv4_dspark_decode_record` (`src/models/dsv4/dspark_layer.cu:169-
+186`): the 584 B record's layout's the [448 e4m3 NoPE | 64 bf16 RoPE
+| 7 ue8m0 scales + 1 pad]'s (the 448's + 128's + 8's = 584's, the
+C5.5/C5.6a's byte-compat's the `tests/unit/dsv4_csa2_oracle_test.
+cpp:127-136`'s layout's the dsv4-native's `kv_cache.h:83-108`'s):
+the NoPE's 448's dims' the 7's 64-dim's groups' the e4m3's × the
+group's ue8m0 scale's (the `e8m0_byte_to_float`'s the 2^(b - 127)'s,
+`src/kernels/latent_format.hpp:124`'s, the exact in fp32's the D19'
+s), the RoPE's 64's dims' the bf16's → fp32's upcast's exact's (the
+128's bf16's values' the 64's dims' the 2-byte's each's,
+`dspark_layer.cu:181-185`'s). The block's phase's bf16's [n_block,
+512]'s the unquantized's kv_latent's (the `dspark_layer.cu:263-266`'
+s the `bf16_bits_to_float`'s the exact's upcast's).
+
+### 4.6 The geometry's guards (the fail-closed's)
+
+The launcher's (`dsv4_dspark_union_attn`, `src/models/dsv4/dspark_
+layer.cu:284-303`), BEFORE any CUDA call's (the dsv4-native's
+dspark_attn's contract's, the `spec:§2.2(c)`'s): `n_comp` in [0,
+`max_tokens` = 4096]'s, `raw_n` in [0, `window` = 128]'s, `n_block`
+in [0, `max_block` = 8]'s (the `dspark_layer.cu:294-296`'s); the
+`raw_n > 0`'s requires's `raw_ring`'s non-null's, the `n_block > 0`'
+s requires's `block_kv`'s non-null's, the `n_comp > 0`'s requires's
+`pool` + `kv_slots`'s (the `dspark_layer.cu:297-300`'s). The
+all-zero's (the no-phase's) = the `l == 0`'s no-tokens's 0.0f's
+output's (the documented's edge's, not an error's). The config's
+(`Dsv4DsparkConfig`, `src/models/dsv4/dspark_layer.hpp:35-54`'s):
+the window's 128's, the max_block's 8's, the max_tokens's 4096's, the
+`kHeads` = 64's, the `kHeadDim` = 512's (the 448 NoPE + 64 RoPE's),
+the `local_heads()` = 64's (the MLA's single latent KV head's the
+replicated's).
+
+### 4.7 The current's model's wiring (the pending's)
+
+The model's calls's the union attention's on's the decode/draft's
+path's (the `src/models/dsv4/model.hpp:30-31`'s comment's):
+`dspark_->union_attn(q_latent, nullptr, nullptr, 0, nullptr, 0,
+block_kv, cfg_.dspark_block_size, out_latent, T, stream_)` (
+`src/models/dsv4/model.cpp:849-854`'s) — the BLOCK phase's only's
+(the pool's / the ring's the nullptr's 0's, the draft's `n_comp ==
+0`'s the ratio-0's class's); the q latent's + the block kv's stand in
+the csa2 seam's (the csa2 projection's the 512-dim's latent's the
+csa2 layer's the private's, the model's staging's the csa2 seam's the
+fill's, the `src/models/dsv4/model.cpp:842-848`'s comment's) — the
+pool's / the ring's phases' wiring's pending's (§5's G-union-wiring'
+s). The `Dsv4DsparkLayer::union_attn`'s the layer's method's (the
+`src/models/dsv4/dspark_layer.cu:137-140`'s) passes's the
+`w_.attn_sink`'s (the nullable's the DSpark stage's sink's, the
+`src/models/dsv4/dspark_layer.hpp:68`'s).
