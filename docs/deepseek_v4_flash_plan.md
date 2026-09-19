@@ -643,3 +643,51 @@ weight folded in), `launch_moe_slot_accum` (the routed sum) — plus the shared
 expert's fp8 triple and the `fp4_gemv` K=4096 compile entry the port spec §2.4
 says is needed. The CPU oracle to match is
 `tests/unit/dsv4_moe_oracle_test.cpp`'s `dsv4_moe_mxfp4_expert_decode_and_clamp`.
+
+## 2026-09-20, night part 3: the root cause is FIXED; a residual MoE numerics gap remains
+
+**Root cause (found and fixed):** `Dsv4HashLayer::expert()` was a stub — the
+model had no FFN at all. It now runs the GLM slot composition (routed MXFP4
+gate/up/SwiGLU + down + the accumulated routed sum + the fp8 shared expert),
+GPU-verified against the CPU oracle (`dsv4_moe_slot_test`: max err 9.8e-05 /
+1.5e-02, both within the 2% budget), and the deploy's decode graph captures
+again. Six other silent bugs were fixed on the way: the union-attention
+accumulator OOB, the DSpark plan's `stride` (4096 vs the fused 12288), the
+deployment's `mtp_depth` (1 vs the DSpark block's 5), the ring format's missing
+large-smem opt-in (its launches were being rejected outright), the draft
+stream-mean's wrong row stride (an uninitialized read), and the dump hook's
+swapped `(hidden, layers)` arguments.
+
+**Where the numerics stand.** The tooling that localizes this now works and is
+the handoff's main asset:
+- `DGPP_DSV4_DUMP_LAYERS=<dir>` (node-env key in BOTH allowlists:
+  `scripts/site_env.py` + `src/serve/cluster_config.cpp`) makes the engine write,
+  per prefill pass that ends the prompt, `req_NNNN/rank_R/layer_NN.f32` (the
+  layer-exit mHC collapse), `layer_NN_hc.f32` (the RAW 4-stream state — the
+  quantity comparable with the reference), `moe_out_l0.f32` (a sub-step probe)
+  and `logits_top.txt`. It refuses to run with `decode_graph` on (the D2H copies
+  must stay out of the capture); use `q-dgx-gateway/config/dgpp-dsv4-w2-eager.json`.
+- `tools/dsv4_reference_layers.py` (the torch reference, runnable in
+  `eugr/spark-vllm:latest` per `docs/dsv4_reference_runbook.md`) computes the
+  checkpoint's own per-layer states and writes the same layout, so a plain diff
+  localizes the first diverging layer. It does layers 0-3 in ~14 s at 4.8 GiB.
+- `scripts/dsv4_coherence_check.sh` prints our text against the vLLM reference
+  lane's opening and how much of it we reproduce (the metric: currently 0).
+
+**Result so far:** streams 0, 1 and 2 of layer 0 match the reference bit-exactly
+(cos 0.9999-1.0000) and **stream 3 — the MoE's lane — is off**: the same
+magnitude (0.98x) but cos 0.72. So the attention, the RoPE, the ring, the mHC,
+the embedding and the head are all confirmed right, and the remaining error is
+inside the MoE's contribution.
+
+**The one caveat to respect when continuing:** dumping `moe_out_l0` gives THIS
+rank's PRE-all-reduce partial (the runner lays `fold`/the boundary reducer on the
+output), while the reference run is world 1. A raw comparison therefore shows
+ours 14.5 vs the reference's 52.9 with cos 0.09 — that is NOT yet evidence of a
+3.6x error; compare the layer-level `layer_NN_hc` states (post-collective) or
+run the reference at world 2 before reading anything into the MoE-output diff.
+The prime suspects inside the MoE, in order: the expert views the slot kernels
+actually read (the loader's `experts[e*3 + 0/1/2]` = w1/w3/w2 order is correct,
+but the `MoeExpertView::of` scale/group fields for MXFP4 and the shared expert's
+fp8 grid shifts are worth an oracle case each), and the routing weights' path
+from `topk_w` into `launch_moe_slot_accum`.
