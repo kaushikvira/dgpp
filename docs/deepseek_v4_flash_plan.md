@@ -529,3 +529,40 @@ Baseline to beat: **10.7 tok/s** (client-measured, 512 tokens, `dsv4-gates/…-t
 against the 40-60 tok/s target. The arithmetic ties the two goals together: at
 the current 65 ms/pass with `accept p1 0%` we get 1.00 tok/pass; a healthy MTP
 acceptance (~70%, depth 5) is ~3 tok/pass → ~45 tok/s.
+
+## The reference exists ON THIS KIT — use it (2026-09-19, night)
+
+`~/work/v-dgx-gateway` (Lane D) already carries the A/B harness for exactly this
+workload: **vLLM serves the SAME checkpoint** (`/data/models/DeepSeek-V4-Flash-0731`,
+byte-identical to HF `deepseek-ai/DeepSeek-V4-Flash-0731` @ `7872f01b`) as
+`deepseek-v4-flash-dspark` on the same `:8888` — `make up-base` / `make down-base`
+(`.env.base`), `.env.miaai` for the production shape, and `docs/DSV4-DGPP.md` for
+the knob mapping. The DGPP-side wrappers (`make up-dgpp-dsv4`, `config/dgpp-dsv4-flash.json`)
+and the bench suite (`make bench-dgpp-dsv4`, incl. `bench/reasoning_check.py`) were
+prepared for this workstream.
+
+**Ground truth captured** (the same prompt our smoke uses — "In one sentence,
+what is a DGX Spark?"): the vLLM lane answers coherently, first token `The` at
+logprob -0.207, then ` DG X Spark is NVIDIA 's compact` — saved as
+`log/evidence/ref-first-tokens.json`. The vLLM lane also measures **36.9 tok/s**
+sustained decode (700 tokens), a useful performance floor. **Our engine's common
+prefix with that reference is currently ZERO tokens** — the metric to move.
+
+Ruled out tonight as the cause of the degeneration (each cheaply tested):
+- **the prompt/chat template** — our raw `/v1/completions` path (no template) is
+  equally degenerate;
+- **the tokenizer/renderer** — `dsv4_prompt_test` + `dsv4_tokenizer_test` pass;
+- **the weights** — a FRESHLY REBUILT resident image (shards → 174 s boot) is
+  equally degenerate, so the Sep-18 image was not stale;
+- **the loader/binding/fp8-scale formats** — `dsv4_loader_test` (GPU) 5/5,
+  `dsv4_loader_cpu_test` 6/6, `dsv4_fp8_scale_test` 4/4;
+- **the input path** — the output IS input-dependent (three different prompts give
+  three different continuations), so the prompt reaches the model;
+- **the graph/engine plumbing** — both the eager and the captured-graph paths are
+  degenerate.
+
+So: a numerically wrong op in the forward pass. `dsv4_gpu_parity_test` (a GPU
+kernel-vs-CPU-oracle harness for the mHC / MoE / csa2 / dspark / fp8-scale ops) is
+being built now — that gate has never existed, and this codebase's history (the
+union-attention accumulator bug that the CPU oracle passed) says that is where the
+bug is.
