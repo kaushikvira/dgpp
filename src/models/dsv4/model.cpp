@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "common/capture_trace.hpp"
 #include "common/cuda_check.hpp"
 #include "common/log.hpp"
 #include "kernels/csa2.hpp"
@@ -617,6 +618,7 @@ void Dsv4Model::write_state_snapshot(int req, uint8_t* d, int spec_row) {
     const float* src = live ? d_tails_ + t * tail_stride + static_cast<size_t>(req) * per_req
                             : spec_tails_ + t * spec_tail_stride + row * per_req;
     DGPP_CUDA_OK(cudaMemcpyAsync(d, src, per_req * sizeof(float), cudaMemcpyDeviceToDevice, stream_));
+    capture_trace_copy("dsv4 write_state_snapshot tail", "D2D", src, d, per_req * sizeof(float), stream_);
     d += per_req * sizeof(float);
   }
 }
@@ -628,6 +630,9 @@ void Dsv4Model::read_state_snapshot(int req, const uint8_t* s) {
   for (int t = 0; t < tails_; ++t) {
     DGPP_CUDA_OK(cudaMemcpyAsync(d_tails_ + t * tail_stride + static_cast<size_t>(req) * per_req, s,
                                  per_req * sizeof(float), cudaMemcpyDeviceToDevice, stream_));
+    capture_trace_copy("dsv4 read_state_snapshot tail", "D2D", s, d_tails_ + t * tail_stride +
+                                                            static_cast<size_t>(req) * per_req,
+                       per_req * sizeof(float), stream_);
     s += per_req * sizeof(float);
   }
 }
@@ -772,7 +777,11 @@ void Dsv4Model::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos, 
     std::vector<int32_t> ids(static_cast<size_t>(T), req);
     for (int i = 0; i < T; ++i) pos[static_cast<size_t>(i)] = first_pos + i;
     DGPP_CUDA_OK(cudaMemcpyAsync(d_draft_pos_, pos.data(), static_cast<size_t>(T) * 8, cudaMemcpyHostToDevice, stream_));
+    capture_trace_copy("dsv4 mtp_run_rows draft positions (prefill form)", "H2D", pos.data(), d_draft_pos_,
+                       static_cast<size_t>(T) * 8, stream_);
     DGPP_CUDA_OK(cudaMemcpyAsync(d_draft_req_, ids.data(), static_cast<size_t>(T) * 4, cudaMemcpyHostToDevice, stream_));
+    capture_trace_copy("dsv4 mtp_run_rows draft request ids (prefill form)", "H2D", ids.data(), d_draft_req_,
+                       static_cast<size_t>(T) * 4, stream_);
     DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
     d_pos = d_draft_pos_;
     d_req = d_draft_req_;
@@ -886,10 +895,14 @@ void Dsv4Model::gather_embedding(const int64_t* tokens, int T, bool capture) {
   embed_gather_sliced_bf16(globals_.embed, tokens, e, T, H, globals_.embed_vocab_begin, globals_.embed_vocab_count,
                            stream_);
   fold(e, T, H, capture);
-  for (int s = 0; s < 4; ++s)
+  for (int s = 0; s < 4; ++s) {
     DGPP_CUDA_OK(cudaMemcpy2DAsync(cur_ + static_cast<size_t>(s) * H, static_cast<size_t>(4) * H * 2, e,
                                    static_cast<size_t>(H) * 2, static_cast<size_t>(H) * 2, static_cast<size_t>(T),
                                    cudaMemcpyDefault, stream_));
+    capture_trace_copy2d(("dsv4 gather_embedding sharded (stream " + std::to_string(s) + ")").c_str(), "D2D", e,
+                         static_cast<size_t>(H) * 2, cur_ + static_cast<size_t>(s) * H, static_cast<size_t>(4) * H * 2,
+                         static_cast<size_t>(H) * 2, static_cast<size_t>(T), stream_);
+  }
 }
 
 void Dsv4Model::mhc_site(const uint16_t* streams, const GlmMhcWeights& w, const uint16_t* ln, int T, bool decode) {

@@ -41,6 +41,7 @@
 
 #include <cuda_runtime.h>
 
+#include "common/capture_trace.hpp"
 #include "common/cuda_check.hpp"
 #include "common/prefill_progress.hpp"
 #include "engine/boundary_reducer.hpp"
@@ -350,12 +351,16 @@ class SessionModel : public PrefillReporting {
     h_session_pos_[req] = session_pos_[static_cast<size_t>(req)];
     DGPP_CUDA_OK(cudaMemcpyAsync(d_session_pos_ + req, h_session_pos_ + req, sizeof(int64_t),
                                  cudaMemcpyHostToDevice, stream_));
+    capture_trace_copy("session push_position", "H2D", h_session_pos_ + req, d_session_pos_ + req, sizeof(int64_t),
+                       stream_);
   }
   void push_mtp_position(int req) {
     if (!mtp_) return;
     h_mtp_pos_[req] = mtp_pos_[static_cast<size_t>(req)];
     DGPP_CUDA_OK(cudaMemcpyAsync(d_mtp_pos_ + req, h_mtp_pos_ + req, sizeof(int64_t),
                                  cudaMemcpyHostToDevice, stream_));
+    capture_trace_copy("session push_mtp_position", "H2D", h_mtp_pos_ + req, d_mtp_pos_ + req, sizeof(int64_t),
+                       stream_);
   }
   // The prefill rows' metadata (positions pos0 + t, the request, one
   // span) into the device arrays (host uploads, a sync).
@@ -699,7 +704,10 @@ typename SessionModel<D>::Outputs SessionModel<D>::finish_run(const RowRun& run,
   if (run.decode && (!run.capture || decode_tail_mirrors_)) {
     DGPP_CUDA_OK(cudaMemcpyAsync(h_tail_logits_, logits_, rows_out * lm_vocab_count_ * sizeof(float),
                                  cudaMemcpyDeviceToHost, stream_));
+    capture_trace_copy("session finish_run tail logits mirror", "D2H", logits_, h_tail_logits_,
+                       rows_out * lm_vocab_count_ * sizeof(float), stream_);
     DGPP_CUDA_OK(cudaMemcpyAsync(h_tail_hidden_, h_, rows_out * H * 2, cudaMemcpyDeviceToHost, stream_));
+    capture_trace_copy("session finish_run tail hidden mirror", "D2H", h_, h_tail_hidden_, rows_out * H * 2, stream_);
   }
   if (run.capture) return Outputs{};  // nothing executed, nothing to materialize
   DGPP_CUDA_OK(cudaStreamSynchronize(stream_));

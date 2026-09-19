@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "common/capture_trace.hpp"
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
 #include "kernels/dsa.hpp"
@@ -344,6 +345,15 @@ void Dsv4Csa2Layer::publish_entries(void* main_cache, void* index_cache, float* 
   if (w_.ratio == 4) {
     DGPP_CUDA_OK(cudaMemcpy2DAsync(latent_main_, kCsa2Latent * 2, latent_, kCsa2TailW * 2, kCsa2Latent * 2,
                                    tokens, cudaMemcpyDeviceToDevice, stream));
+    // The capture's copy-site's trace (the 21's C4A layers's one's each's,
+    // the kernels-only graph's blocker's enumeration's; the site's the
+    // layer's index's, the walk's order's): the construction's gated's on
+    // the capture's (the eager's walk's the per-token's hot path's keeps's
+    // allocation-free's).
+    if (stream_is_capturing(stream))
+      capture_trace_copy2d(("dsv4 csa2 publish_entries latent 1024->512 (layer " + std::to_string(layer_) + ")").c_str(),
+                           "D2D", latent_, static_cast<size_t>(kCsa2TailW) * 2, latent_main_,
+                           static_cast<size_t>(kCsa2Latent) * 2, static_cast<size_t>(kCsa2Latent) * 2, tokens, stream);
     lm = latent_main_;
   } else {
     lm = reinterpret_cast<uint16_t*>(latent_);  // the C128A's [T, 512]'s the plain form's

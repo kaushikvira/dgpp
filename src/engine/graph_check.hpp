@@ -36,7 +36,8 @@ inline void check_decode_graph(cudaGraph_t graph, int rank,
   DGPP_CUDA_OK(cudaGraphGetEdges(graph, nullptr, nullptr, nullptr, &e));
   size_t kernels = 0, empties = 0, memcpys = 0, memsets = 0, hosts = 0,
          events = 0, others = 0, max_in = 0;
-  for (cudaGraphNode_t node : nodes) {
+  for (size_t i = 0; i < n; ++i) {
+    cudaGraphNode_t node = nodes[i];
     cudaGraphNodeType t;
     DGPP_CUDA_OK(cudaGraphNodeGetType(node, &t));
     switch (t) {
@@ -53,6 +54,45 @@ inline void check_decode_graph(cudaGraph_t graph, int rank,
       // (glm_publish_seq).
       case cudaGraphNodeTypeEventRecord: ++events; break;
       default: ++others; break;
+    }
+    // The copy-site enumeration (the dsv4's kernels-only graph blocker's
+    // diagnosis, 2026-09-20): every non-kernel node's parameters, so the
+    // capture's [cap-trace] site lines (common/capture_trace.hpp) join
+    // onto the graph's own nodes by (src, dst, size). Kernels and empty
+    // nodes print nothing (the thousands of them are the graph's body).
+    if (t == cudaGraphNodeTypeMemcpy) {
+      cudaMemcpy3DParms p{};
+      DGPP_CUDA_OK(cudaGraphMemcpyNodeGetParams(node, &p));
+      std::string dir;
+      switch (p.kind) {
+        case cudaMemcpyHostToDevice: dir = "H2D"; break;
+        case cudaMemcpyDeviceToHost: dir = "D2H"; break;
+        case cudaMemcpyDeviceToDevice: dir = "D2D"; break;
+        default: dir = "kind=" + std::to_string(static_cast<int>(p.kind)); break;
+      }
+      if (p.extent.height > 1)
+        DGPP_LOG_INFO("rank {}: {} node [{}/{}]: memcpy2d {} src={:p} (pitch {} B) dst={:p} (pitch {} B) {} x {} B",
+                      rank, what, i, n, dir, p.srcPtr.ptr, p.srcPtr.pitch, p.dstPtr.ptr, p.dstPtr.pitch,
+                      p.extent.width, p.extent.height);
+      else
+        DGPP_LOG_INFO("rank {}: {} node [{}/{}]: memcpy {} src={:p} dst={:p} {} B", rank, what, i, n, dir,
+                      p.srcPtr.ptr, p.dstPtr.ptr, p.extent.width);
+    } else if (t == cudaGraphNodeTypeMemset) {
+      cudaMemsetParams p{};
+      DGPP_CUDA_OK(cudaGraphMemsetNodeGetParams(node, &p));
+      DGPP_LOG_INFO("rank {}: {} node [{}/{}]: memset dst={:p} {} x {} x {} B (value {})", rank, what, i, n, p.dst,
+                    p.width, p.height, p.elementSize, p.value);
+    } else if (t != cudaGraphNodeTypeKernel && t != cudaGraphNodeTypeEmpty) {
+      const char* tname = "other";
+      switch (t) {
+        case cudaGraphNodeTypeHost: tname = "host"; break;
+        case cudaGraphNodeTypeEventRecord: tname = "event-record"; break;
+        case cudaGraphNodeTypeWaitEvent: tname = "event-wait"; break;
+        case cudaGraphNodeTypeGraph: tname = "child-graph"; break;
+        default: break;
+      }
+      DGPP_LOG_INFO("rank {}: {} node [{}/{}]: {} node (type {})", rank, what, i, n, tname,
+                    static_cast<int>(t));
     }
     size_t deps = 0;
     DGPP_CUDA_OK(cudaGraphNodeGetDependencies(node, nullptr, nullptr, &deps));

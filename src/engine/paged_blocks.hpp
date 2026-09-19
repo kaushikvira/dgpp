@@ -21,6 +21,7 @@
 
 #include <cuda_runtime.h>
 
+#include "common/capture_trace.hpp"
 #include "common/cuda_check.hpp"
 
 namespace dgpp {
@@ -88,6 +89,8 @@ class PagedBlockTable {
     held_[static_cast<size_t>(req)] = static_cast<int32_t>(needed);
     DGPP_CUDA_OK(cudaMemcpyAsync(tables_ + static_cast<size_t>(req) * total_blocks_ + have, row + have,
                                  static_cast<size_t>(extra) * 4, cudaMemcpyHostToDevice, stream));
+    capture_trace_copy("paged ensure_request_blocks", "H2D", row + have,
+                       tables_ + static_cast<size_t>(req) * total_blocks_ + have, static_cast<size_t>(extra) * 4, stream);
     return true;
   }
 
@@ -105,6 +108,8 @@ class PagedBlockTable {
     held_[static_cast<size_t>(req)] = 0;
     DGPP_CUDA_OK(cudaMemcpyAsync(tables_ + static_cast<size_t>(req) * total_blocks_, row,
                                  static_cast<size_t>(held) * 4, cudaMemcpyHostToDevice, stream));
+    capture_trace_copy("paged release_request_blocks", "H2D", row, tables_ + static_cast<size_t>(req) * total_blocks_,
+                       static_cast<size_t>(held) * 4, stream);
   }
 
   int64_t request_blocks(int req) const {
@@ -122,6 +127,7 @@ class PagedBlockTable {
     if (!initialized_) throw std::logic_error("PagedBlockTable: reset_all before init");
     std::fill(tables_host_.begin(), tables_host_.end(), 0);
     DGPP_CUDA_OK(cudaMemsetAsync(tables_, 0, tables_host_.size() * 4, stream));
+    capture_trace_memset("paged reset_all", tables_, tables_host_.size() * 4, stream);
     std::fill(held_.begin(), held_.end(), 0);
     std::fill(refcount_.begin(), refcount_.end(), 0);
     free_.clear();
@@ -149,6 +155,8 @@ class PagedBlockTable {
     held_[static_cast<size_t>(req)] = static_cast<int32_t>(n);
     DGPP_CUDA_OK(cudaMemcpyAsync(tables_ + static_cast<size_t>(req) * total_blocks_, row,
                                  static_cast<size_t>(n) * 4, cudaMemcpyHostToDevice, stream));
+    capture_trace_copy("paged share_blocks_into", "H2D", row, tables_ + static_cast<size_t>(req) * total_blocks_,
+                       static_cast<size_t>(n) * 4, stream);
     return true;
   }
   void pin_blocks(const int32_t* blocks, int64_t n) {
