@@ -14,10 +14,29 @@
 #include "kernels/glm_spec.hpp"
 #include "kernels/kernels.hpp"
 #include "kernels/scale_gemm.hpp"
+#include "models/dsv4/compress.hpp"
 
 namespace dgpp {
 using session_detail::dev_alloc;
 using session_detail::pinned_alloc;
+
+namespace {
+// The 0731's Compressor's per-request tail's state geometry (the
+// checkpoint's kv_state / score_state's (coff * ratio, coff * head_dim)'s
+// the 0731's the reference's form's the G-c128a-compressor's the closed's):
+// the coff's the 1 + (ratio == 4)'s (the reference's 304's), the state's
+// row's the 2 x coff * ratio x (coff * kCsa2Latent)'s the fp32's (the
+// kv's plane's + the score's, the C4A's 8 x 1024's the 2 overlapping's
+// windows' the C128A's 128 x 512's the 128-token's ring's). Shared by
+// the constructor's allocation's + the snapshot's bytes's formula's.
+size_t dsv4_tail_state_floats(int ratio) {
+  const int coff = (ratio == 4) ? 2 : 1;
+  return static_cast<size_t>(2) * static_cast<size_t>(coff * ratio) * static_cast<size_t>(coff * kCsa2Latent);
+}
+// The compressor's output width W (the wkv / wgate's width's, the C4A's
+// kCsa2TailW's 1024's the C128A's kCsa2Latent's 512's).
+int dsv4_tail_w(int ratio) { return ((ratio == 4) ? 2 : 1) * kCsa2Latent; }
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // The layer surfaces' configs and scratch formulas (the memory plan's and
@@ -220,15 +239,23 @@ Dsv4Model::Dsv4Model(const Dsv4TextConfig& cfg, const std::string& checkpoint_di
   {
     int c = 0, t = 0;
     for (int l = 0; l < cfg_.max_layer(); ++l) {
-      if (cfg_.compress_ratio(l) > 0) {
+      const int ratio = cfg_.compress_ratio(l);
+      if (ratio > 0) {
         cache_ord_[static_cast<size_t>(l)] = c;
-        cache_ratio_.push_back(cfg_.compress_ratio(l));
+        cache_ratio_.push_back(ratio);
         ++c;
+        // The 0731's Compressor's per-request state (the reference's form's,
+        // the G-c128a-compressor's the closed's): every compressing layer
+        // (the C4A's ratio-4's + the C128A's ratio-128's) owns its tail's
+        // (the checkpoint's kv_state / score_state's), not only the C4A's.
+        tail_ord_[static_cast<size_t>(l)] = t++;
+        tail_ratio_.push_back(ratio);
       }
-      if (cfg_.is_index_layer(l)) tail_ord_[static_cast<size_t>(l)] = t++;
     }
     tails_ = t;
   }
+  tail_off_.assign(static_cast<size_t>(tails_), 0);
+  spec_off_.assign(static_cast<size_t>(tails_), 0);
   // The planar main + index caches (2026-09-19, the dsv4 seam S1b: the no-
   // pool positional state, the dsv41 Csa2StatePool's planes' raw-pointer
   // re-expression): per cache ordinal (kv source), the kFp4Block main
@@ -278,17 +305,35 @@ Dsv4Model::Dsv4Model(const Dsv4TextConfig& cfg, const std::string& checkpoint_di
       Dsv4Csa2Layer::scratch_bytes(csa2_cfg_, max_tokens_, max_cache_tokens_,
                                   std::min(kDecodeRowsCap, max_tokens_), kDecodeSplit, kDotBudget);
   csa2_scratch_ = dev_alloc<char>(csa2_scratch_bytes_);
-  // The ratio-4 (C4A) overlapping compressor's per-request tails (2026-09-18,
-  // the dsv4 dspark + compressor wiring; docs/dsv4_kernel_port_spec.md
-  // §2.1(b)): fp32 [tails_][max_requests][2][tails_w_] (the pending even's
-  // kv (the first W) + the score (the second W), the dsv41
-  // csa2_compress_decode_update's re-expression) + the spec rows' tails (the
-  // rollback's the table's the spec_rows_').
+  // The 0731's Compressor's per-request tails (the 2026-09-18's dsv4 dspark
+  // + compressor wiring's the 2026-09-21's the reference's form's, the
+  // G-c128a-compressor's + the G-tail-cadence / G-tail-pool / G-tail-ape's
+  // the closed's; docs/dsv4_attention_spec.md §5): per compressing layer
+  // (the C4A's + the C128A's), the checkpoint's kv_state / score_state's
+  // (b, coff * ratio, coff * head_dim)'s the fp32's (the kv's plane's the
+  // zero's + the score's the -inf's the reference's 309-310's the cold
+  // start's the publish's the 0's weight's the -inf's rows's) + the spec
+  // rows' tails (the rollback's the table's the spec_rows_'s).
   if (tails_ > 0) {
-    const size_t per_req = static_cast<size_t>(tails_) * 2 * static_cast<size_t>(tails_w_);
-    d_tails_ = dev_alloc<float>(per_req * static_cast<size_t>(max_requests));
-    spec_tails_ = dev_alloc<float>(per_req * static_cast<size_t>(max_decode_rows_));
-    log_memory_ledger("dsv4: the compressor's per-request tails");
+    size_t off = 0, off_spec = 0;
+    for (int t = 0; t < tails_; ++t) {
+      const size_t state_row = dsv4_tail_state_floats(tail_ratio_[static_cast<size_t>(t)]);
+      tail_off_[static_cast<size_t>(t)] = off;
+      off += static_cast<size_t>(max_requests) * state_row;
+      spec_off_[static_cast<size_t>(t)] = off_spec;
+      off_spec += static_cast<size_t>(max_decode_rows_) * state_row;
+    }
+    d_tails_ = dev_alloc<float>(off);
+    spec_tails_ = dev_alloc<float>(off_spec);
+    // The reference's init (the kv_state's zero's + the score_state's the
+    // -inf's, the 309-310's): one block's a request's (the live's + the
+    // spec rows's the same's).
+    for (int t = 0; t < tails_; ++t) {
+      const int64_t n = static_cast<int64_t>(dsv4_tail_state_floats(tail_ratio_[static_cast<size_t>(t)])) / 2;
+      dsv4_compress_tail_init(d_tails_ + tail_off_[static_cast<size_t>(t)], max_requests, n, n, stream_);
+      dsv4_compress_tail_init(spec_tails_ + spec_off_[static_cast<size_t>(t)], max_decode_rows_, n, n, stream_);
+    }
+    log_memory_ledger("dsv4: the compressor's per-request tails (the reference's form's the C4A's 8 x 1024's + the C128A's 128 x 512's)");
   }
   hash_scratch_bytes_ = hash_scratch_bytes(cfg_, tp_world, max_tokens_);
   hash_scratch_ = dev_alloc<char>(hash_scratch_bytes_);
@@ -562,48 +607,62 @@ Dsv4Model::MemoryPlan Dsv4Model::plan_memory(const Dsv4TextConfig& cfg, int max_
 }
 
 size_t Dsv4Model::session_snapshot_bytes(const Dsv4TextConfig& cfg, int, bool) {
-  // The ratio-4 (C4A) overlapping compressor's per-request tails (2026-09-18,
-  // the dsv4 dspark + compressor wiring; the dsv41 csa2_compress_decode_update's
-  // re-expression on the C4A's width, the fp32 [2, kCsa2TailW]'s): the pending
-  // even's kv (the first W = 1024) + the score (the second W = 1024). The
-  // positional rings (the layer scratch's, the slot's the position's) need no
-  // snapshot (a rejected draft's slot is never read by a later query), so the
-  // tails are the only per-request state. W = kCsa2TailW = 1024 (the C4A's
-  // coff x kCsa2Latent; docs/dsv4_attention_spec.md §0.3) — kept in step with
-  // the instance's tails_w_ (the snapshot_state_bytes's the same formula's).
-  size_t tails = 0;
-  for (int l = 0; l < cfg.num_hidden_layers; ++l)
-    if (cfg.is_index_layer(l)) ++tails;
-  return tails * 2 * static_cast<size_t>(kCsa2TailW) * sizeof(float);
+  // The 0731's Compressor's per-request tails (the 2026-09-18's dsv4 dspark
+  // + compressor wiring's the 2026-09-21's the reference's form's, the
+  // G-c128a-compressor's + the G-tail-cadence / G-tail-pool / G-tail-ape's
+  // the closed's; docs/dsv4_attention_spec.md §5): per compressing layer
+  // (the C4A's + the C128A's), the checkpoint's kv_state / score_state's
+  // (coff * ratio, coff * head_dim)'s the fp32's — the C4A's 8 x 1024's the
+  // 2 overlapping's windows' + the C128A's 128 x 512's the 128-token's
+  // ring's. The positional rings (the layer scratch's, the slot's the
+  // position's) need no snapshot (a rejected draft's slot is never read by
+  // a later query), so the tails are the only per-request state.
+  size_t bytes = 0;
+  for (int l = 0; l < cfg.num_hidden_layers; ++l) {
+    const int ratio = cfg.compress_ratio(l);
+    if (ratio > 0) bytes += dsv4_tail_state_floats(ratio) * sizeof(float);
+  }
+  return bytes;
 }
 
 size_t Dsv4Model::snapshot_state_bytes() const {
-  return static_cast<size_t>(tails_) * 2 * static_cast<size_t>(tails_w_) * sizeof(float);
+  size_t bytes = 0;
+  for (int t = 0; t < tails_; ++t) bytes += dsv4_tail_state_floats(tail_ratio_[static_cast<size_t>(t)]) * sizeof(float);
+  return bytes;
 }
 
 void Dsv4Model::reset_slot_state(int req) {
-  if (d_tails_ == nullptr) return;  // no ratio-4 (C4A) layers: no per-request tails
-  const size_t tail_stride = static_cast<size_t>(max_requests_) * 2 * static_cast<size_t>(tails_w_);
-  const size_t per_req = 2 * static_cast<size_t>(tails_w_);
-  for (int t = 0; t < tails_; ++t)
-    DGPP_CUDA_OK(cudaMemsetAsync(d_tails_ + t * tail_stride + static_cast<size_t>(req) * per_req, 0,
-                                 per_req * sizeof(float), stream_));
+  if (d_tails_ == nullptr) return;  // no compressing layers: no per-request tails
+  // The reference's init (the kv_state's zero's + the score_state's the
+  // -inf's, the reference's 309-310's): per ordinal (the C4A's 8 x 1024's
+  // the C128A's 128 x 512's), the request's state's the dsv4_compress_
+  // tail_init's (the kernel's the graph's node's; the reset's the session's
+  // core's the outside's capture's).
+  for (int t = 0; t < tails_; ++t) {
+    const size_t off = tail_off_[static_cast<size_t>(t)];
+    const int64_t n = static_cast<int64_t>(dsv4_tail_state_floats(tail_ratio_[static_cast<size_t>(t)])) / 2;
+    dsv4_compress_tail_init(d_tails_ + off + static_cast<size_t>(req) * 2 * n, 1, n, n, stream_);
+  }
 }
 
 GlmSpecSegments Dsv4Model::spec_segments(int req, int snapshot_row0) const {
   GlmSpecSegments segs;
-  if (d_tails_ == nullptr) return segs;  // no ratio-4 (C4A) layers: no per-request tails
+  if (d_tails_ == nullptr) return segs;  // no compressing layers: no per-request tails
   const auto add = [&](void* dst, const void* snapshots, size_t row_stride, size_t bytes) {
     if (segs.count >= kSpecMaxSegments) throw std::logic_error("spec_segments: too many state families");
     segs.seg[segs.count++] = GlmSpecSegment{dst, snapshots, row_stride, bytes};
   };
-  const size_t per_req = 2 * static_cast<size_t>(tails_w_);
-  const size_t tail_stride = static_cast<size_t>(max_requests_) * per_req;
-  const size_t spec_tail_stride = static_cast<size_t>(max_decode_rows_) * per_req;
-  for (int t = 0; t < tails_; ++t)
-    add(d_tails_ + t * tail_stride + static_cast<size_t>(req) * per_req,
-        spec_tails_ + t * spec_tail_stride + static_cast<size_t>(snapshot_row0) * per_req, per_req * sizeof(float),
-        per_req * sizeof(float));
+  // The per-ordinal's state's (the C4A's 8 x 1024's the 2 overlapping's
+  // windows' the C128A's 128 x 512's the 128-token's ring's the 0731's
+  // reference's form's the G-c128a-compressor's the closed's): the per-
+  // ordinal's per_req's the state_row's (the 2 x coff * ratio x (coff * 512)'s
+  // the fp32's), the tail_off_'s / the spec_off_'s the per-ordinal's offset's.
+  for (int t = 0; t < tails_; ++t) {
+    const size_t per_req = dsv4_tail_state_floats(tail_ratio_[static_cast<size_t>(t)]);
+    add(d_tails_ + tail_off_[static_cast<size_t>(t)] + static_cast<size_t>(req) * per_req,
+        spec_tails_ + spec_off_[static_cast<size_t>(t)] + static_cast<size_t>(snapshot_row0) * per_req,
+        per_req * sizeof(float), per_req * sizeof(float));
+  }
   return segs;
 }
 
@@ -611,12 +670,13 @@ void Dsv4Model::write_state_snapshot(int req, uint8_t* d, int spec_row) {
   if (d_tails_ == nullptr) return;
   const bool live = spec_row < 0;
   const size_t row = live ? 0 : static_cast<size_t>(spec_row);
-  const size_t per_req = 2 * static_cast<size_t>(tails_w_);
-  const size_t tail_stride = static_cast<size_t>(max_requests_) * per_req;
-  const size_t spec_tail_stride = static_cast<size_t>(max_decode_rows_) * per_req;
+  // The per-ordinal's state's copy (the C4A's 8 x 1024's the C128A's 128 x
+  // 512's the 0731's reference's form's the per-ordinal's per_req's the
+  // state_row's the tail_off_'s / the spec_off_'s the offset's).
   for (int t = 0; t < tails_; ++t) {
-    const float* src = live ? d_tails_ + t * tail_stride + static_cast<size_t>(req) * per_req
-                            : spec_tails_ + t * spec_tail_stride + row * per_req;
+    const size_t per_req = dsv4_tail_state_floats(tail_ratio_[static_cast<size_t>(t)]);
+    const float* src = live ? d_tails_ + tail_off_[static_cast<size_t>(t)] + static_cast<size_t>(req) * per_req
+                            : spec_tails_ + spec_off_[static_cast<size_t>(t)] + row * per_req;
     DGPP_CUDA_OK(cudaMemcpyAsync(d, src, per_req * sizeof(float), cudaMemcpyDeviceToDevice, stream_));
     capture_trace_copy("dsv4 write_state_snapshot tail", "D2D", src, d, per_req * sizeof(float), stream_);
     d += per_req * sizeof(float);
@@ -625,12 +685,14 @@ void Dsv4Model::write_state_snapshot(int req, uint8_t* d, int spec_row) {
 
 void Dsv4Model::read_state_snapshot(int req, const uint8_t* s) {
   if (d_tails_ == nullptr) return;
-  const size_t per_req = 2 * static_cast<size_t>(tails_w_);
-  const size_t tail_stride = static_cast<size_t>(max_requests_) * per_req;
+  // The per-ordinal's state's copy (the C4A's 8 x 1024's the C128A's 128 x
+  // 512's the 0731's reference's form's the per-ordinal's per_req's the
+  // state_row's the tail_off_'s the offset's).
   for (int t = 0; t < tails_; ++t) {
-    DGPP_CUDA_OK(cudaMemcpyAsync(d_tails_ + t * tail_stride + static_cast<size_t>(req) * per_req, s,
+    const size_t per_req = dsv4_tail_state_floats(tail_ratio_[static_cast<size_t>(t)]);
+    DGPP_CUDA_OK(cudaMemcpyAsync(d_tails_ + tail_off_[static_cast<size_t>(t)] + static_cast<size_t>(req) * per_req, s,
                                  per_req * sizeof(float), cudaMemcpyDeviceToDevice, stream_));
-    capture_trace_copy("dsv4 read_state_snapshot tail", "D2D", s, d_tails_ + t * tail_stride +
+    capture_trace_copy("dsv4 read_state_snapshot tail", "D2D", s, d_tails_ + tail_off_[static_cast<size_t>(t)] +
                                                             static_cast<size_t>(req) * per_req,
                        per_req * sizeof(float), stream_);
     s += per_req * sizeof(float);
@@ -656,6 +718,7 @@ Dsv4Csa2LayerWeights Dsv4Model::csa2_view(const Dsv4LayerResident& r, int layer)
   w.comp_wkv = a.comp_wkv;
   w.comp_wgate = a.comp_wgate;
   w.comp_norm = a.comp_norm;
+  w.comp_ape = a.comp_ape;  // the APE's (the f32 [ratio, W]'s the score's half's the reference's 303's)
   // The index-key plane: the ratio-4 (C4A) layer's the indexer's own
   // 128-wide rotated compressor's; the ratio-128 (C128A) layer's the main
   // latent's (the compressor's wkv / norm double as the index key's).
@@ -953,20 +1016,20 @@ void Dsv4Model::enqueue_layer(const Dsv4LayerResident& r, int layer, int T, cons
   // row-scale's (the index sources' the C4A's the 64-head selection's the
   // real pointer's, the C128A's the no-index's the nullptr's). The csa2
   // layer's publish_entries's writes the compressor's entries' into them
-  // (the C4A's, the C128A's the separate item's the unpopulated's).
-  // The compressor's per-request tail (the ratio-4's overlapping's, the
+  // (the C4A's + the C128A's the populated's the 0731's reference's form's
+  // the G-c128a-compressor's the closed's).
+  // The compressor's per-request tail (the 0731's reference's form's, the
   // model's d_tails_'s the tail's ordinal's plane's — the dsv41's
   // pool.tails(w_.tail_ord)'s no-pool's re-expression's): the live per-request
   // tails (the main walk's) at this layer's tail ordinal (tail_ord_'s the
   // -1's the SWA-only's / the draft stages' the no-tail's layers'), the
-  // model's tails_w_'s (the C4A's kCsa2TailW's 1024's). The spec rows' tails
-  // (spec_tails_'s the DSpark verify's rollback's) ride the pending's verify's
-  // call site's.
+  // per-ordinal's tail_off_'s (the C4A's 8 x 1024's the C128A's 128 x 512's
+  // the reference's state's) + the per-ordinal's W's (the dsv4_tail_w_'s the
+  // C4A's 1024's the C128A's 512's). The spec rows' tails (spec_tails_'s
+  // the DSpark verify's rollback's) ride the pending's verify's call site's.
   const int tord = tail_ord_[static_cast<size_t>(layer)];
-  float* tails = (tord >= 0 && d_tails_ != nullptr)
-                     ? d_tails_ + static_cast<size_t>(tord) * static_cast<size_t>(max_requests_) * 2 *
-                           static_cast<size_t>(tails_w_)
-                     : nullptr;
+  float* tails = (tord >= 0 && d_tails_ != nullptr) ? d_tails_ + tail_off_[static_cast<size_t>(tord)] : nullptr;
+  const int tails_w = (tord >= 0) ? dsv4_tail_w(tail_ratio_[static_cast<size_t>(tord)]) : 0;
   // The planar main / index cache pointers (2026-09-19, the dsv4 seam S1b's):
   // the main cache's the kv sources' (the ratio > 0's the cord >= 0's) the
   // real pointer's (the main source's attention's the csa2 layer's the
@@ -983,7 +1046,7 @@ void Dsv4Model::enqueue_layer(const Dsv4LayerResident& r, int layer, int T, cons
                             : nullptr;
   float* index_scale = (index_cache != nullptr) ? index_scale_[static_cast<size_t>(cord)] : nullptr;
   csa2_->enqueue_decode(x_, main_cache, index_cache, index_scale, rows.req_ids, rows.pos, rows.spans, rows.num_requests,
-                       T, attn_out, stream_, nullptr, tails, tails_w_);
+                       T, attn_out, stream_, nullptr, tails, tails_w);
   // The DSpark union attention (2026-09-20, the dsv4 S3's union-attn's
   // q-latent's + the block-kv's wiring's; the dsv4_dspark_union_attn's the
   // 3-phase's single softmax's over [compressed | raw ring | block]'s):

@@ -34,26 +34,42 @@ dgpp::Dsv4TextConfig release_config() {
 }  // namespace
 
 DGPP_TEST(dsv4_model_session_snapshot_bytes_the_c4a_tail_width) {
-  // The model/state's level's W = 1024's pin (the csa2 fixture's the C4A
-  // oracle's the same's the W's, the checkpoint's kv_state / score_state's
-  // (b, 8, 1024)'s the same's the row's width's): the per-request tail's the
-  // [2, W]'s (the pending even's kv (the first W) + the score (the second
-  // W)), the session's snapshot's the tails' bytes's (the only per-request
-  // state's, the positional rings' the no-snapshot's).
+  // The model/state's level's per-ordinal tail's bytes' pin (the 2026-09-21's
+  // the 0731's reference's form's the G-c128a-compressor's + the G-tail-
+  // cadence / G-tail-pool / G-tail-ape's the closed's, docs/dsv4_attention_
+  // spec.md §5): the per-request tail's the checkpoint's kv_state /
+  // score_state's (coff * ratio, coff * head_dim)'s the fp32's — the C4A's
+  // (ratio 4's coff 2's) the 8 x 1024's the 2 overlapping's windows' the
+  // C128A's (ratio 128's coff 1's) the 128 x 512's the 128-token's ring's —
+  // the session's snapshot's the tails' bytes's (the only per-request
+  // state's, the positional rings' the no-snapshot's). The C4A geometry's
+  // (the release's ratio-4 backbone layers) pins the 8 x 1024's + the C128A's
+  // (the release's ratio-128 backbone layers) the 128 x 512's at the
+  // model/state's level's (the csa2 fixture's the C4A oracle's the same's
+  // the W's). Host-only, no GPU: the test calls only the static
+  // session_snapshot_bytes' (a pure host function's), no CUDA initialization
+  // (the dsv4_csa2_oracle_test's the same's the pattern's — it links the v4
+  // model's library's but calls only host's the functions's).
   const dgpp::Dsv4TextConfig cfg = release_config();
-  int tails = 0;
-  for (int l = 0; l < cfg.num_hidden_layers; ++l)
-    if (cfg.is_index_layer(l)) ++tails;
-  require(tails > 0, "the release's has ratio-4 (C4A) layers (the tail's the state's)");
-  // W = 1024 (the C4A's kCsa2TailW's the coff x kCsa2Latent's 2 x 512's,
-  // the spec's §0.3's resolution's — NOT the dsv41's kCsa2Latent's 512's):
-  // the per-request tail's the [2, W]'s the 2 W's the kv + the score's
-  // the planes's.
-  const size_t want = static_cast<size_t>(tails) * 2 * 1024 * sizeof(float);
+  int c4a = 0, c128a = 0;
+  for (int l = 0; l < cfg.num_hidden_layers; ++l) {
+    const int ratio = cfg.compress_ratio(l);
+    if (ratio == 4) ++c4a;
+    if (ratio == 128) ++c128a;
+  }
+  require(c4a > 0, "the release's has ratio-4 (C4A) layers (the tail's the state's)");
+  require(c128a > 0, "the release's has ratio-128 (C128A) layers (the tail's the state's the G-c128a's the closed's)");
+  // The per-ordinal's state's (the checkpoint's kv_state / score_state's
+  // (coff * ratio, coff * head_dim)'s the fp32's): the C4A's 2 x 8 x 1024's
+  // the 2 overlapping's windows' the C128A's 2 x 128 x 512's the 128-token's
+  // ring's.
+  const size_t c4a_bytes = static_cast<size_t>(2) * 8 * 1024 * sizeof(float);  // the C4A's 8 x 1024's
+  const size_t c128a_bytes = static_cast<size_t>(2) * 128 * 512 * sizeof(float);  // the C128A's 128 x 512's
+  const size_t want = static_cast<size_t>(c4a) * c4a_bytes + static_cast<size_t>(c128a) * c128a_bytes;
   const size_t got = dgpp::Dsv4Model::session_snapshot_bytes(cfg, 2, false);
   require(got == want,
-          "session_snapshot_bytes must pin W = 1024 (the C4A's kCsa2TailW's), got " + std::to_string(got) +
-              " want " + std::to_string(want));
+          "session_snapshot_bytes must pin the per-ordinal's tail's (the C4A's 8 x 1024's + the C128A's 128 x 512's), got " +
+              std::to_string(got) + " want " + std::to_string(want));
 }
 
 DGPP_TEST(dsv4_model_union_attn_out_bytes_the_dspark_64_head_shape) {

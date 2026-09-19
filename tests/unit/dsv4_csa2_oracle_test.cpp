@@ -557,6 +557,115 @@ DGPP_TEST(dsv4_csa2_compressor_compress_record) {
   }
 }
 
+// The C128A's (ratio 128's coff 1's W 512's) the 128-entry's gated pool's
+// the record's form (the G-c128a-compressor's the closed's the 0731's
+// C128A's the reference's the gated's pool's the Vision-Exp's plain's NOT's
+// the checkpoint's, the spec's §5's open item 3's the resolved's): a
+// 128-token's state store's (the p = 0..127's the identity's table's the
+// bs = 8's the 16's blocks's) + the boundary's compress's at p = 127's
+// ((127 + 1) % 128 == 0's the group's the 128's entries' x 512's the
+// reference's 362-365's the plain's branch's the 128-entry's the direct's
+// gather's the head_off's 0's the coff 1's). Verify the 584 B record's
+// layout + the pooled value against an INDEPENDENT max-shift softmax's
+// (the 128-entry's the dim-major's the different's loop's) + the APE's the
+// score's half's only's (the p % 128's the 128's the ring's the full's
+// coverage's).
+DGPP_TEST(dsv4_csa2_c128a_compress_record) {
+  const int ratio = 128, W = 512, bs = 8, K = 512, n = 128;
+  std::vector<double> x, wkv, wgate;
+  std::vector<uint8_t> xs, wks, wgs;
+  fill_plane(&x, &xs, n, K, 0x1122);
+  fill_plane(&wkv, &wks, W, K, 0x3344);
+  fill_plane(&wgate, &wgs, W, K, 0x5566);
+  std::vector<double> ape(static_cast<size_t>(ratio) * W, 0.25);
+  std::vector<int> positions(n), block_table(n / bs);
+  for (int t = 0; t < n; ++t) {
+    positions[t] = t;
+    block_table[t / bs] = t / bs;
+  }
+  const auto state = compressor_state_store(x, xs, wkv, wks, wgate, wgs, ape, positions, block_table, n / bs, W, bs, ratio, K);
+  // The cos_sin table (the group-start position 0: (127 / 128) * 128 = 0's).
+  const int gpos = (127 / ratio) * ratio;  // 0
+  std::vector<double> cos_sin(static_cast<size_t>(gpos + 1) * 64);
+  for (int p = 0; p <= gpos; ++p)
+    for (int j = 0; j < 32; ++j) {
+      const double ang = static_cast<double>(p) * (0.01 * (j + 1));  // a deterministic table
+      cos_sin[static_cast<size_t>(p) * 64 + j] = std::cos(ang);
+      cos_sin[static_cast<size_t>(p) * 64 + 32 + j] = std::sin(ang);
+    }
+  std::vector<uint16_t> rms_w(512, 0x3F80);  // bf16 1.0
+  const CmpCfg cfg{ratio};
+  const auto rec = compressor_compress(state, block_table, 127, cos_sin, rms_w, 1e-6, cfg);
+  // Layout invariants: the record's 584 B's the pad's 0's the 7's scale's
+  // bytes' the finite's (the no-NaN's the sentinel's).
+  if (rec.size() != kRecordBytes) throw std::runtime_error("the c128a record is not 584 B");
+  if (rec[583] != 0) throw std::runtime_error("the c128a record's pad byte is not zero");
+  for (int g = 0; g < kNoPEGroups; ++g)
+    if (rec[576 + g] == 255) throw std::runtime_error("a c128a record scale byte is the NaN sentinel");
+  // Decode the record's latent + cross-check the NoPE 448 against an
+  // INDEPENDENT recompute (the 128-entry's x 512's pool's the per-dim's
+  // max-shift's the reversed's the loop's order's the different's + the
+  // global's RMSNorm's the bf16's round-trip's) from the state's: the
+  // record's NoPE dequant's must equal the bf16-rounded normed's within one
+  // e4m3 quantum (the quant's documented budget's).
+  std::vector<double> lat(kHeadDim);
+  record_latent(rec.data(), lat.data());
+  const int start = 127 - cfg.n_gather() + 1;  // 0
+  std::vector<double> pooled(512, 0.0);
+  for (int d = 0; d < 512; ++d) {
+    double M = -std::numeric_limits<double>::infinity();
+    for (int i = 0; i < cfg.n_gather(); ++i) {
+      const int pos_i = start + i;
+      if (pos_i < 0) continue;
+      const double* row = state.data() + static_cast<size_t>(block_table[pos_i / bs]) * bs * 2 * W +
+                          static_cast<size_t>(pos_i % bs) * 2 * W;  // the head_off's 0's (the coff 1's)
+      M = std::max(M, row[W + d]);
+    }
+    double L = 0.0, A = 0.0;
+    for (int i = 0; i < cfg.n_gather(); ++i) {
+      const int pos_i = start + i;
+      if (pos_i < 0) continue;
+      const double* row = state.data() + static_cast<size_t>(block_table[pos_i / bs]) * bs * 2 * W +
+                          static_cast<size_t>(pos_i % bs) * 2 * W;
+      const double w = std::exp(row[W + d] - M);
+      L += w;
+      A += w * row[d];
+    }
+    pooled[static_cast<size_t>(d)] = A / L;
+  }
+  double mean = 0.0;
+  for (int d = 0; d < 512; ++d) mean += pooled[static_cast<size_t>(d)] * pooled[static_cast<size_t>(d)];
+  const double rsqrt = 1.0 / std::sqrt(mean / 512.0 + 1e-6);
+  // The bf16-rounded normed NoPE (the assemble_record's quant's input's the
+  // bf16's round-trip's the parity's step's) + the per-group's absmax's (the
+  // e4m3's scale's the group's the 64's dims' share's one's power-of-two's
+  // the assemble_record's the amax's the 1e-4's floor's).
+  std::vector<double> normed(512), normed_bf16(512);
+  for (int d = 0; d < 512; ++d) {
+    normed[static_cast<size_t>(d)] = pooled[static_cast<size_t>(d)] * rsqrt;  // rms_w is bf16 1.0
+    normed_bf16[static_cast<size_t>(d)] = bf16_to_d64(float_to_bf16_bits(static_cast<float>(normed[static_cast<size_t>(d)])));
+  }
+  std::vector<double> group_amax(kNoPEGroups, 1e-4);
+  for (int g = 0; g < kNoPEGroups; ++g)
+    for (int i = 0; i < kGroupEls; ++i)
+      group_amax[static_cast<size_t>(g)] = std::max(group_amax[static_cast<size_t>(g)], std::fabs(normed_bf16[static_cast<size_t>(g * kGroupEls + i)]));
+  for (int d : {0, 128, 320, 447}) {  // the NoPE dims (the RoPE 64 are rotated)
+    const double want = normed_bf16[static_cast<size_t>(d)];
+    const double got = lat[static_cast<size_t>(d)];
+    // The e4m3's quant's budget's the group's the 64's dims' share's one's
+    // power-of-two's scale's the small's values' the coarser's the grid's:
+    // the absmax's / 8's (the one's quantum's the group's the amax's the
+    // assemble_record's the documented's the error's the amax's / 14's the
+    // the bound's the half's the ULP's the 32's the top's binade's the sc's
+    // the 2 x amax's / 448's the upper's).
+    const double tol = group_amax[static_cast<size_t>(d / kGroupEls)] / 8.0;
+    if (std::fabs(want - got) > tol)
+      throw std::runtime_error("c128a compress: the NoPE dequant diverged from the independent normed value at d=" +
+                               std::to_string(d) + " (want " + std::to_string(want) + ", got " + std::to_string(got) +
+                               ", tol " + std::to_string(tol) + ")");
+  }
+}
+
 DGPP_TEST(dsv4_indexer_q_fused_fold) {
   // The 64-term weight fold + the per-row fp8 quant: the q-scale is the
   // row's amax (the 1e-4 floor) / 448, and the dequant(code) * scale
