@@ -227,6 +227,17 @@ void WeightPrefetcher::add(const void* ptr, size_t bytes) {
   pending_end_ = b + take;
 }
 
+void WeightPrefetcher::add_isolated(const void* ptr, size_t bytes) {
+  if (!enabled_ || !window_open_ || rate_ == PrefetchRate::Off || ptr == nullptr || bytes == 0)
+    return;
+  const size_t take = std::min(bytes, remaining_);
+  if (take == 0) return;
+  remaining_ -= take;
+  flush_pending();  // nothing pending may grow into this range, nor this range into the next add
+  launch_l2_prefetch(ptr, take, rate_, side_);
+  ++launches_;
+}
+
 void WeightPrefetcher::prefetch_after(cudaStream_t main, const void* ptr,
                                       size_t bytes, size_t budget_bytes,
                                       PrefetchRate rate) {

@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "common/base64.hpp"
+#include "common/bf16_residency.hpp"
 #include "common/log.hpp"
 #include "kernels/latent_format.hpp"
 #include "loaders/minijson.hpp"
@@ -375,6 +376,8 @@ std::string encode_journal_settings(const WorldSettings& s) {
   append_json_string(&out, s.ngram_table);
   out += ",\"dw\":";
   append_json_string(&out, s.dense_weights);
+  out += ",\"bfw\":";
+  append_json_string(&out, s.bf16_weights);
   out += ",\"pf\":";
   append_json_string(&out, s.prefill);
   // The opt-in YaRN ramp: absent when off, so a record from a plain run
@@ -534,6 +537,8 @@ JournalRecord decode_journal_line(std::string_view line) {
     // Records before 2026-09-10 carry no table residency: resident.
     if (const dgpp::minijson::Value* ngt = v.find("ngt")) s.ngram_table = std::string(ngt->as_string());
     if (const dgpp::minijson::Value* dw = v.find("dw")) s.dense_weights = std::string(dw->as_string());
+    // The bf16 weights' form (2026-09-19): records before it carry none.
+    if (const dgpp::minijson::Value* bfw = v.find("bfw")) s.bf16_weights = std::string(bfw->as_string());
     // Records before 2026-09-14 carry no prefill mode: bounded.
     if (const dgpp::minijson::Value* pf = v.find("pf")) s.prefill = std::string(pf->as_string());
     // Records without the rope ramp key carry none: the plain table
@@ -577,6 +582,7 @@ JournalRecord decode_journal_line(std::string_view line) {
         !latent_format_from_string(s.kv_dtype) ||
         (s.ngram_table != "resident" && s.ngram_table != "mmap") ||
         (s.dense_weights != "checkpoint" && s.dense_weights != "fp8") ||
+        !parse_bf16_residency(s.bf16_weights, nullptr) ||
         (s.prefill != "bounded" && s.prefill != "exact") ||
         (s.embed_sharding != "replicated" && s.embed_sharding != "vocab"))
       throw std::runtime_error("journal: settings record with impossible values");

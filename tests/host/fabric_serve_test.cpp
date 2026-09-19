@@ -459,6 +459,7 @@ void test_journal_codec() {
     ws.stats_interval_s = 0.1;
     ws.reasoning_in_content = true;
     ws.kv_dtype = "fp8";
+    ws.bf16_weights = "bf12";
     // The opt-in rope knob rides the record: a peer that ran without it
     // would rope at different frequencies from rank 0 — silently
     // divergent text, the reason the settings record exists at all.
@@ -506,6 +507,23 @@ void test_journal_codec() {
         refused_dtype = true;
       }
       require(refused_dtype, "codec: a settings record with an unknown kv dtype is refused");
+    }
+    {
+      // The bf16 weights' form rides by name too.
+      dgpp::serve::WorldSettings bad = ws;
+      bad.bf16_weights = "int8";
+      bool refused_form = false;
+      try {
+        (void)dgpp::serve::decode_journal_line(dgpp::serve::encode_journal_settings(bad));
+      } catch (const std::runtime_error&) {
+        refused_form = true;
+      }
+      require(refused_form, "codec: a settings record with an unknown bf16 weight form is refused");
+      // Both forms resident: its own name on the wire.
+      dgpp::serve::WorldSettings both = ws;
+      both.bf16_weights = "bf12+bf16";
+      require(dgpp::serve::decode_journal_line(dgpp::serve::encode_journal_settings(both)).world_settings == both,
+              "codec: the bf12+bf16 form round-trips");
     }
     bool refused = false;
     try {

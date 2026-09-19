@@ -251,10 +251,12 @@ struct Glm4LoaderFamily::Builder : WeightBuilder<Glm4ExpectedTensor> {
     a.kv_head_begin = geo.kv_head_begin;
     const int64_t q0 = static_cast<int64_t>(geo.head_begin) * d, qn = static_cast<int64_t>(geo.local_heads) * d;
     const int64_t k0 = static_cast<int64_t>(geo.kv_head_begin) * d, kn = static_cast<int64_t>(geo.local_kv_heads) * d;
-    a.q_proj = load_bf16_rows(p + "q_proj.weight", q0, qn);
-    a.k_proj = load_bf16_rows(p + "k_proj.weight", k0, kn);
-    a.v_proj = load_bf16_rows(p + "v_proj.weight", k0, kn);
-    a.o_proj = load_bf16_cols(p + "o_proj.weight", q0, qn);
+    // Packable: the model's 12-bit companions replace the four projections
+    // (WeightBuilder::grant_bf16 — aside under bf12-only residency).
+    a.q_proj = load_bf16_rows(p + "q_proj.weight", q0, qn, /*packable=*/true);
+    a.k_proj = load_bf16_rows(p + "k_proj.weight", k0, kn, /*packable=*/true);
+    a.v_proj = load_bf16_rows(p + "v_proj.weight", k0, kn, /*packable=*/true);
+    a.o_proj = load_bf16_cols(p + "o_proj.weight", q0, qn, /*packable=*/true);
     if (cfg.attention_bias) {
       a.q_bias = load_bf16_rows(p + "q_proj.bias", q0, qn);
       a.k_bias = load_bf16_rows(p + "k_proj.bias", k0, kn);
@@ -321,7 +323,7 @@ struct Glm4LoaderFamily::Builder : WeightBuilder<Glm4ExpectedTensor> {
     if (is_mtp) {
       out.enorm = load_bf16(p + "enorm.weight");
       out.hnorm = load_bf16(p + "hnorm.weight");
-      out.eh_proj = load_bf16(p + "eh_proj.weight");
+      out.eh_proj = load_bf16(p + "eh_proj.weight", /*packable=*/true);
       out.shared_head_norm = load_bf16(p + "shared_head.norm.weight");
     }
     out.input_norm = load_bf16(p + "input_layernorm.weight");
@@ -445,6 +447,13 @@ size_t Glm4LoaderFamily::globals_bytes(const Glm4TextConfig& cfg, int rank, int 
   return b;
 }
 
+size_t Glm4LoaderFamily::globals_side_bytes(const Glm4TextConfig& cfg, int rank, int world,
+                                            LoaderHeadSharding head) {
+  const int count = Glm4LocalGeometry::from_config(cfg, rank, world, head).lm_vocab_count;
+  if (!bf12_shape_ok(count, cfg.hidden_size)) return 0;
+  return align_up_256(static_cast<size_t>(count) * static_cast<size_t>(cfg.hidden_size) * 2);
+}
+
 void Glm4LoaderFamily::build_globals(const Glm4TextConfig& cfg, const Glm4LocalGeometry& geo,
                                      const LoaderTensorMap& tensors, LayerBump& bump,
                                      Glm4GlobalsResident& out, uint64_t& source_bytes,
@@ -468,7 +477,10 @@ void Glm4LoaderFamily::build_globals(const Glm4TextConfig& cfg, const Glm4LocalG
   const TensorInfo& t = lookup("lm_head.weight");
   const size_t row_bytes = static_cast<size_t>(cfg.hidden_size) * 2;
   const int begin = geo.lm_vocab_begin, count = geo.lm_vocab_count;
-  uint16_t* dst = static_cast<uint16_t*>(bump.alloc(static_cast<size_t>(count) * row_bytes));
+  // The head is packable (the model's 12-bit companion replaces it).
+  uint16_t* dst = static_cast<uint16_t*>(bf12_shape_ok(count, cfg.hidden_size)
+                                             ? bump.alloc_side(static_cast<size_t>(count) * row_bytes)
+                                             : bump.alloc(static_cast<size_t>(count) * row_bytes));
   std::memcpy(bump.host(dst), static_cast<const uint8_t*>(t.data) + static_cast<size_t>(begin) * row_bytes,
               static_cast<size_t>(count) * row_bytes);
   source_bytes += static_cast<size_t>(count) * row_bytes;

@@ -249,6 +249,10 @@ class GlmLayerStream {
   // what the image stores; the round-trip test compares it bitwise.
   // {nullptr, 0} when the layer is not materialized.
   std::pair<const void*, size_t> resident_layer_span(int layer) const;
+  // A resident layer's bytes in grant order — the staging mirror's and the
+  // image's layout, whatever the device placement (side grants included;
+  // all of them must still be mapped). `dst` holds layer_bytes. Synchronous.
+  void copy_resident_layer(int layer, void* dst) const;
 
   // Exact device bytes load_layer will use for a layer — the same formula
   // that sizes the bump; load_layer throws if actual usage ever differs,
@@ -275,6 +279,21 @@ class GlmLayerStream {
   static size_t resident_bytes(const GlmTextConfig& cfg, int rank = 0,
                                 int world = 1,
                                 GlmHeadSharding head = GlmHeadSharding::Full);
+
+  // bf12-only residency (common/bf16_residency.hpp): of the bytes above,
+  // the packable bf16 matrices — the KDA projections, the draft's eh_proj,
+  // the lm head — that a resident stream grants ASIDE (LayerBump) and the
+  // model returns once their 12-bit companions exist (release_packed).
+  static size_t layer_side_bytes(const GlmTextConfig& cfg, int layer, int rank = 0, int world = 1);
+  static size_t globals_side_bytes(const GlmTextConfig& cfg, int rank = 0, int world = 1,
+                                   GlmHeadSharding head = GlmHeadSharding::Full);
+  static size_t side_bytes(const GlmTextConfig& cfg, int rank, int world, GlmHeadSharding head,
+                           bool with_mtp);
+  bool side_grants() const { return side_grants_; }
+  // Returns a packed matrix's bf16 bytes to the device (layer < 0: the
+  // globals'). 0 when `weight` was not granted aside. Nothing outstanding
+  // may read it.
+  size_t release_packed(int layer, const void* weight);
 
   // Registers the stream whose kernels READ resident layers (the model's
   // compute stream). When set, load boundaries synchronize only that
@@ -326,6 +345,7 @@ class GlmLayerStream {
   uint64_t verbatim_bytes_ = 0;
   bool sources_released_ = false;
   bool resident_mtp_ = false;
+  bool side_grants_ = false;  // packable matrices load into releasable ranges
   std::string checkpoint_dir_;
   std::unique_ptr<GlmResidentImage> image_;  // resident mode, when configured
   int image_restored_ = 0;

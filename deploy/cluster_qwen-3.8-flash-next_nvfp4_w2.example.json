@@ -5,6 +5,7 @@
     "max_concurrency": 4,
     "kv_capacity": 262144,
     "kv_dtype": "bf16",
+    "bf16_weights": "bf12+bf16",
     "ngram_table": "mmap",
     "default_max_tokens": 256,
     "queue_limit": 8,

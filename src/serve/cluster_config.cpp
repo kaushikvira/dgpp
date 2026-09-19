@@ -1,4 +1,5 @@
 #include "serve/cluster_config.hpp"
+
 #include <arpa/inet.h>
 
 #include <cmath>
@@ -8,6 +9,7 @@
 #include <sstream>
 #include <stdexcept>
 
+#include "common/bf16_residency.hpp"
 #include "kernels/latent_format.hpp"
 #include "loaders/minijson.hpp"
 
@@ -178,6 +180,11 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
           e.dense_weights = text(x, ek, what);
           if (e.dense_weights != "checkpoint" && e.dense_weights != "fp8")
             fail(what, "'" + ek + "' must be \"checkpoint\" or \"fp8\"");
+        }
+        else if (p.key == "bf16_weights") {
+          e.bf16_weights = text(x, ek, what);
+          if (!parse_bf16_residency(e.bf16_weights, nullptr))
+            fail(what, "'" + ek + "' must be \"checkpoint\", \"bf12\" or \"bf12+bf16\"");
         }
         else if (p.key == "prefill") {
           e.prefill = text(x, ek, what);

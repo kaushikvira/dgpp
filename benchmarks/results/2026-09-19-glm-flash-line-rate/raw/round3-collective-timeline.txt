@@ -1,0 +1,15 @@
+# rank 0's collective timeline per arm (DGPP_BUS_TIMELINE=1, scripts/bus_window_skew.py), four-node GLM-5.3-Flash.
+# C1-only arms (16 KiB rows): gate_seq = DGPP_BUS_GATE=sequential, tl_final = the interleaved gate as shipped.
+# C4-only arms (64 KiB rows, past the staging budget): c4_seq / c4_int.
+gate_seq: rank 0: 711 windows | per collective (median of window avgs, us): total 40.9 = copy 3.6 + handshake 15.3 + skew 16.4 + fold 5.5; engine post 3.2; max skew 68; compute between gens 298.0
+gate_seq:         claim 1->2: gap 8.2 us avg; % <3/<5/<7/<10/<15/<25/>=25 us: [0, 25, 21, 41, 6, 3, 4]
+gate_seq:         claim 2->3: gap 8.8 us avg; % <3/<5/<7/<10/<15/<25/>=25 us: [0, 36, 27, 22, 4, 4, 6]
+tl_final: rank 0: 711 windows | per collective (median of window avgs, us): total 35.5 = copy 3.5 + handshake 14.3 + skew 13.8 + fold 3.8; engine post 3.0; max skew 69; compute between gens 298.9
+tl_final:         claim 1->2: gap 6.7 us avg; % <3/<5/<7/<10/<15/<25/>=25 us: [29, 9, 34, 16, 6, 2, 4]
+tl_final:         claim 2->3: gap 8.2 us avg; % <3/<5/<7/<10/<15/<25/>=25 us: [35, 11, 29, 8, 5, 5, 7]
+c4_seq: rank 0: 1489 windows | per collective (median of window avgs, us): total 73.2 = copy 5.0 + handshake 34.9 + skew 20.9 + fold 12.3; engine post 7.1; max skew 65; compute between gens 616.1
+c4_seq:         claim 1->2: gap 10.8 us avg; % <3/<5/<7/<10/<15/<25/>=25 us: [0, 5, 10, 43, 27, 13, 2]
+c4_seq:         claim 2->3: gap 12.4 us avg; % <3/<5/<7/<10/<15/<25/>=25 us: [0, 10, 23, 36, 17, 7, 6]
+c4_int: rank 0: 1471 windows | per collective (median of window avgs, us): total 73.6 = copy 5.0 + handshake 33.8 + skew 18.1 + fold 16.6; engine post 6.9; max skew 60; compute between gens 617.4
+c4_int:         claim 1->2: gap 9.8 us avg; % <3/<5/<7/<10/<15/<25/>=25 us: [20, 1, 7, 31, 24, 15, 2]
+c4_int:         claim 2->3: gap 10.7 us avg; % <3/<5/<7/<10/<15/<25/>=25 us: [36, 1, 12, 22, 14, 8, 7]

@@ -79,6 +79,23 @@ class WeightPrefetcher {
   // at the next open_window(), or at join(). DGPP_L2_PREFETCH_MERGE=off
   // restores one launch per add.
   void add(const void* ptr, size_t bytes);
+  // add() for a range that is its OWN allocation (a bf16 weight's packed
+  // companion — IGemm::resident_view — not a span of the layer's image): it
+  // never joins a pending range and nothing joins it. The coalescing bridges
+  // holes of up to kMergeGap between adds, which is a read of whatever lies
+  // between them — a layer's neighbouring tensors inside one image, but
+  // between two allocations a hole can be unmapped (a released bf16 range,
+  // loaders/releasable_range.hpp, stays reserved and unreadable; a
+  // neighbouring image's edge is an out-of-bounds read, compute-sanitizer
+  // 2026-09-09). One launch of its own.
+  void add_isolated(const void* ptr, size_t bytes);
+  // The matmul weight `weight` through its resident view: add() when the
+  // view is the weight itself (its image's span), add_isolated() when it is
+  // a companion.
+  void add_view(const void* weight, const void* view, size_t view_bytes) {
+    if (view == weight) add(view, view_bytes);
+    else add_isolated(view, view_bytes);
+  }
   // open_window + add in one call — the layers' idiom.
   void prefetch_after(cudaStream_t main, const void* ptr, size_t bytes,
                       size_t budget_bytes = 0,

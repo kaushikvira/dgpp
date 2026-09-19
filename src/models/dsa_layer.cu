@@ -616,7 +616,8 @@ void DsaLayer::attend_dense(DsaStatePool& state, int layer,
 
 void DsaLayer::enqueue_prefill(const void* hidden_in, DsaStatePool& state,
                                int layer, int req, int64_t token_start,
-                               int tokens, void* out, cudaStream_t stream, int row_base) {
+                               int tokens, void* out, cudaStream_t stream, int row_base,
+                               bool state_only) {
   validate_pool(state, layer);
   if (tokens <= 0 || tokens > max_tokens_)
     throw std::invalid_argument("dsa layer: token count out of range");
@@ -682,6 +683,7 @@ void DsaLayer::enqueue_prefill(const void* hidden_in, DsaStatePool& state,
 
   if (reuse) {
     dot_stride_last_ = 0;
+    if (state_only) return;
   } else {
   // Complete pools fully inside this chunk -> compressed index cache.
   const int64_t pool_lo = token_start / kpool;
@@ -696,6 +698,8 @@ void DsaLayer::enqueue_prefill(const void* hidden_in, DsaStatePool& state,
   // Tail ring: the last kpool tokens of the request so far.
   dsa_kpool_tail_seed(k_rows_, dim, gate_rows, dim, req_ids_dev_, pos_dev_,
                       tokens, state.tail(layer), kpool, dim, stream);
+  // The rows' state is complete here; the rest computes their output.
+  if (state_only) return;
 
   // Selection + attention over dot tiles. The gather is per-chunk (every
   // tile reads the same pools); only the dot buffer is per-tile.
@@ -814,10 +818,18 @@ void DsaLayer::enqueue_decode(const void* hidden_in, DsaStatePool& state,
   if (prefetch) {
     prefetch->open_window(stream, size_t{16} << 20, prefetch->layer_rate());
     prefetch->add(w_.kv_b, kv_b_bytes());  // absorb_q and vout read it first
-    prefetch->add(w_.packed_int() ? static_cast<const void*>(w_.o_proj_p.packed)
-                  : w_.quantized() ? static_cast<const void*>(w_.o_proj_q.payload)
-                                   : w_.o_proj,
-                  o_proj_bytes());
+    if (w_.packed_int() || w_.quantized()) {
+      prefetch->add(w_.packed_int() ? static_cast<const void*>(w_.o_proj_p.packed)
+                                    : static_cast<const void*>(w_.o_proj_q.payload),
+                    o_proj_bytes());
+    } else {
+      // A bf16 o_proj: the bytes the rows' launch streams (its packed
+      // companion's when the GEMM holds one — kernels/bf12_gemv.hpp).
+      const void* view = nullptr;
+      size_t view_bytes = 0;
+      gemm_.resident_view(w_.o_proj, o_proj_bytes(), tokens, &view, &view_bytes);
+      prefetch->add_view(w_.o_proj, view, view_bytes);  // a companion is its own allocation
+    }
   }
 
   // Latent rows first (this batch's own tokens are readable by this

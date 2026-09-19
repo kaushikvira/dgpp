@@ -1,0 +1,116 @@
+[
+  {
+    "words": 1600,
+    "prompt_sha256": "92ca08d36dd14a69228bc3888f8aedcd92a215222284a03c60fd296d9b49233f",
+    "data_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+    "wall_s": 8.870015664026141,
+    "prefill_ms": 3928.2,
+    "response": {
+      "id": "chatcmpl-73b0bd2c8bcd6424",
+      "object": "chat.completion",
+      "created": 1789839601,
+      "model": "HawkBearPig/GLM-5.3-Flash-NVFP4-FP8",
+      "system_fingerprint": null,
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "The user wants me to summarize the mathematical topics in ten paragraphs. The prompt contains a long list of grade-school math word problems (these look like GSM8K-style problems). The task: \"Summarize the mathematical topics below in ten paragraphs.\"\n\nSo I need to write ten paragraphs summarizing the mathematical topics/concepts covered in these problems. Let me identify the topics:\n\n1. Arithmetic operations (addition, subtraction, multiplication, division)\n2. Percentages (discounts, increases, decreases, percent of a whole)\n3. Rates and ratios (speed/distance/time, unit rates, age ratios)\n4. Money and commerce",
+            "refusal": null
+          },
+          "logprobs": null,
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 2066,
+        "completion_tokens": 128,
+        "total_tokens": 2194,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 128
+        }
+      }
+    }
+  },
+  {
+    "words": 6000,
+    "prompt_sha256": "0526198593813368e206cd25da183e167329f63e31339b2f6dcf50f068c7273e",
+    "data_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+    "wall_s": 13.521516038978007,
+    "prefill_ms": 9515.3,
+    "response": {
+      "id": "chatcmpl-73b0bd2c8bcd6425",
+      "object": "chat.completion",
+      "created": 1789839610,
+      "model": "HawkBearPig/GLM-5.3-Flash-NVFP4-FP8",
+      "system_fingerprint": null,
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "The user wants me to summarize the mathematical topics in ten paragraphs. The text is a huge collection of grade-school math word problems (GSM8K-style problems). The user says \"GLM prefill validation 6000\" \u2014 this seems like some kind of test prompt, possibly a prefill validation. The instruction: \"Summarize the mathematical topics below in ten paragraphs.\"\n\nSo I need to write a ten-paragraph summary of the mathematical topics covered in these word problems. The problems cover arithmetic, percentages, ratios, rates, geometry (volume), unit conversions, algebra (linear equations), averages, proportions, etc.\n\nI should",
+            "refusal": null
+          },
+          "logprobs": null,
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 7568,
+        "completion_tokens": 128,
+        "total_tokens": 7696,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 128
+        }
+      }
+    }
+  },
+  {
+    "words": 24000,
+    "prompt_sha256": "606c097d381ee2ecf308552b6673f0329e998ae0b6bf10cd1dfb4f1ec24da290",
+    "data_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+    "wall_s": 45.391191936971154,
+    "prefill_ms": 40189.8,
+    "response": {
+      "id": "chatcmpl-73b0bd2c8bcd6426",
+      "object": "chat.completion",
+      "created": 1789839624,
+      "model": "HawkBearPig/GLM-5.3-Flash-NVFP4-FP8",
+      "system_fingerprint": null,
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "Let me analyze this task. The user wants me to summarize the mathematical topics in ten paragraphs. The content is a huge collection of grade-school arithmetic word problems (GSM8K-style problems). The user asks: \"Summarize the mathematical topics below in ten paragraphs.\"\n\nSo I need to write ten paragraphs summarizing the mathematical topics covered in these word problems. Let me identify the topics:\n\n1. Basic arithmetic operations (addition, subtraction, multiplication, division)\n2. Money and financial calculations (costs, profits, discounts, taxes, interest, salaries, wages, budgeting)\n3. Rates, speeds, distance, time",
+            "refusal": null
+          },
+          "logprobs": null,
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 30182,
+        "completion_tokens": 128,
+        "total_tokens": 30310,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 128
+        }
+      }
+    }
+  }
+]

@@ -31,6 +31,12 @@
 //   static size_t min_staging_bytes();          // a floor on the staging mirror
 //   static void after_restore(const Config&, int layer, const LoaderTensorMap&,
 //                             LayerResident&);  // host-side fields a restore re-reads
+//   (optional) static size_t globals_side_bytes(const Config&, int rank, int world,
+//                             LoaderHeadSharding);  // the globals' side grants
+//     — a family whose model packs bf16 matrices into 12-bit companions
+//     (common/bf16_residency.hpp) grants them with the builder's `packable`
+//     loads / LayerBump::alloc_side, and its model returns their bytes with
+//     release_packed() once the companions exist.
 // LayerResident carries `int layer` (-1 when empty) and `size_t bytes`;
 // GlobalsResident carries `size_t bytes` (0 when not loaded). A derived
 // stream implements image_dir() and calls open_resident_image() from its
@@ -54,6 +60,7 @@
 
 #include <cuda_runtime.h>
 
+#include "common/bf16_residency.hpp"
 #include "common/cuda_check.hpp"
 #include "common/log.hpp"
 #include "loaders/resident_image.hpp"
@@ -102,6 +109,10 @@ class ResidentLayerStream {
   int image_layers_restored() const { return image_restored_; }
   int image_layers_captured() const { return image_captured_; }
   std::pair<const void*, size_t> resident_layer_span(int layer) const;
+  // A resident layer's bytes in grant order — the staging mirror's and the
+  // image's layout, whatever the device placement (side grants included;
+  // all of them must still be mapped). `dst` holds layer_bytes. Synchronous.
+  void copy_resident_layer(int layer, void* dst) const;
 
   // The byte formulas (counting builds and closed forms).
   static size_t layer_bytes(const Config& cfg, int layer, int rank = 0, int world = 1);
@@ -113,6 +124,24 @@ class ResidentLayerStream {
   static size_t resident_bytes(const Config& cfg, int rank = 0, int world = 1,
                                LoaderHeadSharding head = LoaderHeadSharding::Full,
                                bool with_mtp = false);
+  // bf12-only residency: of resident_bytes, the packable bf16 matrices a
+  // resident stream grants ASIDE (LayerBump) — returned by release_packed()
+  // once the model has packed them.
+  static size_t layer_side_bytes(const Config& cfg, int layer, int rank = 0, int world = 1);
+  static size_t globals_side_bytes(const Config& cfg, int rank = 0, int world = 1,
+                                   LoaderHeadSharding head = LoaderHeadSharding::Full) {
+    if constexpr (requires { F::globals_side_bytes(cfg, rank, world, head); })
+      return F::globals_side_bytes(cfg, rank, world, head);
+    else
+      return 0;
+  }
+  static size_t side_bytes(const Config& cfg, int rank = 0, int world = 1,
+                           LoaderHeadSharding head = LoaderHeadSharding::Full, bool with_mtp = false);
+  bool side_grants() const { return side_grants_; }
+  // Returns a packed matrix's bf16 bytes to the device (layer < 0: the
+  // globals'); 0 when `weight` was not granted aside. Nothing outstanding
+  // may read it.
+  size_t release_packed(int layer, const void* weight);
   // The pinned staging mirror the load needs (the largest layer, the
   // globals, the family's floor): a plan item, because it lives beside the
   // resident weights until release_sources() frees it with the shard
@@ -153,6 +182,7 @@ class ResidentLayerStream {
   LoaderResidency residency_ = LoaderResidency::Streaming;
   LoaderHeadSharding head_ = LoaderHeadSharding::Full;
   bool resident_mtp_ = false;
+  bool side_grants_ = false;  // packable matrices load into releasable ranges
   cudaStream_t reader_ = nullptr;
   uint64_t source_bytes_ = 0;
   uint64_t verbatim_bytes_ = 0;
@@ -182,6 +212,7 @@ class ResidentLayerStream {
   struct CountedBuild {
     size_t bytes = 0;
     uint64_t source_bytes = 0;
+    size_t side_bytes = 0;  // of bytes: what a side-grant build places aside
   };
   static CountedBuild count_layer(const Config& cfg, int layer, int rank, int world);
   void check_resident_footprint_fits() const;
@@ -240,8 +271,12 @@ ResidentLayerStream<F>::ResidentLayerStream(const Config& cfg, const std::string
   } else {
     layer_bump_->init(capacity);
   }
+  // Side grants: resident stacks only — a streaming bump is rewritten every
+  // forward and is never packed.
+  side_grants_ = residency_ == LoaderResidency::Resident && bf16_side_grants();
   const size_t globals_cap = F::globals_bytes(cfg_, rank_, world_, head_);
-  globals_bump_->init(globals_cap);
+  globals_bump_->side_mode = side_grants_;
+  globals_bump_->init(globals_cap - (side_grants_ ? globals_side_bytes(cfg_, rank_, world_, head_) : 0));
   staging_bytes_ = std::max({capacity, globals_cap, F::min_staging_bytes()});
   DGPP_CUDA_OK(cudaHostAlloc(&staging_, staging_bytes_, cudaHostAllocDefault));
   DGPP_CUDA_OK(cudaStreamCreate(&stream_));
@@ -261,6 +296,7 @@ typename ResidentLayerStream<F>::CountedBuild ResidentLayerStream<F>::count_laye
   const Geometry geo = Geometry::from_config(cfg, rank, world, LoaderHeadSharding::Full);
   LayerBump bump;
   bump.counting = true;
+  bump.side_mode = true;
   bump.capacity = SIZE_MAX;
   const std::vector<Expected> table = F::layer_table(cfg, layer);
   std::unordered_map<std::string, const Expected*> by_name;
@@ -271,7 +307,30 @@ typename ResidentLayerStream<F>::CountedBuild ResidentLayerStream<F>::count_laye
   LoaderTensorMap no_tensors;
   typename F::Builder ctx(cfg, geo, table, by_name, bump, scratch, no_tensors, jobs, packs, false);
   ctx.build_layer(layer);
-  return CountedBuild{bump.cursor, ctx.source_bytes};
+  return CountedBuild{bump.cursor, ctx.source_bytes, bump.side_bytes};
+}
+
+template <class F>
+size_t ResidentLayerStream<F>::layer_side_bytes(const Config& cfg, int layer, int rank, int world) {
+  return count_layer(cfg, layer, rank, world).side_bytes;
+}
+
+template <class F>
+size_t ResidentLayerStream<F>::side_bytes(const Config& cfg, int rank, int world, LoaderHeadSharding head,
+                                          bool with_mtp) {
+  size_t total = globals_side_bytes(cfg, rank, world, head);
+  const int layers = with_mtp ? F::max_layer(cfg) : F::main_layers(cfg);
+  for (int l = 0; l < layers; ++l) total += layer_side_bytes(cfg, l, rank, world);
+  return total;
+}
+
+template <class F>
+size_t ResidentLayerStream<F>::release_packed(int layer, const void* weight) {
+  if (!side_grants_) return 0;
+  if (layer < 0) return globals_bump_->release_side(weight);
+  if (layer >= static_cast<int>(resident_bumps_.size()) || !resident_bumps_[static_cast<size_t>(layer)])
+    return 0;
+  return resident_bumps_[static_cast<size_t>(layer)]->release_side(weight);
 }
 
 template <class F>
@@ -335,7 +394,15 @@ std::pair<const void*, size_t> ResidentLayerStream<F>::resident_layer_span(int l
       resident_layers_[static_cast<size_t>(layer)].layer != layer)
     return {nullptr, 0};
   const LayerBump& b = *resident_bumps_[static_cast<size_t>(layer)];
-  return {b.base, b.cursor};
+  return {b.base, b.dev_cursor};
+}
+
+template <class F>
+void ResidentLayerStream<F>::copy_resident_layer(int layer, void* dst) const {
+  if (residency_ != LoaderResidency::Resident || layer < 0 ||
+      layer >= static_cast<int>(resident_bumps_.size()) || !resident_bumps_[static_cast<size_t>(layer)])
+    throw std::out_of_range(std::string(F::who()) + ": copy_resident_layer of a layer that is not resident");
+  resident_bumps_[static_cast<size_t>(layer)]->download(dst);
 }
 
 template <class F>
@@ -398,7 +465,7 @@ void ResidentLayerStream<F>::restore_layer_from_image(int layer, LayerBump& bump
   }();
   image_->read_layer(layer, staging_, bytes, verify);
   sync_load_boundary(reader_, stream_);
-  DGPP_CUDA_OK(cudaMemcpyAsync(bump.base, staging_, bytes, cudaMemcpyHostToDevice, stream_));
+  bump.upload(stream_);  // stage == staging_: the blob is the mirror's layout
   DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
   F::after_restore(cfg_, layer, tensors_, out);
   out.bytes = bytes;
@@ -407,7 +474,7 @@ void ResidentLayerStream<F>::restore_layer_from_image(int layer, LayerBump& bump
 
 template <class F>
 void ResidentLayerStream<F>::capture_layer_to_image(int layer, const LayerBump& bump, size_t bytes) {
-  DGPP_CUDA_OK(cudaMemcpy(staging_, bump.base, bytes, cudaMemcpyDeviceToHost));
+  bump.download(staging_);
   try {
     image_->write_layer(layer, staging_, bytes);
     ++image_captured_;
@@ -441,7 +508,7 @@ void ResidentLayerStream<F>::build_layer_into(int layer, LayerBump& bump, LayerR
         if (auto it = tensors_.find(e.name); it != tensors_.end() && it->second && it->second->owner)
           it->second->owner->discard(*it->second);
   }
-  DGPP_CUDA_OK(cudaMemcpyAsync(bump.base, bump.stage, bump.cursor, cudaMemcpyHostToDevice, stream_));
+  bump.upload(stream_);
   if (!jobs.empty())
     throw std::logic_error(std::string(F::who()) + ": no dequant bridges exist for this family");
   for (const PackJob& j : packs)
@@ -474,7 +541,9 @@ const typename F::LayerResident& ResidentLayerStream<F>::load_layer(int layer) {
       throw std::runtime_error(std::string(F::who()) + ": layer " + std::to_string(layer) +
                                " was never materialized before release_sources()");
     auto bump = std::make_unique<LayerBump>();
-    bump->init(layer_bytes(cfg_, layer, rank_, world_));
+    bump->side_mode = side_grants_;
+    const CountedBuild counted = count_layer(cfg_, layer, rank_, world_);
+    bump->init(counted.bytes - (side_grants_ ? counted.side_bytes : 0));
     if (image_ && image_->has_layer(layer)) {
       restore_layer_from_image(layer, *bump, slot);
     } else {
@@ -518,8 +587,7 @@ const typename F::GlobalsResident& ResidentLayerStream<F>::load_globals() {
     throw std::runtime_error(std::string(F::who()) + ": globals byte-formula drift: used " +
                              std::to_string(globals_.bytes) + " != formula " +
                              std::to_string(expected_bytes));
-  DGPP_CUDA_OK(cudaMemcpyAsync(globals_bump_->base, globals_bump_->stage, globals_.bytes,
-                               cudaMemcpyHostToDevice, stream_));
+  globals_bump_->upload(stream_);
   DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
   return globals_;
 }

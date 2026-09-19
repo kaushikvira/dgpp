@@ -6,6 +6,7 @@
     "max_concurrency": 8,
     "kv_capacity": 122880,
     "kv_dtype": "bf16",
+    "bf16_weights": "bf12",
     "embed_sharding": "vocab",
     "default_max_tokens": 256,
     "queue_limit": 8,

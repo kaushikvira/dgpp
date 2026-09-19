@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -27,6 +28,7 @@
 
 #include <cuda_runtime.h>
 
+#include "common/bf16_residency.hpp"
 #include "common/dtypes.hpp"
 #include "engine/speculative.hpp"
 #include "models/qwen/config.hpp"
@@ -565,6 +567,54 @@ int run_fixture(const std::string& dir) {
     require(yielded.kv_blocks_in_use() == 0 && reference.kv_blocks_in_use() == 0,
             "resized continuation releases all blocks");
     std::printf("[ OK ] resized prefill: target/draft logits, required snapshot and attach\n");
+  }
+  // engine.bf16_weights: the same checkpoint with the lossless 12-bit
+  // companions of its GDN / QSA / draft projections and the head (packed at
+  // session_graph_prepare; format v2 — the fixture's rows are all tail). The
+  // GDN's four input projections then take the packed multi launch, every
+  // other site the GEMM seam's packed GEMV; prefill keeps the bf16 bytes.
+  // Prefill, the draft block and the decode that continues are bitwise the
+  // bf16 build's, under either value of the key (this family keeps both
+  // forms resident).
+  {
+    struct Restore {
+      ~Restore() { dgpp::set_bf16_residency(dgpp::Bf16Residency::Checkpoint); }
+    } restore;
+    const auto build = [&](dgpp::Bf16Residency mode) {
+      dgpp::set_bf16_residency(mode);
+      auto m = std::make_unique<QwenModel>(cfg, dir, 64, 512, QwenResidency::Resident, nullptr, 0, 1, 2, true);
+      m->session_graph_prepare();
+      return m;
+    };
+    const auto plain = build(dgpp::Bf16Residency::Checkpoint);
+    const auto both = build(dgpp::Bf16Residency::Bf12AndBf16);
+    const auto only = build(dgpp::Bf16Residency::Bf12);
+    require(plain->bf12_companions().matrices() == 0, "bf12: checkpoint residency packs nothing");
+    require(both->bf12_companions().matrices() > 0 && both->bf12_companions().kept_bf16() == 0,
+            "bf12: every offered matrix packs");
+    require(only->bf12_companions().matrices() == both->bf12_companions().matrices() &&
+                only->bf12_companions().released() == 0,
+            "bf12: this family keeps the bf16 bytes under either value");
+    for (const std::vector<int64_t>* prompt : {&A, &B}) {
+      const QwenModel::Outputs want = plain->session_prefill(0, *prompt);
+      require(bitwise(want.logits, both->session_prefill(0, *prompt).logits), "bf12+bf16: prefill logits are bitwise");
+      require(bitwise(want.logits, only->session_prefill(0, *prompt).logits), "bf12: prefill logits are bitwise");
+      int64_t token = argmax(want.logits.data(), V);
+      for (int step = 0; step < 6; ++step) {
+        const QwenModel::Outputs d = plain->session_draft(0, {token});
+        require(bitwise(d.logits, both->session_draft(0, {token}).logits), "bf12+bf16: the draft block is bitwise");
+        require(bitwise(d.logits, only->session_draft(0, {token}).logits), "bf12: the draft block is bitwise");
+        const QwenModel::Outputs o = plain->session_step(0, token);
+        require(bitwise(o.logits, both->session_step(0, token).logits), "bf12+bf16: decode continues bitwise");
+        require(bitwise(o.logits, only->session_step(0, token).logits), "bf12: decode continues bitwise");
+        token = argmax(o.logits.data(), V);
+      }
+      plain->session_close(0);
+      both->session_close(0);
+      only->session_close(0);
+    }
+    std::printf("[ OK ] bf16_weights: %zu matrices packed; prefill, draft and decode bitwise the bf16 build\n",
+                both->bf12_companions().matrices());
   }
   std::printf("[ OK ] qwen_decode_test\n");
   return 0;

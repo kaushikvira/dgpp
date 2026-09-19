@@ -1,5 +1,6 @@
 #include "models/glm4/forward.hpp"
 
+#include <chrono>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -8,6 +9,7 @@
 #include <string>
 
 #include "common/cuda_check.hpp"
+#include "kernels/bf12_companions.hpp"
 #include "kernels/glm4_attn.hpp"
 #include "kernels/glm_norm.hpp"
 #include "kernels/kernels.hpp"
@@ -157,8 +159,14 @@ Glm4Model::MemoryPlan Glm4Model::plan_memory(const Glm4TextConfig& cfg, int max_
   const int pool_layers = cfg.num_hidden_layers + (mtp ? 1 : 0);
   const int n_split = Glm4AttentionLayer::default_decode_splits();
 
+  // bf12-only residency: the packable bf16 matrices load aside and give
+  // their bytes back as each layer is packed (graph_prepare).
+  const bool bf12_only = Bf12Companions::packed_only() && residency == Glm4Residency::Resident;
   if (residency == Glm4Residency::Resident) {
-    plan.add("model weights (resident)", Glm4LayerStream::resident_bytes(cfg, tp_rank, tp_world, head, mtp));
+    size_t resident = Glm4LayerStream::resident_bytes(cfg, tp_rank, tp_world, head, mtp);
+    if (bf12_only) resident -= Glm4LayerStream::side_bytes(cfg, tp_rank, tp_world, head, mtp);
+    plan.add(bf12_only ? "model weights (resident, packed bf16 matrices released)" : "model weights (resident)",
+             resident);
     plan.add("loader staging (pinned host, freed when the last layer is resident)", 0,
              Glm4LayerStream::staging_plan_bytes(cfg, tp_rank, tp_world, head, mtp));
   } else {
@@ -168,6 +176,26 @@ Glm4Model::MemoryPlan Glm4Model::plan_memory(const Glm4TextConfig& cfg, int max_
       largest = std::max(largest, Glm4LayerStream::layer_bytes(cfg, l, tp_rank, tp_world));
     plan.add("model weights (one streamed layer + globals)",
              largest + Glm4LayerStream::globals_bytes(cfg, tp_rank, tp_world, head));
+  }
+  if (Bf12Companions::enabled() && residency == Glm4Residency::Resident) {
+    // The lossless 12-bit companions of the bf16 attention projections, the
+    // head and the draft's eh_proj (kernels/bf12_companions.hpp).
+    const int64_t Q = static_cast<int64_t>(geo.local_heads) * cfg.head_dim;
+    const int64_t KV = static_cast<int64_t>(geo.local_kv_heads) * cfg.head_dim;
+    const int64_t Hh = cfg.hidden_size;
+    const size_t per_layer = Bf12Companions::planned_bytes(Q, Hh) + 2 * Bf12Companions::planned_bytes(KV, Hh) +
+                             Bf12Companions::planned_bytes(Hh, Q);
+    size_t packed = static_cast<size_t>(pool_layers) * per_layer +
+                    Bf12Companions::planned_bytes(static_cast<int64_t>(V), Hh);
+    if (mtp) packed += Bf12Companions::planned_bytes(Hh, 2 * Hh);
+    plan.add("bf16 decode packing (12-bit companions)", packed);
+    if (bf12_only) {
+      const size_t h = static_cast<size_t>(Hh);
+      plan.add("bf16 prefill expansion scratch",
+               static_cast<size_t>(kBf12ExpandSlots) *
+                   Bf12Companions::planned_slot_bytes({static_cast<size_t>(Q) * h * 2, static_cast<size_t>(KV) * h * 2,
+                                                       mtp ? h * 2 * h * 2 : 0, V * h * 2}));
+    }
   }
   plan.add("gemm workspace (at least)", size_t{64} << 20);
   {
@@ -264,9 +292,18 @@ void Glm4Model::prefetch_attn(const Glm4AttnResident& a) {
   const size_t H = static_cast<size_t>(cfg_.hidden_size);
   const size_t Q = static_cast<size_t>(a.local_heads) * cfg_.head_dim;
   const size_t KV = static_cast<size_t>(a.local_kv_heads) * cfg_.head_dim;
-  if (a.q_proj) prefetch_.add(a.q_proj, Q * H * 2);
-  if (a.k_proj) prefetch_.add(a.k_proj, KV * H * 2);
-  if (a.v_proj) prefetch_.add(a.v_proj, KV * H * 2);
+  // The bytes the rows' launches stream: a packed companion's when the
+  // GEMM holds one (kernels/bf12_gemv.hpp).
+  const auto add = [&](const uint16_t* w, size_t bytes) {
+    if (w == nullptr) return;
+    const void* view = nullptr;
+    size_t view_bytes = 0;
+    gemm_.resident_view(w, bytes, walk_rows_, &view, &view_bytes);
+    prefetch_.add_view(w, view, view_bytes);  // a companion is its own allocation
+  };
+  add(a.q_proj, Q * H * 2);
+  add(a.k_proj, KV * H * 2);
+  add(a.v_proj, KV * H * 2);
 }
 
 // Before the attention fold: this layer's post norm, the router (and its
@@ -308,7 +345,13 @@ void Glm4Model::prefetch_head() {
   const size_t H = static_cast<size_t>(cfg_.hidden_size);
   prefetch_.open_window(stream_, prefetch_window_bytes_, prefetch_.boundary_rate());
   if (globals_.final_norm) prefetch_.add(globals_.final_norm, H * 2);
-  if (globals_.lm_head) prefetch_.add(globals_.lm_head, static_cast<size_t>(lm_vocab_count_) * H * 2);
+  if (globals_.lm_head) {
+    const void* view = nullptr;
+    size_t view_bytes = 0;
+    gemm_.resident_view(globals_.lm_head, static_cast<size_t>(lm_vocab_count_) * H * 2, walk_rows_, &view,
+                        &view_bytes);
+    prefetch_.add_view(globals_.lm_head, view, view_bytes);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +416,10 @@ Glm4Model::Outputs Glm4Model::run_rows(const RowRun& run) {
   if (run.capture && loader_.residency() != Glm4Residency::Resident)
     throw std::logic_error("run_rows: a capture needs a resident stack");
   const int H = cfg_.hidden_size;
+  // The packed companions' wide launches are the decode batch's alone (a
+  // short prefill chunk keeps its Lt algorithm: kernels/gemm.hpp).
+  gemm_.set_bf12_wide(run.decode);
+  walk_rows_ = T;
   const RowInputs in = begin_run(run);
   embed_gather_bf16(globals_.embed, in.tokens, resid_, T, H, stream_);
   Outputs out;
@@ -472,16 +519,61 @@ Glm4Model::Outputs Glm4Model::forward(const std::vector<int64_t>& token_ids, boo
 void Glm4Model::graph_prepare() {
   if (loader_.residency() != Glm4Residency::Resident)
     throw std::logic_error("session_graph_prepare: the decode graph needs a resident stack");
+  // The bf16 decode weights' 12-bit companions are packed as each layer
+  // lands (the caches already exist: under bf12-only residency the layer's
+  // bf16 bytes go back at once, so no more than one layer's sit beside
+  // their companions).
+  const bool pack = Bf12Companions::enabled() && !bf12_built_;
   for (int layer = 0; layer < cfg_.num_hidden_layers; ++layer) {
     const Glm4LayerResident& r = loader_.load_layer(layer);
     build_layer_objects(r);
     if (r.moe) moe_->prepare_graph_table(moe_ordinal(layer), stream_);
+    if (pack) pack_layer_companions(layer, r);
   }
   if (mtp_) {
     const Glm4LayerResident& r = loader_.load_layer(cfg_.mtp_layer());
     build_layer_objects(r);
     moe_->prepare_graph_table(cfg_.num_moe_layers(), stream_);
+    if (pack) pack_layer_companions(cfg_.mtp_layer(), r);
   }
+  if (pack) finish_companions();
+}
+
+// The lossless 12-bit companions of the decode GEMV's bf16 weights
+// (engine.bf16_weights = "bf12"): the attention projections of every layer
+// — 6.3 of the 9.7 GB a decode step reads per rank at world 4 — the head
+// and the draft's eh_proj, packed as each layer lands and before any
+// capture. Prefill and the batches past eight rows keep the bf16 bytes —
+// or, under bf12-only residency (the bytes returned here, layer by layer),
+// expand them and take the packed launches (kernels/gemm.hpp).
+void Glm4Model::pack_layer_companions(int layer, const Glm4LayerResident& r) {
+  const auto t0 = std::chrono::steady_clock::now();
+  const int64_t H = cfg_.hidden_size;
+  const auto release = [&](const void* w) { return loader_.release_packed(layer, w); };
+  const auto pack = [&](const uint16_t* w, int64_t n, int64_t k) {
+    bf12_.pack_and_release(w, n, k, gemm_, stream_, release);
+  };
+  const Glm4AttnResident& a = r.attn;
+  const int64_t Q = static_cast<int64_t>(a.local_heads) * cfg_.head_dim;
+  const int64_t KV = static_cast<int64_t>(a.local_kv_heads) * cfg_.head_dim;
+  pack(a.q_proj, Q, H);
+  pack(a.k_proj, KV, H);
+  pack(a.v_proj, KV, H);
+  pack(a.o_proj, H, Q);
+  if (layer == cfg_.mtp_layer() && r.eh_proj != nullptr) pack(r.eh_proj, H, 2 * H);
+  bf12_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// The lm head's, the expansion scratch (one slot: no walk of this family
+// calls a matrix twice), and the summary.
+void Glm4Model::finish_companions() {
+  const auto t0 = std::chrono::steady_clock::now();
+  bf12_built_ = true;
+  bf12_.pack_and_release(globals_.lm_head, lm_vocab_count_, cfg_.hidden_size, gemm_, stream_,
+                         [&](const void* w) { return loader_.release_packed(-1, w); });
+  bf12_.finish(gemm_, kBf12ExpandSlots);
+  bf12_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  bf12_.log_summary(loader_.rank(), bf12_s_);
 }
 
 // ---------------------------------------------------------------------------
@@ -492,6 +584,8 @@ void Glm4Model::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos, 
                              bool capture, int head_rows, int batch_requests) {
   if (!mtp_) throw std::logic_error("mtp_run_rows: MTP is not enabled");
   if (T <= 0 || T > max_tokens_) throw std::invalid_argument("mtp_run_rows: rows");
+  gemm_.set_bf12_wide(decode_row);  // the decode batch's alone (kernels/gemm.hpp)
+  walk_rows_ = T;
   if (head_rows < 0 || head_rows > T) throw std::invalid_argument("mtp_run_rows: head_rows");
   const int H = cfg_.hidden_size;
   const float eps = cfg_.rms_norm_eps;

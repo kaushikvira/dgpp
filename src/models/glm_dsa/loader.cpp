@@ -210,7 +210,8 @@ struct GlmDsaLoaderFamily::Builder : WeightBuilder<GlmDsaExpectedTensor> {
     const GlmDsaExpectedTensor& eb = expected(b);
     if (ea.shape.size() != 2 || eb.shape.size() != 2 || ea.shape[1] != eb.shape[1])
       fail("fused rows of '" + a + "' and '" + b + "' disagree on K");
-    uint16_t* dst = static_cast<uint16_t*>(bump.alloc(ea.nbytes() + eb.nbytes()));
+    // Packable (the model's 12-bit companion replaces it): grant_bf16.
+    uint16_t* dst = static_cast<uint16_t*>(grant_bf16(ea.shape[0] + eb.shape[0], ea.shape[1], /*packable=*/true));
     if (copy) {
       const TensorInfo& ta = source(a);
       const TensorInfo& tb = source(b);
@@ -290,15 +291,15 @@ struct GlmDsaLoaderFamily::Builder : WeightBuilder<GlmDsaExpectedTensor> {
       a.o_proj_packed = load_packq_cols(p + "o_proj", o0, on);
     } else {
       a.qkv_a = load_bf16_fused(p + "q_a_proj.weight", p + "kv_a_proj_with_mqa.weight");
-      a.q_b = load_bf16_rows(p + "q_b_proj.weight", qb0, qbn);
+      a.q_b = load_bf16_rows(p + "q_b_proj.weight", qb0, qbn, /*packable=*/true);
       a.kv_b = load_bf16_rows(p + "kv_b_proj.weight", kb0, kbn);
-      a.o_proj = load_bf16_cols(p + "o_proj.weight", o0, on);
+      a.o_proj = load_bf16_cols(p + "o_proj.weight", o0, on, /*packable=*/true);
     }
     if (cfg.owns_indexer(layer)) {
       const std::string ip = p + "indexer.";
-      a.wq_b = load_bf16(ip + "wq_b.weight");
-      a.wk = load_bf16(ip + "wk.weight");
-      a.wp = load_bf16(ip + "weights_proj.weight");
+      a.wq_b = load_bf16(ip + "wq_b.weight", /*packable=*/true);
+      a.wk = load_bf16(ip + "wk.weight", /*packable=*/true);
+      a.wp = load_bf16(ip + "weights_proj.weight", /*packable=*/true);
       a.k_norm_w = load_bf16(ip + "k_norm.weight");
       a.k_norm_b = load_bf16(ip + "k_norm.bias");
     }
@@ -308,9 +309,9 @@ struct GlmDsaLoaderFamily::Builder : WeightBuilder<GlmDsaExpectedTensor> {
     const int64_t I = geo.local_dense_inter, r = rank;
     GlmDsaDenseMlpResident& m = out.dense;
     m.local_inter = I;
-    m.gate = load_bf16_rows(p + "gate_proj.weight", r * I, I);
-    m.up = load_bf16_rows(p + "up_proj.weight", r * I, I);
-    m.down = load_bf16_cols(p + "down_proj.weight", r * I, I);
+    m.gate = load_bf16_rows(p + "gate_proj.weight", r * I, I, /*packable=*/true);
+    m.up = load_bf16_rows(p + "up_proj.weight", r * I, I, /*packable=*/true);
+    m.down = load_bf16_cols(p + "down_proj.weight", r * I, I, /*packable=*/true);
   }
 
   void build_moe(const std::string& p, int layer, bool draft) {
@@ -361,7 +362,7 @@ struct GlmDsaLoaderFamily::Builder : WeightBuilder<GlmDsaExpectedTensor> {
     if (draft) {
       out.enorm = load_bf16(p + "enorm.weight");
       out.hnorm = load_bf16(p + "hnorm.weight");
-      out.eh_proj = load_bf16(p + "eh_proj.weight");
+      out.eh_proj = load_bf16(p + "eh_proj.weight", /*packable=*/true);
       out.shared_head_norm = load_bf16(p + "shared_head.norm.weight");
     }
     out.input_norm = load_bf16(p + "input_layernorm.weight");
@@ -457,6 +458,13 @@ size_t GlmDsaLoaderFamily::globals_bytes(const GlmDsaTextConfig& cfg, int rank, 
   return b;
 }
 
+size_t GlmDsaLoaderFamily::globals_side_bytes(const GlmDsaTextConfig& cfg, int rank, int world,
+                                              LoaderHeadSharding head) {
+  const int count = GlmDsaLocalGeometry::from_config(cfg, rank, world, head).lm_vocab_count;
+  if (!bf12_shape_ok(count, cfg.hidden_size)) return 0;
+  return align_up_256(static_cast<size_t>(count) * static_cast<size_t>(cfg.hidden_size) * 2);
+}
+
 void GlmDsaLoaderFamily::build_globals(const GlmDsaTextConfig& cfg, const GlmDsaLocalGeometry& geo,
                                        const LoaderTensorMap& tensors, LayerBump& bump,
                                        GlmDsaGlobalsResident& out, uint64_t& source_bytes,
@@ -495,7 +503,10 @@ void GlmDsaLoaderFamily::build_globals(const GlmDsaTextConfig& cfg, const GlmDsa
   out.final_norm = copy_global("model.norm.weight");
   const TensorInfo& t = lookup("lm_head.weight");
   const int begin = geo.lm_vocab_begin, count = geo.lm_vocab_count;
-  uint16_t* dst = static_cast<uint16_t*>(bump.alloc(static_cast<size_t>(count) * row_bytes));
+  // The head is packable (the model's 12-bit companion replaces it).
+  uint16_t* dst = static_cast<uint16_t*>(bf12_shape_ok(count, cfg.hidden_size)
+                                             ? bump.alloc_side(static_cast<size_t>(count) * row_bytes)
+                                             : bump.alloc(static_cast<size_t>(count) * row_bytes));
   std::memcpy(bump.host(dst), static_cast<const uint8_t*>(t.data) + static_cast<size_t>(begin) * row_bytes,
               static_cast<size_t>(count) * row_bytes);
   source_bytes += static_cast<size_t>(count) * row_bytes;

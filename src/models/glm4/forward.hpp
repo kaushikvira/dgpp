@@ -49,6 +49,7 @@
 #include "engine/decode_outputs.hpp"
 #include "engine/memory_plan.hpp"
 #include "engine/session_model.hpp"
+#include "kernels/bf12_companions.hpp"
 #include "kernels/gemm.hpp"
 #include "kernels/glm_spec.hpp"
 #include "kernels/l2_prefetch.hpp"
@@ -175,6 +176,15 @@ class Glm4Model : public SessionModel<Glm4Model> {
   Glm4TextConfig cfg_;
   Glm4LayerStream loader_;
   CublasLtGemm gemm_;
+  // The bf16 decode weights' 12-bit companions (kernels/bf12_companions.hpp)
+  // and the rows of the walk in flight (the prefetch windows' view).
+  static constexpr int kBf12ExpandSlots = 1;
+  void pack_layer_companions(int layer, const Glm4LayerResident& r);
+  void finish_companions();
+  Bf12Companions bf12_;
+  bool bf12_built_ = false;
+  double bf12_s_ = 0.0;
+  int walk_rows_ = 1;
   void* gemm_ws_ = nullptr;
   size_t gemm_ws_bytes_ = 0;
   Glm4GemmWorkspace gw_;

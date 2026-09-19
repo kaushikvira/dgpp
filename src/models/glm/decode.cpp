@@ -55,6 +55,40 @@ void GlmDiagnosticModel::mhc_comb_fork(const GlmMhcWeights& w, int tokens) {
   DGPP_CUDA_OK(cudaEventRecord(mhc_join_, mhc_side_));
 }
 
+// The prefill fold overlap (2026-09-19). A prefill chunk's two folds per
+// layer were 15-17 % of its GPU time with nothing beside them: the walk
+// drained the stream, folded [T, H] and waited. Here a chunk of at least
+// 1024 rows (the blocks stay in the chunk's kernel classes: over 256 rows)
+// runs its ATTENTION site in two row blocks, A =
+// [0, TA) and B = [TA, T): block A's fold is in flight while block B's site
+// computes (the recurrence and the caches carry from A to B exactly as
+// across a chunk cut), and the FFN site's fold of block B while the next
+// layer's block A computes; the FFN site itself keeps the whole chunk (its
+// experts are read once per chunk — two row blocks would read them twice).
+// Exposed on those layers: the folds of attention B and FFN A, half the
+// bytes. The KDA layers only (34 of GLM-5.3-Flash's 45): every kernel of
+// a KDA site is row-independent, its state carries bitwise, and its Lt
+// projections take the chunk's algorithm (set_plan_rows), so the walk is
+// BITWISE the unsplit one — measured on the fabric at 2K-30K prompts, the
+// asynchronous folds included. A DSA site in row blocks is not (the same
+// A/B: transcripts move, as under any change of the chunk cuts), so the
+// DSA layers keep the whole site and both their folds whole.
+// DGPP_PREFILL_OVERLAP=off restores the unsplit walk.
+bool GlmDiagnosticModel::fold_overlap_default() {
+  static const bool on = [] {
+    const char* v = std::getenv("DGPP_PREFILL_OVERLAP");
+    return v == nullptr || (std::string(v) != "off" && std::string(v) != "0");
+  }();
+  return on;
+}
+
+void GlmDiagnosticModel::set_prefill_fold_overlap(bool on, int min_rows, bool without_reducer) {
+  if (min_rows < 32) throw std::invalid_argument("set_prefill_fold_overlap: min_rows under 32");
+  fold_overlap_ = on;
+  fold_overlap_min_rows_ = min_rows;
+  fold_overlap_without_reducer_ = without_reducer;
+}
+
 void GlmDiagnosticModel::prefetch_ffn_side(const GlmLayerBound& b,
                                            bool dense_mlp) {
   if (!prefetch_.enabled()) return;
@@ -75,10 +109,10 @@ void GlmDiagnosticModel::prefetch_ffn_side(const GlmLayerBound& b,
   for (int i = 0; i < 3; ++i) prefetch_quant(prefetch_, b.moe->shared[i]);
 }
 
-void GlmDiagnosticModel::prefetch_attention_side(int layer) {
+void GlmDiagnosticModel::prefetch_attention_side(int layer, int rows) {
   if (!prefetch_.enabled()) return;
   if (layer >= cfg_.num_hidden_layers) {
-    prefetch_head();
+    prefetch_head(rows);
     return;
   }
   // Resident stacks only: load_layer is a lookup there. A streaming stack
@@ -95,18 +129,29 @@ void GlmDiagnosticModel::prefetch_attention_side(int layer) {
   // The first projection is far larger than the window; add() clamps to
   // the budget and the GEMV's leading blocks are the ones that hit.
   if (r.kind == GlmLayerKind::Kda) {
-    if (kda_) prefetch_.add(r.kda.in_proj, kda_->in_proj_bytes());
+    if (kda_) {
+      // The bytes the rows' launch streams: the packed companion's when
+      // it takes one (kernels/bf12_gemv.hpp).
+      const void* view = nullptr;
+      size_t view_bytes = 0;
+      gemm_.resident_view(r.kda.in_proj, kda_->in_proj_bytes(), rows, &view, &view_bytes);
+      prefetch_.add_view(r.kda.in_proj, view, view_bytes);  // a companion is its own allocation
+    }
   } else {
     if (dsa_) prefetch_.add(r.dsa.qkv_a, dsa_->qkv_a_bytes());
   }
 }
 
-void GlmDiagnosticModel::prefetch_head() {
+void GlmDiagnosticModel::prefetch_head(int rows) {
   if (!prefetch_.enabled()) return;
   const size_t H = static_cast<size_t>(cfg_.hidden_size);
   prefetch_.open_window(stream_, 0, prefetch_.boundary_rate());
   prefetch_.add(globals_.final_norm, H * 2);
-  prefetch_.add(globals_.lm_head, static_cast<size_t>(lm_vocab_count_) * H * 2);
+  const void* view = nullptr;
+  size_t view_bytes = 0;
+  gemm_.resident_view(globals_.lm_head, static_cast<size_t>(lm_vocab_count_) * H * 2, rows,
+                      &view, &view_bytes);
+  prefetch_.add_view(globals_.lm_head, view, view_bytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -1329,6 +1374,43 @@ GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_run_rows(
   int moe_decode_calls = 0;
   int moe_prefill_calls = 0;  // prefill's per-layer trace staging slots
 
+  // The packed companions' wide launches are the decode batch's alone (a
+  // short prefill chunk keeps its Lt algorithm: kernels/gemm.hpp).
+  gemm_.set_bf12_wide(decode_row);
+  // The fold overlap's row blocks (0: the unsplit walk). 16-row aligned: a
+  // block starts pool-aligned and on a 16-byte boundary of every row buffer.
+  const int TA = (fold_overlap_ && !decode_row && !capture_mode &&
+                  (boundary_ != nullptr || fold_overlap_without_reducer_) &&
+                  group_num_spans_ == 0 && T >= fold_overlap_min_rows_)
+                     ? (T / 2) / 16 * 16
+                     : 0;
+  const int TB = T - TA;
+  bool ffn_b_pending = false;  // the previous layer's FFN fold of block B is in flight
+  const size_t H4 = static_cast<size_t>(mhc_cfg_.hc_mult) * H;
+  const size_t coeff = static_cast<size_t>(mhc_cfg_.coeff_rows());
+  // One mHC site over rows [r0, r0 + rows) of `streams` (never deferred:
+  // the prefill forms compute the comb in-block).
+  const auto mhc_site_rows = [&](const uint16_t* streams, const GlmMhcWeights& w, const uint16_t* ln,
+                                 int r0, int rows) {
+    launch_mhc_compute_normed(streams + static_cast<size_t>(r0) * H4, w, mhc_cfg_, nullptr,
+                              post_ + static_cast<size_t>(r0) * mhc_cfg_.hc_mult,
+                              comb_ + static_cast<size_t>(r0) * mhc_cfg_.hc_mult * mhc_cfg_.hc_mult,
+                              mhc_logits_ + static_cast<size_t>(r0) * coeff, ln,
+                              normed_ + static_cast<size_t>(r0) * H, eps, rows, stream_,
+                              mhc_counters_ + r0, /*defer_comb=*/false);
+  };
+  const auto mhc_update_rows = [&](const uint16_t* sub_out, const uint16_t* in, uint16_t* out_streams,
+                                   int r0, int rows) {
+    launch_mhc_stream_update(post_ + static_cast<size_t>(r0) * mhc_cfg_.hc_mult,
+                             comb_ + static_cast<size_t>(r0) * mhc_cfg_.hc_mult * mhc_cfg_.hc_mult,
+                             sub_out + static_cast<size_t>(r0) * H, in + static_cast<size_t>(r0) * H4,
+                             out_streams + static_cast<size_t>(r0) * H4, mhc_cfg_, rows, stream_);
+  };
+  const auto drain = [&] {
+    step_timing::Scope tick(step_timing::kFoldDrain);
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+  };
+
   for (int layer = 0; layer < cfg_.num_hidden_layers; ++layer) {
     const GlmLayerResident& r = stack_layer(layer);
     const GlmLayerBound b = bind_layer(r, cfg_.mlps[layer] == GlmMlpKind::Dense);
@@ -1339,11 +1421,35 @@ GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_run_rows(
     hw.base = b.mhc->attn_base;
     hw.scale = b.mhc->attn_scale;
     // The sites consume the normed row only: no collapsed store (nullptr).
-    const bool attn_comb_deferred = launch_mhc_compute_normed(
-        cur, hw, mhc_cfg_, nullptr, post_, comb_, mhc_logits_, b.ln1,
-        normed_, eps, T, stream_, mhc_counters_, mhc_comb_side_);
-    if (attn_comb_deferred) mhc_comb_fork(hw, T);
+    bool attn_comb_deferred = false;
+    // The site runs in row blocks on the KDA layers only (see the note above).
+    const bool split_site = TA > 0 && r.kind == GlmLayerKind::Kda;
+    if (ffn_b_pending) {
+      // Block A's streams are updated (in nxt); block B's wait for the fold.
+      mhc_site_rows(nxt, hw, b.ln1, 0, TA);
+    } else if (TA > 0) {
+      mhc_site_rows(cur, hw, b.ln1, 0, T);
+    } else {
+      attn_comb_deferred = launch_mhc_compute_normed(
+          cur, hw, mhc_cfg_, nullptr, post_, comb_, mhc_logits_, b.ln1,
+          normed_, eps, T, stream_, mhc_counters_, mhc_comb_side_);
+      if (attn_comb_deferred) mhc_comb_fork(hw, T);
+    }
     uint16_t* attn_out = sub_out_;
+    // The overlap's seam between the site's blocks: the previous FFN fold
+    // of block B lands (its update, then this site's block B), and block
+    // A's fold starts. Called with block A's site enqueued.
+    const auto overlap_seam = [&] {
+      drain();
+      if (ffn_b_pending) {
+        if (boundary_) boundary_->end_async();
+        mhc_update_rows(sub_out_, cur, nxt, TA, TB);  // the previous FFN site's block B
+        std::swap(cur, nxt);
+        ffn_b_pending = false;
+        mhc_site_rows(cur, hw, b.ln1, TA, TB);
+      }
+      if (boundary_ && !boundary_->begin_async(attn_out, TA, H)) boundary_->reduce(attn_out, TA, H);
+    };
     if (boundary_) {
       if (uint16_t* staged = boundary_->stage(T, H)) attn_out = staged;
     }
@@ -1414,6 +1520,16 @@ GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_run_rows(
                         attn_out + static_cast<size_t>(row0) * H, len, stream_);
           row0 += len;
         }
+      } else if (split_site) {
+        // Two row blocks; the recurrent and conv state carry from A to B.
+        gemm_.set_plan_rows(T);
+        if (!kda_->prepare(TA)) throw std::runtime_error("session: KDA GEMM plans unavailable");
+        kda_->enqueue(normed_, rec, conv, kda_geo_.conv_hist, attn_out, TA, stream_);
+        overlap_seam();
+        if (!kda_->prepare(TB)) throw std::runtime_error("session: KDA GEMM plans unavailable");
+        kda_->enqueue(normed_ + static_cast<size_t>(TA) * H, rec, conv, kda_geo_.conv_hist,
+                      attn_out + static_cast<size_t>(TA) * H, TB, stream_);
+        gemm_.set_plan_rows(0);
       } else {
         kda_->enqueue(normed_, rec, conv, kda_geo_.conv_hist, attn_out, T,
                       stream_, decode_row ? &prefetch_ : nullptr, spec, batch);
@@ -1464,6 +1580,9 @@ GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_run_rows(
       ++dsa_ordinal;
     }
     const bool dense_mlp = cfg_.mlps[layer] == GlmMlpKind::Dense;
+    // The FFN fold's block B flies only beside a next site that runs in blocks.
+    const bool next_split = TA > 0 && layer + 1 < cfg_.num_hidden_layers &&
+                            cfg_.layers[static_cast<size_t>(layer) + 1] == GlmLayerKind::Kda;
     if (decode_row) prefetch_ffn_side(b, dense_mlp);
     if (boundary_) {
       // A captured sync is an error — under capture the fold is a
@@ -1473,7 +1592,13 @@ GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_run_rows(
         debug_sync("attention", layer, decode_row);
         DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
       }
-      boundary_->reduce(attn_out, T, H);
+      if (split_site) {
+        // Block A folded beside block B's site; block B's fold is exposed.
+        boundary_->end_async();
+        boundary_->reduce(attn_out + static_cast<size_t>(TA) * H, TB, H);
+      } else {
+        boundary_->reduce(attn_out, T, H);
+      }
       if (decode_row && layer < gr_probe_layers_)
         boundary_->probe(T, kGrProbeCols);
     }
@@ -1487,10 +1612,15 @@ GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_run_rows(
     fw.fn = b.mhc->ffn_fn;
     fw.base = b.mhc->ffn_base;
     fw.scale = b.mhc->ffn_scale;
-    const bool ffn_comb_deferred = launch_mhc_compute_normed(
-        cur, fw, mhc_cfg_, nullptr, post_, comb_, mhc_logits_, b.ln2,
-        normed_, eps, T, stream_, mhc_counters_, mhc_comb_side_);
-    if (ffn_comb_deferred) mhc_comb_fork(fw, T);
+    bool ffn_comb_deferred = false;
+    if (TA > 0) {
+      mhc_site_rows(cur, fw, b.ln2, 0, T);
+    } else {
+      ffn_comb_deferred = launch_mhc_compute_normed(
+          cur, fw, mhc_cfg_, nullptr, post_, comb_, mhc_logits_, b.ln2,
+          normed_, eps, T, stream_, mhc_counters_, mhc_comb_side_);
+      if (ffn_comb_deferred) mhc_comb_fork(fw, T);
+    }
     uint16_t* ffn_out = sub_out_;
     if (boundary_) {
       if (uint16_t* staged = boundary_->stage(T, H)) ffn_out = staged;
@@ -1550,7 +1680,7 @@ GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_run_rows(
         ++moe_prefill_calls;
       }
     }
-    if (decode_row) prefetch_attention_side(layer + 1);
+    if (decode_row) prefetch_attention_side(layer + 1, T);
     if (boundary_) {
       // A captured sync is an error — under capture the fold is a
       // recorded node and the stream order IS the drain.
@@ -1559,12 +1689,35 @@ GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_run_rows(
         debug_sync("ffn", layer, decode_row);
         DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
       }
-      boundary_->reduce(ffn_out, T, H);
+      if (next_split) {
+        // Block A's fold is exposed; block B's flies beside the next
+        // layer's block A (its update lands at that site's seam).
+        // ffn_out is sub_out_ at these shapes.
+        boundary_->reduce(ffn_out, TA, H);
+        ffn_b_pending = boundary_->begin_async(ffn_out + static_cast<size_t>(TA) * H, TB, H);
+        if (!ffn_b_pending) boundary_->reduce(ffn_out + static_cast<size_t>(TA) * H, TB, H);
+      } else {
+        boundary_->reduce(ffn_out, T, H);
+      }
+    } else if (next_split) {
+      ffn_b_pending = true;  // the split walk without a reducer (the unit gate): the same deferred update
     }
     if (ffn_comb_deferred) DGPP_CUDA_OK(cudaStreamWaitEvent(stream_, mhc_join_, 0));
-    launch_mhc_stream_update(post_, comb_, ffn_out, cur, nxt, mhc_cfg_, T,
-                             stream_);
+    if (ffn_b_pending) {
+      mhc_update_rows(ffn_out, cur, nxt, 0, TA);  // block B's follows its fold
+    } else {
+      launch_mhc_stream_update(post_, comb_, ffn_out, cur, nxt, mhc_cfg_, T,
+                               stream_);
+      std::swap(cur, nxt);
+    }
+  }
+  if (ffn_b_pending) {
+    // The last layer's FFN fold of block B.
+    drain();
+    if (boundary_) boundary_->end_async();
+    mhc_update_rows(sub_out_, cur, nxt, TA, TB);
     std::swap(cur, nxt);
+    ffn_b_pending = false;
   }
 
   // ---- head: mean over streams, final norm, lm head -----------------

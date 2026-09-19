@@ -155,9 +155,14 @@ class DsaLayer {
   //             spans, 2026-09-14: span s's rows at its offset in the walk,
   //             so a selection-reusing layer finds every span's selection
   //             where the indexed layer left it; 0 for a one-request chunk)
+  //   state_only: write the rows' cache state — the latent rows, the index
+  //             pools, the tail ring, all functions of the site's INPUT — and
+  //             stop: no selection, no attention, `out` untouched. For a
+  //             caller that never reads the rows' output (the draft block's
+  //             prefill rows fill its caches and nothing else).
   void enqueue_prefill(const void* hidden_in, DsaStatePool& state, int layer,
                        int req, int64_t token_start, int tokens, void* out,
-                       cudaStream_t stream, int row_base = 0);
+                       cudaStream_t stream, int row_base = 0, bool state_only = false);
 
   // Decodes a batch of `tokens` rows over `num_requests` requests.
   //   hidden_in: bf16 [tokens, hidden] (padding rows: any input — kernels

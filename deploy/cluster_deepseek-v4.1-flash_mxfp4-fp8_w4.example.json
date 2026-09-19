@@ -5,6 +5,7 @@
   "engine": {
     "max_concurrency": 6,
     "kv_capacity": 131072,
+    "bf16_weights": "bf12",
     "prefill": "bounded",
     "default_max_tokens": 256,
     "queue_limit": 8,

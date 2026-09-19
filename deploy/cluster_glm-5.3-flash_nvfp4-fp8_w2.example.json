@@ -6,6 +6,7 @@
     "max_concurrency": 4,
     "kv_capacity": 163840,
     "kv_dtype": "fp8",
+    "bf16_weights": "bf12",
     "default_max_tokens": 256,
     "queue_limit": 8,
     "max_connections": 64,

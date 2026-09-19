@@ -19,6 +19,8 @@
 // token — a uniform shift would be RoPE-invariant but not kpool-invariant).
 #include "models/glm/forward.hpp"
 
+#include <cstdlib>
+
 #include <stdexcept>
 
 #include "common/cuda_check.hpp"
@@ -54,6 +56,7 @@ void GlmDiagnosticModel::mtp_run_rows(int req, int64_t first_pos, int T,
   if (!r.enorm || !r.hnorm || !r.eh_proj || !r.shared_head_norm)
     throw std::runtime_error("mtp: the draft layer's head tensors are unbound");
   const GlmLayerBound b = bind_layer(r, /*dense_mlp=*/false);
+  gemm_.set_bf12_wide(decode_row);  // the decode batch's alone (kernels/gemm.hpp)
 
   // ---- input: [enorm(embed) | hnorm(hidden)] -> eh_proj ------------------
   if (decode_row && batched) {
@@ -92,11 +95,28 @@ void GlmDiagnosticModel::mtp_run_rows(int req, int64_t first_pos, int T,
 
   // ---- attention site -----------------------------------------------------
   glm_rmsnorm_bf16(mtp_x_, b.ln1, normed_, T, H, eps, stream_);
-  uint16_t* attn_out = staged_or(sub_out_);
   dsa_->rebind(*b.dsa);
   if (!dsa_->prepare(T))
     throw std::runtime_error("mtp: DSA GEMM plans unavailable");
   const int ordinal = main_dsa_layers_;
+  if (!decode_row) {
+    // Prefill rows fill the block's caches and nothing reads their output:
+    // no head runs for them, and the chain's hidden comes from a decode
+    // row. The DSA site's state — latent rows, index pools, tail ring — is
+    // a function of the site's input alone, so the block stops once it is
+    // written: no selection or attention, no feed-forward site (it was 5 %
+    // of a prefill on its own, through the host-segmented path), no folds
+    // (and so no staged handout is taken). Every rank takes the same
+    // branch. DGPP_MTP_PREFILL_FULL=1 runs the whole block as before.
+    static const bool full_block = std::getenv("DGPP_MTP_PREFILL_FULL") != nullptr;
+    if (!full_block) {
+      dsa_->enqueue_prefill(normed_, pool_, ordinal, req, first_pos, T, sub_out_, stream_,
+                            /*row_base=*/0, /*state_only=*/true);
+      if (!capture_mode) debug_sync("mtp prefill state", -1, decode_row);
+      return;
+    }
+  }
+  uint16_t* attn_out = staged_or(sub_out_);
   if (decode_row) {
     dsa_->enqueue_decode(normed_, pool_, ordinal, d_req_ids_, d_step_pos_,
                          d_req_spans_, batched ? batch_requests : 1, T, attn_out,

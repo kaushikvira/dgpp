@@ -1,6 +1,7 @@
 #include "models/glm_dsa/model.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -9,6 +10,7 @@
 #include <string>
 
 #include "common/cuda_check.hpp"
+#include "kernels/bf12_companions.hpp"
 #include "kernels/dsa.hpp"
 #include "kernels/glm_norm.hpp"
 #include "kernels/kernels.hpp"
@@ -119,9 +121,17 @@ GlmDsaModel::GlmDsaModel(const GlmDsaTextConfig& cfg, const std::string& checkpo
   // persistent kernels) — so the caches below take the memory the load
   // used rather than sit beside it (the plan counts the staging only
   // beyond what the caches replace).
+  // The bf16 decode weights' 12-bit companions are packed as each layer
+  // lands (under bf12-only residency the layer's bf16 bytes go back at once:
+  // no more than one layer's sit beside their companions).
   if (residency == GlmDsaResidency::Resident) {
     const int layers = cfg_.num_hidden_layers + (mtp && cfg_.mtp_layer() >= 0 ? 1 : 0);
-    for (int l = 0; l < layers; ++l) (void)loader_.load_layer(l);
+    const bool pack = Bf12Companions::enabled();
+    for (int l = 0; l < layers; ++l) {
+      const GlmDsaLayerResident& r = loader_.load_layer(l);
+      if (pack) pack_layer_companions(l, r);
+    }
+    if (pack) finish_companions();
     loader_.release_sources();
   }
   log_memory_ledger("glm_dsa: layers resident, sources released");
@@ -215,6 +225,108 @@ GlmDsaModel::GlmDsaModel(const GlmDsaTextConfig& cfg, const std::string& checkpo
   DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
 }
 
+// The lossless 12-bit companions of the decode GEMV's bf16 weights
+// (engine.bf16_weights = "bf12"; kernels/bf12_companions.hpp): what this
+// checkpoint leaves bf16 on the matmul seam — the dense layers' and the
+// draft's attention projections and MLPs, every indexer, the head and
+// eh_proj (2.25 of the 3.65 GB of bf16 a step reads per rank at world 4;
+// kv_b and the routers ride their own kernels), packed as each layer lands.
+// Prefill and the batches past eight rows keep the bf16 bytes — or, under
+// bf12-only residency (the bytes returned here, layer by layer), expand
+// them and take the packed launches (kernels/gemm.hpp).
+void GlmDsaModel::pack_layer_companions(int layer, const GlmDsaLayerResident& r) {
+  const auto t0 = std::chrono::steady_clock::now();
+  const int64_t H = cfg_.hidden_size;
+  const auto release = [&](const void* w) { return loader_.release_packed(layer, w); };
+  const auto pack = [&](const uint16_t* w, int64_t n, int64_t k) {
+    bf12_.pack_and_release(w, n, k, gemm_, stream_, release);
+  };
+  const GlmDsaAttnResident& a = r.attn;
+  const int64_t lh = a.local_heads;
+  if (!a.packed()) {
+    pack(a.qkv_a, cfg_.q_lora_rank + cfg_.kv_lora_rank + cfg_.qk_rope_head_dim, H);
+    pack(a.q_b, lh * cfg_.qk_head_dim(), cfg_.q_lora_rank);
+  }
+  if (a.o_proj != nullptr && a.o_proj_packed.packed == nullptr) pack(a.o_proj, H, lh * cfg_.v_head_dim);
+  if (a.owns_indexer()) {
+    pack(a.wq_b, static_cast<int64_t>(cfg_.index_n_heads) * cfg_.index_head_dim, cfg_.q_lora_rank);
+    pack(a.wk, cfg_.index_head_dim, H);
+    pack(a.wp, cfg_.index_n_heads, H);
+  }
+  if (!r.moe && r.dense.gate != nullptr) {
+    pack(r.dense.gate, r.dense.local_inter, H);
+    pack(r.dense.up, r.dense.local_inter, H);
+    pack(r.dense.down, H, r.dense.local_inter);
+  }
+  if (r.eh_proj != nullptr) pack(r.eh_proj, H, 2 * H);
+  bf12_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// The lm head's, the expansion scratch (one slot: no walk of this family
+// calls a matrix twice), and the summary.
+void GlmDsaModel::finish_companions() {
+  const auto t0 = std::chrono::steady_clock::now();
+  // (The session core learns the head's rows after the load: the globals' here.)
+  const int head_rows = globals_.lm_vocab_count > 0 ? globals_.lm_vocab_count : cfg_.vocab_size;
+  bf12_.pack_and_release(globals_.lm_head, head_rows, cfg_.hidden_size, gemm_, stream_,
+                         [&](const void* w) { return loader_.release_packed(-1, w); });
+  bf12_.finish(gemm_, kBf12ExpandSlots);
+  bf12_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  bf12_.log_summary(loader_.rank(), bf12_s_);
+}
+
+// bf12-only residency's expansion slot: the largest packed matrix under the
+// cap, by formula (pack_layer_companions' matrices).
+size_t GlmDsaModel::bf12_slot_bytes(const GlmDsaTextConfig& cfg, int tp_rank, int tp_world,
+                                    GlmDsaHeadSharding head, bool mtp) {
+  const GlmDsaLocalGeometry geo = GlmDsaLocalGeometry::from_config(cfg, tp_rank, tp_world, head);
+  const size_t H = static_cast<size_t>(cfg.hidden_size), lh = static_cast<size_t>(geo.local_heads);
+  const auto ok = [](size_t n, size_t k) {
+    return bf12_shape_ok(static_cast<int>(n), static_cast<int>(k)) ? n * k * 2 : size_t{0};
+  };
+  const size_t q_lora = static_cast<size_t>(cfg.q_lora_rank);
+  bool bf16_attn = mtp && cfg.mtp_layer() >= 0, dense = false, indexer = false;
+  for (int l = 0; l < cfg.num_hidden_layers; ++l) {
+    bf16_attn = bf16_attn || !cfg.packed_layer(l);
+    dense = dense || !cfg.is_moe_layer(l);
+    indexer = indexer || cfg.owns_indexer(l);
+  }
+  const size_t I = static_cast<size_t>(geo.local_dense_inter);
+  return Bf12Companions::planned_slot_bytes(
+      {bf16_attn ? ok(static_cast<size_t>(cfg.q_lora_rank + cfg.kv_lora_rank + cfg.qk_rope_head_dim), H) : 0,
+       bf16_attn ? ok(lh * static_cast<size_t>(cfg.qk_head_dim()), q_lora) : 0,
+       bf16_attn ? ok(H, lh * static_cast<size_t>(cfg.v_head_dim)) : 0,
+       indexer ? ok(static_cast<size_t>(cfg.index_n_heads) * static_cast<size_t>(cfg.index_head_dim), q_lora) : 0,
+       indexer ? ok(static_cast<size_t>(cfg.index_head_dim), H) : 0,
+       indexer ? ok(static_cast<size_t>(cfg.index_n_heads), H) : 0, dense ? ok(I, H) : 0, dense ? ok(H, I) : 0,
+       mtp && cfg.mtp_layer() >= 0 ? ok(H, 2 * H) : 0, ok(static_cast<size_t>(geo.lm_vocab_count), H)});
+}
+
+// The companions' planned bytes: build_bf12_companions' matrices by formula.
+size_t GlmDsaModel::bf12_plan_bytes(const GlmDsaTextConfig& cfg, int tp_rank, int tp_world,
+                                    GlmDsaHeadSharding head, bool mtp) {
+  const GlmDsaLocalGeometry geo = GlmDsaLocalGeometry::from_config(cfg, tp_rank, tp_world, head);
+  const int64_t H = cfg.hidden_size, lh = geo.local_heads;
+  const size_t attn = Bf12Companions::planned_bytes(cfg.q_lora_rank + cfg.kv_lora_rank + cfg.qk_rope_head_dim, H) +
+                      Bf12Companions::planned_bytes(lh * cfg.qk_head_dim(), cfg.q_lora_rank) +
+                      Bf12Companions::planned_bytes(H, lh * cfg.v_head_dim);
+  const size_t indexer =
+      Bf12Companions::planned_bytes(static_cast<int64_t>(cfg.index_n_heads) * cfg.index_head_dim, cfg.q_lora_rank) +
+      Bf12Companions::planned_bytes(cfg.index_head_dim, H) + Bf12Companions::planned_bytes(cfg.index_n_heads, H);
+  const size_t dense = 2 * Bf12Companions::planned_bytes(geo.local_dense_inter, H) +
+                       Bf12Companions::planned_bytes(H, geo.local_dense_inter);
+  size_t bytes = Bf12Companions::planned_bytes(geo.lm_vocab_count, H);
+  const int layers = cfg.num_hidden_layers + (mtp && cfg.mtp_layer() >= 0 ? 1 : 0);
+  for (int l = 0; l < layers; ++l) {
+    const bool draft = l == cfg.mtp_layer();
+    if (draft || !cfg.packed_layer(l)) bytes += attn;
+    if (cfg.owns_indexer(l)) bytes += indexer;
+    if (!draft && !cfg.is_moe_layer(l)) bytes += dense;
+    if (draft) bytes += Bf12Companions::planned_bytes(H, 2 * H);
+  }
+  return bytes;
+}
+
 GlmDsaModel::~GlmDsaModel() {
   cudaFree(resid_);
   cudaFree(x_);
@@ -262,8 +374,15 @@ GlmDsaModel::MemoryPlan GlmDsaModel::plan_memory(const GlmDsaTextConfig& cfg, in
   const DsaConfig dsa = dsa_config(cfg, tp_world, mtp, latent_format);
 
   size_t staging = 0;
+  // bf12-only residency: the packable bf16 matrices load aside and give
+  // their bytes back as each layer is packed (the companions and the
+  // prefill scratch are their own lines; all of it precedes the caches).
+  const bool bf12_only = Bf12Companions::packed_only() && residency == GlmDsaResidency::Resident;
   if (residency == GlmDsaResidency::Resident) {
-    plan.add("model weights (resident)", GlmDsaLayerStream::resident_bytes(cfg, tp_rank, tp_world, head, mtp));
+    size_t resident = GlmDsaLayerStream::resident_bytes(cfg, tp_rank, tp_world, head, mtp);
+    if (bf12_only) resident -= GlmDsaLayerStream::side_bytes(cfg, tp_rank, tp_world, head, mtp);
+    plan.add(bf12_only ? "model weights (resident, packed bf16 matrices released)" : "model weights (resident)",
+             resident);
     staging = GlmDsaLayerStream::staging_plan_bytes(cfg, tp_rank, tp_world, head, mtp);
   } else {
     size_t largest = 0;
@@ -273,6 +392,11 @@ GlmDsaModel::MemoryPlan GlmDsaModel::plan_memory(const GlmDsaTextConfig& cfg, in
     plan.add("model weights (one streamed layer + globals)",
              largest + GlmDsaLayerStream::globals_bytes(cfg, tp_rank, tp_world, head));
   }
+  if (Bf12Companions::enabled() && residency == GlmDsaResidency::Resident)
+    plan.add("bf16 decode packing (12-bit companions)", bf12_plan_bytes(cfg, tp_rank, tp_world, head, mtp));
+  if (bf12_only)
+    plan.add("bf16 prefill expansion scratch",
+             static_cast<size_t>(kBf12ExpandSlots) * bf12_slot_bytes(cfg, tp_rank, tp_world, head, mtp));
   const size_t after_weights = plan.total_bytes();
   plan.add("gemm workspace (at least)", size_t{64} << 20);
   plan.add(std::string("dsa cache pool (latent ") + latent_format_name(latent_format) +
@@ -412,9 +536,9 @@ void GlmDsaModel::prefetch_ffn_side(const GlmDsaLayerResident& r) {
     for (int i = 0; i < 3; ++i) prefetch_packed(r.moe_w.shared[i]);
   } else {
     const size_t I = static_cast<size_t>(r.dense.local_inter);
-    if (r.dense.gate) prefetch_.add(r.dense.gate, I * H * 2);
-    if (r.dense.up) prefetch_.add(r.dense.up, I * H * 2);
-    if (r.dense.down) prefetch_.add(r.dense.down, I * H * 2);
+    if (r.dense.gate) prefetch_bf16(r.dense.gate, I * H * 2);
+    if (r.dense.up) prefetch_bf16(r.dense.up, I * H * 2);
+    if (r.dense.down) prefetch_bf16(r.dense.down, I * H * 2);
   }
 }
 
@@ -438,17 +562,26 @@ void GlmDsaModel::prefetch_attention_side(int layer) {
     prefetch_packed(a.qkv_a_packed);
     prefetch_packed(a.q_b_packed);
   } else {
-    if (a.qkv_a) prefetch_.add(a.qkv_a, qkv_rows * H * 2);
+    if (a.qkv_a) prefetch_bf16(a.qkv_a, qkv_rows * H * 2);
     if (a.q_b)
-      prefetch_.add(a.q_b, static_cast<size_t>(a.local_heads) * static_cast<size_t>(cfg_.qk_head_dim()) *
+      prefetch_bf16(a.q_b, static_cast<size_t>(a.local_heads) * static_cast<size_t>(cfg_.qk_head_dim()) *
                                static_cast<size_t>(cfg_.q_lora_rank) * 2);
   }
   if (a.owns_indexer()) {
-    prefetch_.add(a.wq_b, static_cast<size_t>(cfg_.index_n_heads) * cfg_.index_head_dim *
+    prefetch_bf16(a.wq_b, static_cast<size_t>(cfg_.index_n_heads) * cfg_.index_head_dim *
                               static_cast<size_t>(cfg_.q_lora_rank) * 2);
-    prefetch_.add(a.wk, static_cast<size_t>(cfg_.index_head_dim) * H * 2);
-    prefetch_.add(a.wp, static_cast<size_t>(cfg_.index_n_heads) * H * 2);
+    prefetch_bf16(a.wk, static_cast<size_t>(cfg_.index_head_dim) * H * 2);
+    prefetch_bf16(a.wp, static_cast<size_t>(cfg_.index_n_heads) * H * 2);
   }
+}
+
+// A bf16 matmul weight into the open window: the bytes the walk's launch
+// streams — its packed companion's when the GEMM holds one.
+void GlmDsaModel::prefetch_bf16(const uint16_t* w, size_t bytes) {
+  const void* view = nullptr;
+  size_t view_bytes = 0;
+  gemm_.resident_view(w, bytes, walk_rows_, &view, &view_bytes);
+  prefetch_.add_view(w, view, view_bytes);  // a companion is its own allocation
 }
 
 void GlmDsaModel::prefetch_head() {
@@ -456,7 +589,7 @@ void GlmDsaModel::prefetch_head() {
   const size_t H = static_cast<size_t>(cfg_.hidden_size);
   prefetch_.open_window(stream_, prefetch_window_bytes_, prefetch_.boundary_rate());
   if (globals_.final_norm) prefetch_.add(globals_.final_norm, H * 2);
-  if (globals_.lm_head) prefetch_.add(globals_.lm_head, static_cast<size_t>(lm_vocab_count_) * H * 2);
+  if (globals_.lm_head) prefetch_bf16(globals_.lm_head, static_cast<size_t>(lm_vocab_count_) * H * 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -560,6 +693,10 @@ void GlmDsaModel::enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, ui
 
 GlmDsaModel::Outputs GlmDsaModel::run_rows(const RowRun& run) {
   const int T = run.T, req = run.req;
+  // The packed companions' wide launches are the decode batch's alone (a
+  // short prefill chunk keeps its Lt algorithm: kernels/gemm.hpp).
+  gemm_.set_bf12_wide(run.decode);
+  walk_rows_ = T;
   if (run.capture && loader_.residency() != GlmDsaResidency::Resident)
     throw std::logic_error("run_rows: a capture needs a resident stack");
   const int H = cfg_.hidden_size;
@@ -701,6 +838,8 @@ void GlmDsaModel::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos
   if (!mtp_) throw std::logic_error("mtp_run_rows: MTP is not enabled");
   if (T <= 0 || T > max_tokens_) throw std::invalid_argument("mtp_run_rows: rows");
   if (head_rows < 0 || head_rows > T) throw std::invalid_argument("mtp_run_rows: head_rows");
+  gemm_.set_bf12_wide(decode_row);  // the decode batch's alone (kernels/gemm.hpp)
+  walk_rows_ = T;
   const int H = cfg_.hidden_size;
   const float eps = cfg_.rms_norm_eps;
   const int64_t* d_pos = decode_row ? d_step_pos_ : d_prefill_pos_;

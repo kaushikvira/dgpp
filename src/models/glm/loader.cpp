@@ -1,5 +1,7 @@
 #include "models/glm/loader.hpp"
 
+#include "common/bf16_residency.hpp"
+
 #include "loaders/weight_build.hpp"
 
 #include <algorithm>
@@ -196,9 +198,8 @@ struct BuildCtx : WeightBuilder<GlmExpectedTensor> {
     // separately. f_a/g_a are replicated (full rows); q/k/v and b carry
     // this rank's head rows.
     const int64_t in_rows = 2 * head_dim + 3 * lp_s + h_s;
-    uint16_t* in_proj = static_cast<uint16_t*>(
-        bump.alloc(static_cast<size_t>(in_rows) * static_cast<size_t>(hidden) *
-                   2));
+    // (packable: the model's 12-bit companion replaces it — grant_bf16.)
+    uint16_t* in_proj = static_cast<uint16_t*>(grant_bf16(in_rows, hidden, /*packable=*/true));
     struct Piece {
       const char* name;
       int64_t full_rows;  // source rows (geometry check)
@@ -271,8 +272,7 @@ struct BuildCtx : WeightBuilder<GlmExpectedTensor> {
       const GlmExpectedTensor& e = expected(name);
       if (e.shape[0] != hidden || e.shape[1] != lp_f)
         throw std::runtime_error("glm loader: KDA o_proj geometry mismatch");
-      uint16_t* packed = static_cast<uint16_t*>(
-          bump.alloc(static_cast<size_t>(hidden) * lp_s * 2));
+      uint16_t* packed = static_cast<uint16_t*>(grant_bf16(hidden, lp_s, /*packable=*/true));
       if (copy) {
         packs.push_back(PackJob{
             static_cast<const uint16_t*>(source(name).data) + rank * lp_s,
@@ -475,7 +475,7 @@ struct BuildCtx : WeightBuilder<GlmExpectedTensor> {
         "model.language_model.layers." + std::to_string(layer) + ".";
     out.enorm = load_bf16(p + "enorm.weight");
     out.hnorm = load_bf16(p + "hnorm.weight");
-    out.eh_proj = load_bf16(p + "eh_proj.weight");
+    out.eh_proj = load_bf16(p + "eh_proj.weight", /*packable=*/true);
     out.shared_head_norm = load_bf16(p + "shared_head.norm.weight");
   }
 
@@ -509,11 +509,16 @@ struct BuildCtx : WeightBuilder<GlmExpectedTensor> {
 };
 
 // Runs one layer's build in counting mode; returns the exact byte total at
-// the given rank's geometry.
-size_t count_layer_bytes(const GlmTextConfig& cfg, int layer, int rank,
-                         int world) {
+// the given rank's geometry — and, of it, the bytes a side-grant build
+// places aside (LayerBump: the packable bf16 matrices).
+struct CountedLayer {
+  size_t bytes = 0;
+  size_t side_bytes = 0;
+};
+CountedLayer count_layer(const GlmTextConfig& cfg, int layer, int rank, int world) {
   GlmLayerBump bump;
   bump.counting = true;
+  bump.side_mode = true;
   bump.capacity = SIZE_MAX;
   std::vector<GlmExpectedTensor> table =
       glm_expected_layer_tensors(cfg, layer);
@@ -526,7 +531,10 @@ size_t count_layer_bytes(const GlmTextConfig& cfg, int layer, int rank,
   BuildCtx ctx(cfg,    table, by_name, bump,  scratch,
                 no_tensors, jobs,  packs,   false, rank, world);
   ctx.build_layer(layer);
-  return bump.cursor;
+  return CountedLayer{bump.cursor, bump.side_bytes};
+}
+size_t count_layer_bytes(const GlmTextConfig& cfg, int layer, int rank, int world) {
+  return count_layer(cfg, layer, rank, world).bytes;
 }
 
 }  // namespace
@@ -534,6 +542,10 @@ size_t count_layer_bytes(const GlmTextConfig& cfg, int layer, int rank,
 size_t GlmLayerStream::layer_bytes(const GlmTextConfig& cfg, int layer,
                                    int rank, int world) {
   return count_layer_bytes(cfg, layer, rank, world);
+}
+
+size_t GlmLayerStream::layer_side_bytes(const GlmTextConfig& cfg, int layer, int rank, int world) {
+  return count_layer(cfg, layer, rank, world).side_bytes;
 }
 
 namespace {
@@ -566,6 +578,23 @@ size_t GlmLayerStream::globals_bytes(const GlmTextConfig& cfg, int rank,
                                          cfg.hidden_size * 2);
   const size_t norm_bytes = align_up_256(static_cast<size_t>(cfg.hidden_size) * 2);
   return embed_bytes + head_bytes + norm_bytes;
+}
+
+// The lm head is the globals' packable matrix (the model's 12-bit companion
+// replaces it): its grant goes aside under side grants.
+size_t GlmLayerStream::globals_side_bytes(const GlmTextConfig& cfg, int rank, int world,
+                                          GlmHeadSharding head) {
+  const int head_vocab = lm_vocab_count(cfg, rank, world, head);
+  if (!bf12_shape_ok(head_vocab, cfg.hidden_size)) return 0;
+  return align_up_256(static_cast<size_t>(head_vocab) * cfg.hidden_size * 2);
+}
+
+size_t GlmLayerStream::side_bytes(const GlmTextConfig& cfg, int rank, int world,
+                                  GlmHeadSharding head, bool with_mtp) {
+  size_t total = globals_side_bytes(cfg, rank, world, head);
+  for (int l = 0; l < cfg.num_hidden_layers; ++l) total += layer_side_bytes(cfg, l, rank, world);
+  if (with_mtp && cfg.mtp_layer() >= 0) total += layer_side_bytes(cfg, cfg.mtp_layer(), rank, world);
+  return total;
 }
 
 size_t GlmLayerStream::resident_bytes(const GlmTextConfig& cfg, int rank,
@@ -654,8 +683,13 @@ GlmLayerStream::GlmLayerStream(const GlmTextConfig& cfg,
   } else {
     layer_bump_->init(capacity);
   }
+  // Side grants (common/bf16_residency.hpp): resident stacks only — a
+  // streaming bump is rewritten every forward and is never packed.
+  side_grants_ = residency_ == GlmResidency::Resident && bf16_side_grants();
   const size_t globals_cap = globals_bytes(cfg_, rank_, world_, head_);
-  globals_bump_->init(globals_cap);
+  globals_bump_->side_mode = side_grants_;
+  globals_bump_->init(globals_cap -
+                      (side_grants_ ? globals_side_bytes(cfg_, rank_, world_, head_) : 0));
   // one pinned staging mirror serves every bump (layers and globals build
   // one at a time and exit synced): sized for the largest of them.
   staging_bytes_ = std::max(capacity, globals_cap);
@@ -713,7 +747,15 @@ std::pair<const void*, size_t> GlmLayerStream::resident_layer_span(
       resident_layers_[static_cast<size_t>(layer)].layer != layer)
     return {nullptr, 0};
   const GlmLayerBump& b = *resident_bumps_[static_cast<size_t>(layer)];
-  return {b.base, b.cursor};
+  return {b.base, b.dev_cursor};
+}
+
+void GlmLayerStream::copy_resident_layer(int layer, void* dst) const {
+  if (residency_ != GlmResidency::Resident || layer < 0 ||
+      layer >= static_cast<int>(resident_bumps_.size()) ||
+      !resident_bumps_[static_cast<size_t>(layer)])
+    throw std::out_of_range("glm loader: copy_resident_layer of a layer that is not resident");
+  resident_bumps_[static_cast<size_t>(layer)]->download(dst);
 }
 
 void GlmLayerStream::set_resident_image_dir(const std::string& dir) {
@@ -793,8 +835,7 @@ void GlmLayerStream::restore_layer_from_image(int layer, GlmLayerBump& bump,
   }();
   image_->read_layer(layer, staging_, bytes, verify);
   sync_load_boundary(reader_, stream_);
-  DGPP_CUDA_OK(cudaMemcpyAsync(bump.base, staging_, bytes,
-                               cudaMemcpyHostToDevice, stream_));
+  bump.upload(stream_);  // stage == staging_: the blob is the mirror's layout
   DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
   out.bytes = bytes;
   ++image_restored_;
@@ -804,7 +845,7 @@ void GlmLayerStream::capture_layer_to_image(int layer, const GlmLayerBump& bump,
                                             size_t bytes) {
   // The bump is final and the stream is synced (build_layer_into's exit);
   // the staging mirror is free again, so it carries the D2H.
-  DGPP_CUDA_OK(cudaMemcpy(staging_, bump.base, bytes, cudaMemcpyDeviceToHost));
+  bump.download(staging_);
   try {
     image_->write_layer(layer, staging_, bytes);
     ++image_captured_;
@@ -873,8 +914,7 @@ void GlmLayerStream::build_layer_into(int layer, GlmLayerBump& bump,
   // alongside the builder's memcpys; then one H2D copy of the whole layer.
   for (const PackJob& j : packs)
     if (!j.src_on_device) run_host_pack(j, bump);
-  DGPP_CUDA_OK(cudaMemcpyAsync(bump.base, bump.stage, bump.cursor,
-                               cudaMemcpyHostToDevice, stream_));
+  bump.upload(stream_);
 
   // Phase two: the dequants (device -> device inside the bump).
   for (const DequantJob& j : jobs)
@@ -924,7 +964,9 @@ const GlmLayerResident& GlmLayerStream::load_layer(int layer) {
           "layer you need — the MTP draft included — before releasing)");
 
     auto bump = std::make_unique<GlmLayerBump>();
-    bump->init(layer_bytes(cfg_, layer, rank_, world_));
+    bump->side_mode = side_grants_;
+    const CountedLayer counted = count_layer(cfg_, layer, rank_, world_);
+    bump->init(counted.bytes - (side_grants_ ? counted.side_bytes : 0));
     if (image_ && image_->has_layer(layer)) {
       restore_layer_from_image(layer, *bump, slot);
     } else {
@@ -1079,12 +1121,13 @@ const GlmGlobalsResident& GlmLayerStream::load_globals() {
   globals_bump_->stage = staging_;
   globals_ = GlmGlobalsResident{};
 
-  auto copy_global = [&](const std::string& name) -> uint16_t* {
+  auto copy_global = [&](const std::string& name, bool packable = false) -> uint16_t* {
     auto it = tensors_.find(name);
     if (it == tensors_.end() || !it->second)
       throw std::runtime_error("glm loader: global tensor missing: " + name);
     const TensorInfo& t = *it->second;
-    uint16_t* dst = static_cast<uint16_t*>(globals_bump_->alloc(t.nbytes()));
+    uint16_t* dst = static_cast<uint16_t*>(packable ? globals_bump_->alloc_side(t.nbytes())
+                                                    : globals_bump_->alloc(t.nbytes()));
     std::memcpy(globals_bump_->host(dst), t.data, t.nbytes());
     source_bytes_ += t.nbytes();
     verbatim_bytes_ += t.nbytes();
@@ -1102,7 +1145,9 @@ const GlmGlobalsResident& GlmLayerStream::load_globals() {
     const auto [begin, count] = lm_head_slice(cfg_, rank_, world_);
     const size_t row_bytes = static_cast<size_t>(cfg_.hidden_size) * 2;
     uint16_t* dst = static_cast<uint16_t*>(
-        globals_bump_->alloc(static_cast<size_t>(count) * row_bytes));
+        bf12_shape_ok(count, cfg_.hidden_size)
+            ? globals_bump_->alloc_side(static_cast<size_t>(count) * row_bytes)
+            : globals_bump_->alloc(static_cast<size_t>(count) * row_bytes));
     std::memcpy(globals_bump_->host(dst),
                 static_cast<const uint8_t*>(t.data) +
                     static_cast<size_t>(begin) * row_bytes,
@@ -1112,7 +1157,7 @@ const GlmGlobalsResident& GlmLayerStream::load_globals() {
     globals_.lm_vocab_begin = begin;
     globals_.lm_vocab_count = count;
   } else {
-    globals_.lm_head = copy_global("lm_head.weight");
+    globals_.lm_head = copy_global("lm_head.weight", bf12_shape_ok(cfg_.vocab_size, cfg_.hidden_size));
     globals_.lm_vocab_begin = 0;
     globals_.lm_vocab_count = cfg_.vocab_size;
   }
@@ -1125,11 +1170,22 @@ const GlmGlobalsResident& GlmLayerStream::load_globals() {
         "glm loader: globals byte-formula drift: used " +
         std::to_string(globals_.bytes) + " != formula " +
         std::to_string(expected_bytes));
-  DGPP_CUDA_OK(cudaMemcpyAsync(globals_bump_->base, globals_bump_->stage,
-                               globals_.bytes, cudaMemcpyHostToDevice,
-                               stream_));
+  globals_bump_->upload(stream_);
   DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
   return globals_;
+}
+
+// The bf16 bytes of a packed matrix go back to the device (bf12-only
+// residency): `weight` is a side grant of the layer's bump — or of the
+// globals' (layer < 0). Returns the bytes freed; 0 when the matrix was not
+// granted aside (another mode, or outside the packing contract).
+size_t GlmLayerStream::release_packed(int layer, const void* weight) {
+  if (!side_grants_) return 0;
+  if (layer < 0) return globals_bump_->release_side(weight);
+  if (layer >= static_cast<int>(resident_bumps_.size()) ||
+      !resident_bumps_[static_cast<size_t>(layer)])
+    return 0;
+  return resident_bumps_[static_cast<size_t>(layer)]->release_side(weight);
 }
 
 void GlmLayerStream::release_layer() {

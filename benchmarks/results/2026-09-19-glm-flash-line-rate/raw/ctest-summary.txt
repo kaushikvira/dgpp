@@ -1,0 +1,112 @@
+ 1/110 Test #1: qwen_forward_fixture ..................... Passed 0.12 sec
+ 2/110 Test #2: qwen_forward_smoke ....................... Passed 1.14 sec
+ 3/110 Test #3: qwen_forward_generate .................... Passed 18.68 sec
+ 4/110 Test #4: qwen_forward_test ........................ Passed 1.29 sec
+ 5/110 Test #5: qwen_decode_test ......................... Passed 2.94 sec
+ 6/110 Test #6: nic_regress_selftest ..................... Passed 0.48 sec
+ 7/110 Test #7: glm_tp_test .............................. Passed 34.86 sec
+ 8/110 Test #8: unit_tests ............................... Passed 9.66 sec
+ 9/110 Test #9: tokenizer_test ........................... Passed 0.26 sec
+ 10/110 Test #10: qwen_tokenizer_test ...................... Passed 0.17 sec
+ 11/110 Test #11: dsv41_tokenizer_test ..................... Passed 0.10 sec
+ 12/110 Test #12: dsv41_prompt_test ........................ Passed 0.09 sec
+ 13/110 Test #13: glm4_tokenizer_test ...................... Passed 0.25 sec
+ 14/110 Test #14: glm_dsa_tokenizer_test ................... Passed 0.22 sec
+ 15/110 Test #15: chat_template_test ....................... Passed 1.98 sec
+ 16/110 Test #16: qwen_chat_template_test .................. Passed 1.59 sec
+ 17/110 Test #17: glm4_chat_template_test .................. Passed 1.78 sec
+ 18/110 Test #18: glm_dsa_chat_template_test ............... Passed 1.95 sec
+ 19/110 Test #19: http_server_test ......................... Passed 6.35 sec
+ 20/110 Test #20: serve_test ............................... Passed 103.76 sec
+ 21/110 Test #21: fabric_serve_test ........................ Passed 3.05 sec
+ 22/110 Test #22: scheduler_test ........................... Passed 0.04 sec
+ 23/110 Test #23: unit ..................................... Passed 9.52 sec
+ 24/110 Test #24: checkpoint_audit_test .................... Passed 0.07 sec
+ 25/110 Test #25: route_trace_test ......................... Passed 0.11 sec
+ 26/110 Test #26: sampling_profile_test .................... Passed 0.05 sec
+ 27/110 Test #27: site_env_test ............................ Passed 1.74 sec
+ 28/110 Test #28: script_reports_test ......................***Failed 0.59 sec
+ 29/110 Test #29: portability_test ......................... Passed 0.28 sec
+ 30/110 Test #30: setup_tools_test ......................... Passed 1.75 sec
+ 31/110 Test #31: bootstrap_test ........................... Passed 0.12 sec
+ 32/110 Test #32: launcher_test ............................ Passed 8.59 sec
+ 33/110 Test #33: kda_test ................................. Passed 3.02 sec
+ 34/110 Test #34: dsa_test ................................. Passed 15.08 sec
+ 35/110 Test #35: qwen_gr_test ............................. Passed 0.42 sec
+ 36/110 Test #36: qwen_norm_test ........................... Passed 0.40 sec
+ 37/110 Test #37: gdn_test ................................. Passed 0.44 sec
+ 38/110 Test #38: qsa_test ................................. Passed 1.22 sec
+ 39/110 Test #39: qwen_ple_test ............................ Passed 0.72 sec
+ 40/110 Test #40: csa2_test ................................ Passed 0.49 sec
+ 41/110 Test #41: csa2_layer_test .......................... Passed 3.72 sec
+ 42/110 Test #42: dsv41_engram_layer_test .................. Passed 1.07 sec
+ 43/110 Test #43: dsv41_model_test ......................... Passed 3.55 sec
+ 44/110 Test #44: dsv41_forward_fixture .................... Passed 0.62 sec
+ 45/110 Test #45: dsv41_forward_smoke ...................... Passed 0.96 sec
+ 46/110 Test #46: dsv41_forward_generate ................... Passed 0.70 sec
+ 47/110 Test #47: dsv41_forward_test_e2e ................... Passed 0.95 sec
+ 48/110 Test #48: dsv41_forward_generate_teacher ........... Passed 0.64 sec
+ 49/110 Test #49: dsv41_forward_test ....................... Passed 0.90 sec
+ 50/110 Test #50: dsv41_forward_generate_bounded ........... Passed 0.60 sec
+ 51/110 Test #51: dsv41_forward_test_bounded_e2e ........... Passed 0.94 sec
+ 52/110 Test #52: dsv41_forward_generate_teacher_bounded ... Passed 0.57 sec
+ 53/110 Test #53: dsv41_forward_test_bounded ............... Passed 0.90 sec
+ 54/110 Test #54: dsv41_decode_test ........................ Passed 3.28 sec
+ 55/110 Test #55: dsv41_engram_test ........................ Passed 0.39 sec
+ 56/110 Test #56: qwen_moe_test ............................ Passed 2.65 sec
+ 57/110 Test #57: qwen_loader_test ......................... Passed 5.80 sec
+ 58/110 Test #58: glm4_attn_test ........................... Passed 0.43 sec
+ 59/110 Test #59: glm4_loader_test ......................... Passed 0.88 sec
+ 60/110 Test #60: glm4_forward_fixture ..................... Passed 0.08 sec
+ 61/110 Test #61: glm4_forward_smoke ....................... Passed 0.87 sec
+ 62/110 Test #62: glm4_forward_generate .................... Passed 6.86 sec
+ 63/110 Test #63: glm4_forward_test ........................ Passed 0.92 sec
+ 64/110 Test #64: glm_dsa_forward_fixture .................. Passed 0.09 sec
+ 65/110 Test #65: glm_dsa_forward_smoke .................... Passed 0.91 sec
+ 66/110 Test #66: glm_dsa_forward_generate ................. Passed 13.15 sec
+ 67/110 Test #67: glm_dsa_forward_test ..................... Passed 0.97 sec
+ 68/110 Test #68: glm_dsa_prefill_fixture .................. Passed 0.12 sec
+ 69/110 Test #69: glm_dsa_prefill_generate ................. Passed 105.29 sec
+ 70/110 Test #70: glm_dsa_prefill_test ..................... Passed 0.97 sec
+ 71/110 Test #71: glm_dsa_decode_test ...................... Passed 1.32 sec
+ 72/110 Test #72: glm_dsa_tp_test .......................... Passed 3.70 sec
+ 73/110 Test #73: glm_dsa_engine_test ...................... Passed 7.04 sec
+ 74/110 Test #74: glm4_decode_test ......................... Passed 1.03 sec
+ 75/110 Test #75: glm4_tp_test ............................. Passed 1.49 sec
+ 76/110 Test #76: glm4_engine_test ......................... Passed 2.82 sec
+ 77/110 Test #77: glm_dsa_loader_test ...................... Passed 1.03 sec
+ 78/110 Test #78: dsv41_loader_test ........................ Passed 8.65 sec
+ 79/110 Test #79: dsv41_tp_test ............................ Passed 7.45 sec
+ 80/110 Test #80: dsv41_engine_test ........................ Passed 7.95 sec
+ 81/110 Test #81: qwen_tp_test ............................. Passed 3.38 sec
+ 82/110 Test #82: qwen_engine_test ......................... Passed 9.08 sec
+ 83/110 Test #83: qwen_engine_row_independent .............. Passed 2.56 sec
+ 84/110 Test #84: glm_loader_test .......................... Passed 2.66 sec
+ 85/110 Test #85: bf16_gemv_test ........................... Passed 16.08 sec
+ 86/110 Test #86: bf12_gemv_test ........................... Passed 0.65 sec
+ 87/110 Test #87: mma_gemv_test ............................ Passed 3.06 sec
+ 88/110 Test #88: fp4_gemv_test ............................ Passed 0.52 sec
+ 89/110 Test #89: packq_gemv_test .......................... Passed 0.57 sec
+ 90/110 Test #90: packq_gemm_test .......................... Passed 0.50 sec
+ 91/110 Test #91: scale_gemm_test .......................... Passed 0.80 sec
+ 92/110 Test #92: glm_mhc_test ............................. Passed 2.65 sec
+ 93/110 Test #93: det_math_test ............................ Passed 4.43 sec
+ 94/110 Test #94: glm_pick_test ............................ Passed 1.10 sec
+ 95/110 Test #95: glm_moe_test ............................. Passed 25.12 sec
+ 96/110 Test #96: glm_forward_fixture ...................... Passed 0.15 sec
+ 97/110 Test #97: glm_forward_generate ..................... Passed 2.17 sec
+ 98/110 Test #98: glm_forward_test ......................... Passed 0.91 sec
+ 99/110 Test #99: dsa_dump_generate ........................ Passed 0.49 sec
+100/110 Test #100: dsa_dump_test ............................ Passed 0.80 sec
+101/110 Test #101: kda_dump_generate ........................ Passed 0.06 sec
+102/110 Test #102: kda_dump_test ............................ Passed 2.96 sec
+103/110 Test #103: doll_selftest ............................ Passed 0.83 sec
+104/110 Test #104: flag_protocol_test ....................... Passed 1.28 sec
+105/110 Test #105: roster_selftest .......................... Passed 0.06 sec
+106/110 Test #106: bus_test ................................. Passed 35.49 sec
+107/110 Test #107: bus_selftest ............................. Passed 2.29 sec
+108/110 Test #108: glm_vision_test .......................... Passed 0.87 sec
+109/110 Test #109: glm_vision_stream_test ................... Passed 24.24 sec
+110/110 Test #110: glm_vision_frontend_test ................. Passed 0.25 sec
+99% tests passed, 1 tests failed out of 110
+Total Test time (real) = 583.71 sec

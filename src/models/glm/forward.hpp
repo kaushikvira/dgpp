@@ -26,6 +26,7 @@
 #include "engine/boundary_reducer.hpp"
 #include "engine/memory_plan.hpp"
 #include "engine/decode_outputs.hpp"
+#include "kernels/bf12_companions.hpp"
 #include "kernels/gemm.hpp"
 #include "kernels/glm_spec.hpp"
 #include "kernels/l2_prefetch.hpp"
@@ -644,6 +645,12 @@ class GlmDiagnosticModel : public PrefillReporting {
   // chunk multiples.
   int64_t kv_block_tokens() const;
   static constexpr int prefill_chunk_tokens() { return kPrefillChunkTokens; }
+  // The prefill fold overlap's switch and first row count (decode.cpp);
+  // without_reducer runs the row-block walk at world 1 too — the unit gate:
+  // the blocks must be bitwise the chunk.
+  void set_prefill_fold_overlap(bool on, int min_rows = 1024, bool without_reducer = false);
+  // The bf16 decode weights' 12-bit companions (gates read its counters).
+  const Bf12Companions& bf12_companions() const { return bf12_; }
 
   // Isolated parity runner (the curated suite's real-checkpoint mode):
   // every layer starts from the REFERENCE trajectory — layer_inputs[L]
@@ -709,8 +716,24 @@ class GlmDiagnosticModel : public PrefillReporting {
   // The block-boundary prefetch windows (decode rows): while the bus folds
   // one side of a layer, pull the OTHER side's first weights into L2.
   void prefetch_ffn_side(const GlmLayerBound& b, bool dense_mlp);
-  void prefetch_attention_side(int layer);
-  void prefetch_head();
+  // The prefill fold overlap (decode.cpp): on by default
+  // (DGPP_PREFILL_OVERLAP=off), from 1024-row chunks.
+  static bool fold_overlap_default();
+  bool fold_overlap_ = fold_overlap_default();
+  int fold_overlap_min_rows_ = 1024;
+  bool fold_overlap_without_reducer_ = false;
+  // The lossless 12-bit companions of the decode GEMV's bf16 weights
+  // (engine.bf16_weights; kernels/bf12_companions.hpp): packed — and, under
+  // bf12-only residency, their bf16 bytes returned — as each layer lands.
+  // Two expansion slots: the fold overlap's row blocks call a KDA site's in
+  // and o projections twice per chunk.
+  static constexpr int kBf12ExpandSlots = 2;
+  void pack_layer_companions(int layer, const GlmLayerResident& r);
+  void finish_companions();
+  Bf12Companions bf12_;
+  double bf12_ms_ = 0.0;
+  void prefetch_attention_side(int layer, int rows);
+  void prefetch_head(int rows);
 
   // The stack's only layer-load path: load_layer plus the resident-mode
   // hand-off — the stack walks layers in order, so the last main layer's

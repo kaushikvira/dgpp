@@ -3,6 +3,7 @@
 #include "kernels/scale_gemm.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -10,6 +11,7 @@
 #include <string>
 
 #include "common/cuda_check.hpp"
+#include "common/log.hpp"
 #include "kernels/glm_norm.hpp"
 #include "kernels/qwen_mtp.hpp"
 #include "kernels/qwen_norm.hpp"
@@ -235,6 +237,10 @@ QwenModel::MemoryPlan QwenModel::plan_memory(const QwenTextConfig& cfg, int max_
     plan.add("model weights (one streamed layer + globals + n-gram table)",
              largest + QwenLayerStream::globals_bytes(cfg, tp_rank, tp_world, head) +
                  QwenLayerStream::ngram_table_bytes(cfg, tp_rank, tp_world));
+  }
+  if (Bf12Companions::enabled() && residency == QwenResidency::Resident) {
+    const size_t packed = bf12_plan_bytes(cfg, geo, mtp);
+    if (packed > 0) plan.add("bf16 decode packing (12-bit companions)", packed);
   }
   plan.add("gemm workspace (at least)", size_t{64} << 20);
   if (QwenLayerStream::dense_weights_fp8())
@@ -493,6 +499,14 @@ void QwenModel::prefetch_add(const char* what, const void* p, size_t bytes) {
   prefetch_.add(p, bytes);
 }
 
+void QwenModel::prefetch_bf16(const char* what, const uint16_t* w, size_t bytes) {
+  const void* view = nullptr;
+  size_t view_bytes = 0;
+  gemm_.resident_view(w, bytes, walk_rows_, &view, &view_bytes);
+  if (prefetch_debug()) std::fprintf(stderr, "prefetch add %-18s %p %zu\n", what, view, view_bytes);
+  prefetch_.add_view(w, view, view_bytes);  // a companion is its own allocation
+}
+
 // The FP8 form's payload and scale grid (adjacent grants of one image).
 void QwenModel::prefetch_fp8(const char* what, const GlmQuantMatrix& q) {
   if (!q.payload) return;
@@ -548,12 +562,12 @@ void QwenModel::prefetch_attention_side(int layer) {
   if (r.kind == QwenLayerKind::Gdn && r.gdn.in_proj_qkv) {
     const size_t rows = static_cast<size_t>(r.gdn.local_key_heads) * cfg_.gdn_key_head_dim * 2 +
                         static_cast<size_t>(r.gdn.local_value_heads) * cfg_.gdn_value_head_dim;
-    prefetch_add("r.gdn.in_proj_qkv", r.gdn.in_proj_qkv, rows * H * 2);
+    prefetch_bf16("r.gdn.in_proj_qkv", r.gdn.in_proj_qkv, rows * H * 2);
   } else if (r.kind == QwenLayerKind::Gdn && r.gdn.in_proj_qkv_fp8.payload) {
     prefetch_fp8("r.gdn.in_proj_qkv_fp8", r.gdn.in_proj_qkv_fp8);
   } else if (r.qsa.q_proj) {
     const size_t rows = static_cast<size_t>(r.qsa.local_heads) * 2 * cfg_.head_dim;
-    prefetch_add("r.qsa.q_proj", r.qsa.q_proj, rows * H * 2);
+    prefetch_bf16("r.qsa.q_proj", r.qsa.q_proj, rows * H * 2);
   } else if (r.qsa.q_proj_fp8.payload) {
     prefetch_fp8("r.qsa.q_proj_fp8", r.qsa.q_proj_fp8);
   }
@@ -571,7 +585,7 @@ void QwenModel::prefetch_head(const QwenGrResident& mixer) {
   prefetch_.open_window(stream_, prefetch_window_bytes_, prefetch_.boundary_rate());
   prefetch_gr(mixer, /*inject=*/false);
   // Far larger than the window: add() clamps, the GEMV's leading rows hit.
-  if (globals_.lm_head) prefetch_add("globals_.lm_head", globals_.lm_head, static_cast<size_t>(lm_vocab_count_) * H * 2);
+  if (globals_.lm_head) prefetch_bf16("globals_.lm_head", globals_.lm_head, static_cast<size_t>(lm_vocab_count_) * H * 2);
   else prefetch_fp8("globals_.lm_head_fp8", globals_.lm_head_fp8);
 }
 
@@ -598,6 +612,8 @@ void QwenModel::prefetch_ple_value_side(const QwenLayerResident& r) {
 
 QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
   const int T = run.T, req = run.req;
+  walk_rows_ = T;
+  gemm_.set_bf12_wide(run.decode);  // the decode batch's alone (kernels/gemm.hpp)
   if (run.capture && loader_.residency() != QwenResidency::Resident)
     throw std::logic_error("run_rows: a capture needs a resident stack");
   const int H = cfg_.hidden_size, W = cfg_.hc_count * H;
@@ -959,17 +975,102 @@ void QwenModel::read_draft_snapshot(int req, const uint8_t* d) {
 void QwenModel::graph_prepare() {
   if (loader_.residency() != QwenResidency::Resident)
     throw std::logic_error("session_graph_prepare: the decode graph needs a resident stack");
+  // The bf16 decode weights' 12-bit companions are packed as each layer
+  // lands, before any capture.
+  const bool pack = Bf12Companions::enabled() && !bf12_built_;
   for (int layer = 0; layer < cfg_.num_hidden_layers; ++layer) {
     const QwenLayerResident& r = loader_.load_layer(layer);
     build_layer_objects(r);
     moe_->prepare_graph_table(layer, stream_);
+    if (pack) pack_layer_companions(layer, r);
   }
   if (mtp_) {
     // The draft layer's MoE takes the slot after the main stack's.
     const QwenLayerResident& r = loader_.load_layer(cfg_.mtp_layer());
     build_layer_objects(r);
     moe_->prepare_graph_table(n_moe_layers_, stream_);
+    if (pack) pack_layer_companions(cfg_.mtp_layer(), r);
   }
+  if (pack) finish_companions();
+}
+
+// The lossless 12-bit companions of the decode GEMV's bf16 weights
+// (engine.bf16_weights; kernels/bf12_gemv.hpp, format v2: the hidden 2560
+// and the 1536-wide slices carry a 512-column tail): the GDN's four input
+// projections (one multi-problem launch — QwenGdnLayer::in_projections picks
+// its packed twin) and its out projection, the QSA's q / k / v / index / o,
+// the draft block's, its two fc matrices and the head. Measured on the real
+// weights: 2-7 escapes per 10,000, no raw rows; cold GEMVs -15 to -26 %;
+// the four-node FP8 recipe +6.4 / +3.8 / +2.4 / +1.3 % at one to four live
+// requests, transcripts identical. Under engine.dense_weights = "fp8" every
+// one of those matrices is already block-FP8 (the head included): nothing
+// is packed. This family keeps both forms resident under either value of
+// the key (its loader grants nothing aside: every recipe has the room).
+void QwenModel::pack_layer_companions(int layer, const QwenLayerResident& r) {
+  if (QwenLayerStream::dense_weights_fp8()) return;
+  const auto t0 = std::chrono::steady_clock::now();
+  const int64_t H = cfg_.hidden_size;
+  const auto release = [&](const void* w) { return loader_.release_packed(layer, w); };
+  const auto pack = [&](const uint16_t* w, int64_t n, int64_t k) {
+    if (w != nullptr) bf12_.pack_and_release(w, n, k, gemm_, stream_, release);
+  };
+  if (r.kind == QwenLayerKind::Gdn) {
+    const int64_t lk = r.gdn.local_key_heads, lv = r.gdn.local_value_heads;
+    const int64_t LV = lv * cfg_.gdn_value_head_dim;
+    pack(r.gdn.in_proj_qkv, 2 * lk * cfg_.gdn_key_head_dim + LV, H);
+    pack(r.gdn.in_proj_z, LV, H);
+    pack(r.gdn.in_proj_a, lv, H);
+    pack(r.gdn.in_proj_b, lv, H);
+    pack(r.gdn.out_proj, H, LV);
+  } else {
+    const int64_t D = cfg_.head_dim, lh = r.qsa.local_heads, lkv = r.qsa.local_kv_heads;
+    pack(r.qsa.q_proj, lh * 2 * D, H);
+    pack(r.qsa.k_proj, lkv * D, H);
+    pack(r.qsa.v_proj, lkv * D, H);
+    pack(r.qsa.index_qk_proj, static_cast<int64_t>(cfg_.indexer_n_heads + 1) * cfg_.indexer_head_dim, H);
+    pack(r.qsa.o_proj, H, lh * D);
+  }
+  bf12_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+void QwenModel::finish_companions() {
+  bf12_built_ = true;
+  if (QwenLayerStream::dense_weights_fp8()) {
+    DGPP_LOG_INFO("rank {} bf12: nothing to pack — engine.dense_weights = fp8 already holds the dense "
+                  "projections and the head as block-FP8",
+                  loader_.rank());
+    return;
+  }
+  const auto t0 = std::chrono::steady_clock::now();
+  const int64_t H = cfg_.hidden_size;
+  const auto release = [&](const void* w) { return loader_.release_packed(-1, w); };
+  if (mtp_) {
+    if (globals_.mtp_fc_embedding) bf12_.pack_and_release(globals_.mtp_fc_embedding, H, H, gemm_, stream_, release);
+    if (globals_.mtp_fc_hidden) bf12_.pack_and_release(globals_.mtp_fc_hidden, H, H, gemm_, stream_, release);
+  }
+  if (globals_.lm_head) bf12_.pack_and_release(globals_.lm_head, lm_vocab_count_, H, gemm_, stream_, release);
+  bf12_.finish(gemm_, /*slots=*/1);
+  bf12_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  bf12_.log_summary(loader_.rank(), bf12_s_);
+}
+
+// The companions' planned bytes: pack_layer_companions' matrices by formula
+// (nothing under dense_weights = "fp8").
+size_t QwenModel::bf12_plan_bytes(const QwenTextConfig& cfg, const QwenLocalGeometry& geo, bool mtp) {
+  if (QwenLayerStream::dense_weights_fp8()) return 0;
+  const int64_t H = cfg.hidden_size;
+  size_t bytes = Bf12Companions::planned_bytes(geo.lm_vocab_count, H);
+  const int64_t lk = geo.local_key_heads, lv = geo.local_value_heads, LV = lv * cfg.gdn_value_head_dim;
+  const size_t gdn = Bf12Companions::planned_bytes(2 * lk * cfg.gdn_key_head_dim + LV, H) +
+                     Bf12Companions::planned_bytes(LV, H) + 2 * Bf12Companions::planned_bytes(lv, H) +
+                     Bf12Companions::planned_bytes(H, LV);
+  const int64_t D = cfg.head_dim, lh = geo.local_heads, lkv = geo.local_kv_heads;
+  const size_t qsa = Bf12Companions::planned_bytes(lh * 2 * D, H) + 2 * Bf12Companions::planned_bytes(lkv * D, H) +
+                     Bf12Companions::planned_bytes(static_cast<int64_t>(cfg.indexer_n_heads + 1) * cfg.indexer_head_dim, H) +
+                     Bf12Companions::planned_bytes(H, lh * D);
+  for (QwenLayerKind k : cfg.layers) bytes += k == QwenLayerKind::Gdn ? gdn : qsa;
+  if (mtp) bytes += qsa + 2 * Bf12Companions::planned_bytes(H, H);
+  return bytes;
 }
 
 // ---------------------------------------------------------------------------
@@ -979,6 +1080,8 @@ void QwenModel::graph_prepare() {
 // ---------------------------------------------------------------------------
 void QwenModel::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos, int T, bool decode_row,
                              bool capture, int head_rows, int batch_requests) {
+  walk_rows_ = T;
+  gemm_.set_bf12_wide(decode_row);  // the decode batch's alone (kernels/gemm.hpp)
   if (!mtp_) throw std::logic_error("mtp_run_rows: MTP is not enabled");
   if (T <= 0 || T > max_tokens_) throw std::invalid_argument("mtp_run_rows: rows");
   if (head_rows < 0 || head_rows > T) throw std::invalid_argument("mtp_run_rows: head_rows");

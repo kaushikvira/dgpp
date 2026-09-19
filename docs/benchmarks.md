@@ -139,11 +139,17 @@ end down from 52–56 ms.
 
 | mode | ms/pass | tok/pass | ms/token | date |
 |---|---|---|---|---|
-| T=1 | 26.22 | 1.0 | 26.22 | 2026-09-08 |
-| MTP, greedy | 33.7–34.4 | 1.72–1.98 | 17.3–19.8 | 2026-09-16 |
+| T=1, through the service (`--no-mtp`) | 24.9 | 1.0 | 24.9 | 2026-09-19 |
+| MTP, greedy | 31.5–33.2 | 1.72–1.98 | 16.1–19.3 | 2026-09-19 |
 
 The routed experts are NVFP4 and everything else is the FP8 release's own
 bytes. The current MTP range comes from the five-class service sweep in §4.
+Both rows are with the template's `bf16_weights` on (`"bf12+bf16"` on four
+nodes, `"bf12"` on two: decode is the same) — the lossless
+12-bit form of the BF16 matrices decode streams (bit-identical transcripts):
+the same binary with the key off measures 27.0 ms at T=1 and 33.7–34.4 ms per
+MTP pass, the 2026-09-16 figures
+([record](../benchmarks/results/2026-09-19-glm-flash-line-rate/README.md)).
 
 ### GLM-5.3-Flash NVFP4/FP8 hybrid, world 2
 
@@ -170,6 +176,18 @@ which is the speculative-identity gate (§9.6) passing on this world.
 Depth 1 is the shipped setting. The QSA prefill optimization added on
 2026-09-15 does not change decode arithmetic; 80 paired C1 responses retained
 identical text, usage and decode-step counts (§6).
+
+Since 2026-09-19 the templates' `bf16_weights: "bf12+bf16"` streams the GDN and
+QSA projections, the draft block's and the head from their lossless 12-bit
+form (1.65 → 1.24 GiB per rank at world 4, 3.20 → 2.41 at world 2; 81 % of
+what a world-4 rank reads per token is BF16, 1.7 GB of it packed). The same
+binary through the service, MTP greedy, engine decode tok/s at one to four
+live requests: world 4 73.3 / 118.8 / 141.0 / 162.2 → 78.0 / 123.3 / 144.3 /
+164.3 (+6.4 / +3.8 / +2.4 / +1.3 %); world 2 47.1 / 73.3 / 85.4 / 96.2 → 51.4 /
+78.2 / 91.0 / 100.6 (+9.0 / +6.7 / +6.6 / +4.6 %); transcripts byte-identical,
+prefill unchanged
+([record](../benchmarks/results/2026-09-19-glm-flash-line-rate/README.md) §7).
+The rows above predate it.
 
 ### Qwen3.8-Flash-Next-NVFP4, world 1 (one Spark)
 
@@ -221,12 +239,33 @@ The T=1 floor here is about 40 ms, and 6.3 GB per rank per step of it is the
 BF16 attention projections that modelopt left unquantized. That is also what
 bounds this family under concurrency (§5).
 
+Since 2026-09-19 the template's `bf16_weights: "bf12+bf16"` streams those
+projections from their lossless 12-bit form (6.36 → 4.78 GiB per rank, +4.9
+GiB resident beside the BF16 bytes; `"bf12"` alone is 1.4 GiB UNDER the BF16
+plan for +2–4 % of prefill): the same binary through the service measures 31.4–33.0 → 35.0–
+36.5 tok/s single stream (+11–12 %) and 66.8–70.2 → 69.9–73.8 at four live
+requests (+5–7 %), transcripts byte-identical
+([record](../benchmarks/results/2026-09-19-glm-flash-line-rate/README.md)).
+The rows above predate it.
+
 ### The full GLM-5.3 (int4/int8 g64), world 4
 
 | mode | ms/pass | tok/pass | ms/token | date |
 |---|---|---|---|---|
 | T=1 | 51.1 | 1.0 | 51.1 | 2026-09-12 |
 | MTP depth 1 | 61–66 | 1.69–1.97 | 31–39 | 2026-09-14 |
+
+Since 2026-09-19 the template's `bf16_weights: "bf12"` packs what this
+checkpoint leaves BF16 on the matmul seam (the dense layers' and the draft's
+projections, the indexers, the head: 1.65 → 1.24 GiB per rank): 28.3–28.8 →
+29.8–30.6 tok/s single stream (+5–6.5 %), 45.4–46.6 → 48.1–48.4 at four
+(+3–7 %), transcripts identical. The template is sized to the node's
+ceiling: with both forms resident it held 100K of context; with the 12-bit
+form alone (`"bf12"`, the BF16 bytes returned as each layer loads — the
+template since the same day) it is 0.3 GiB under the BF16 plan and carries
+the 120K shape again, decode level at one, four and eight live requests and
+prefill within 1 %. The rows
+above predate it.
 
 The 754B model at 99.3 GiB of int4/int8 weights per rank: the T=1 step
 streams about 10.2 GB per rank (the audit's floor 44.5 ms at 230 GB/s) plus
@@ -289,23 +328,26 @@ Current service-path pace at concurrency 1:
 
 The graph pass spans 34–41 ms and commits 1.68–1.97 tokens per pass by class.
 
-### GLM-5.3-Flash NVFP4/FP8 hybrid, world 4, MTP greedy (2026-09-16)
+### GLM-5.3-Flash NVFP4/FP8 hybrid, world 4, MTP greedy (2026-09-19)
 
-HTTP service, 256 output tokens, MTP depth one, default thinking mode.
-Medians of three repetitions. Engine timing excludes admission/prefill and
-the first token emitted by prefill. Tokens/pass counts committed decode work.
+HTTP service, 256 output tokens, MTP depth one, default thinking mode, the
+template as shipped (`bf16_weights` on: `"bf12+bf16"`). Means of two repetitions.
+Engine timing excludes admission/prefill and the first token emitted by
+prefill. Tokens/pass counts committed decode work.
 
-| class | engine ms/pass | committed tok/pass | engine ms/token | engine tok/s |
-|---|---:|---:|---:|---:|
-| prose | 33.67 | 1.861 | 18.09 | 55.28 |
-| code | 34.41 | 1.977 | 17.41 | 57.44 |
-| json | 33.91 | 1.962 | 17.29 | 57.84 |
-| math | 34.30 | 1.917 | 17.89 | 55.90 |
-| chat | 34.06 | 1.723 | 19.77 | 50.59 |
+| class | engine ms/pass | committed tok/pass | engine ms/token | engine tok/s | same binary, `bf16_weights: checkpoint` |
+|---|---:|---:|---:|---:|---:|
+| prose | 31.48 | 1.861 | 16.91 | 59.12 | 54.8 |
+| code | 32.17 | 1.977 | 16.28 | 61.44 | 57.1 |
+| json | 31.63 | 1.962 | 16.12 | 62.02 | 57.6 |
+| math | 32.03 | 1.917 | 16.70 | 59.86 | 55.6 |
+| chat | 33.20 | 1.723 | 19.27 | 51.90 | 50.4 |
 
-All five C1 transcripts match the baseline. The prefill optimization leaves
-decode unchanged within measurement noise. See the
-[matched campaign](../benchmarks/results/2026-09-16-glm-flash-perf/README.md).
+Tokens per pass are unchanged and all five C1 transcripts are byte-identical
+to the control's: the 12-bit form is a storage format for the same BF16
+values. The chat class drifts between boots (31.7–33.2 ms/pass across this
+campaign's runs of the same build). See the
+[campaign](../benchmarks/results/2026-09-19-glm-flash-line-rate/README.md).
 
 ### GLM-5.3-Flash NVFP4/FP8 hybrid, world 2, MTP greedy (2026-09-12)
 
@@ -431,22 +473,27 @@ the engine ran one scalar replay per live request in sequence:
 | 3 | 6-row | 90 | ~124 |
 | 4 | 8-row | 107 | not recorded |
 
-### GLM-5.3-Flash NVFP4/FP8 hybrid, world 4 (2026-09-16)
+### GLM-5.3-Flash NVFP4/FP8 hybrid, world 4 (2026-09-19)
 
-Same workload as §4, with four distinct prompts per loaded phase. Medians of
-three repetitions, 256 output tokens per request. Request-wall rates include
-admission and prefill; engine rates exclude them. C2 was not rerun.
+Same workload as §4, with distinct prompts per loaded phase. Means of two
+repetitions, 256 output tokens per request, engine rates (admission and
+prefill excluded), the template as shipped. The control column is the same
+binary with `--bf16-weights checkpoint` and `DGPP_PREFILL_OVERLAP=off`.
 
-| class | C1 engine tok/s | C1 request-wall tok/s | C4 engine tok/s | C4 request-wall tok/s |
-|---|---:|---:|---:|---:|
-| prose | 55.28 | 54.42 | 100.62 | 97.65 |
-| code | 57.44 | 56.56 | 103.23 | 100.63 |
-| json | 57.84 | 56.44 | 105.13 | 102.19 |
-| math | 55.90 | 54.98 | 107.03 | 103.98 |
-| chat | 50.59 | 49.90 | 100.66 | 96.38 |
+| class | C1 | C2 | C3 | C4 | control C1 / C2 / C3 / C4 |
+|---|---:|---:|---:|---:|---|
+| prose | 59.12 | 80.00 | 97.27 | 114.25 | 54.8 / 75.2 / 91.0 / 105.2 |
+| code | 61.44 | 84.86 | 98.49 | 109.72 | 57.1 / 80.3 / 91.1 / 102.6 |
+| json | 62.02 | 80.47 | 106.11 | 119.84 | 57.6 / 76.0 / 98.0 / 112.3 |
+| math | 59.86 | 87.21 | 98.31 | 110.20 | 55.6 / 82.7 / 93.7 / 104.6 |
+| chat | 51.90 | 77.51 | 92.99 | 104.81 | 50.4 / 75.5 / 88.9 / 100.4 |
 
-The current implementation uses context-aware DSA prefill query tiles inside
-the existing workspace. Decode kernels and numerical formats are unchanged.
+Geometric means: +6.8 / +5.2 / +6.5 / +6.4 % at one to four live requests.
+Two live requests run four-row steps on the narrow 12-bit kernel, three and
+four run six- and eight-row steps on its windowed form (which replaced a
+cuBLASLt call over the BF16 bytes); the decode collective now claims every
+ready peer per scan round. A seven-minute mixed soak on this build served
+562 requests with none failed and identical operation streams on all ranks.
 
 ### GLM-5.3-Flash NVFP4/FP8 hybrid, world 2 (2026-09-12)
 
@@ -622,7 +669,7 @@ records contain each actual tokenizer count.
 | model and current configuration | ~2K | ~8K | ~32K | date |
 |---|---:|---:|---:|---|
 | GLM-5.3-Flash-FP8, world 4 | — | — | — | rerun pending |
-| GLM-5.3-Flash NVFP4 hybrid, world 4 | **1.465 s** | **6.005 s** | **27.753 s** | 2026-09-16 |
+| GLM-5.3-Flash NVFP4 hybrid, world 4 | **1.297 s** | **5.249 s** | **24.523 s** | 2026-09-19 |
 | GLM-5.3 NVFP4 hybrid, world 2 | — | — | — | rerun pending |
 | GLM-4.7-NVFP4, world 4 | 2.809 s | 16.865 s | — | 2026-09-10 |
 | Qwen3.8-Flash-Next-FP8, world 2 | **1.299 s** | **5.108 s** | **21.168 s** | 2026-09-15 |
@@ -631,8 +678,13 @@ records contain each actual tokenizer count.
 | DeepSeek-V4.1-Flash MXFP4/FP8, world 4 | **1.599 s** | **5.726 s** | — | 2026-09-16 |
 
 Flash hybrid prefill uses context-aware DSA query tiles inside the existing
-scratch allocation. Its actual prompt lengths are 1,944–1,989, 7,723–7,811
-and 31,291–31,306 tokens. Median rates are 1,333, 1,301 and 1,128 prompt tok/s.
+scratch allocation; since 2026-09-19 the draft block's prefill rows stop at
+their cache state (−6.0 / −7.3 / −7.6 %) and the KDA layers' bulk folds fly
+beside the next row block's compute (−5.2 / −4.7 / −3.9 %), both with
+identical first tokens and long-context transcripts
+([record](../benchmarks/results/2026-09-19-glm-flash-line-rate/README.md)).
+Its actual prompt lengths are 1,944–1,989, 7,723–7,811 and 31,291–31,306
+tokens. Median rates are 1,507, 1,486 and 1,277 prompt tok/s.
 Matched cold-prefill times fell by 21.7%, 41.5% and 66.4%, respectively, with
 no weight or KV precision change. Decode rates remain essentially flat.
 The [campaign record](../benchmarks/results/2026-09-16-glm-flash-perf/README.md)

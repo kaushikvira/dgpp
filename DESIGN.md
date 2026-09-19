@@ -869,6 +869,76 @@ behind this bug for a day; and the readback invariant (a decoded broadcast
 must equal the locally computed winner; today the digest group, §9) is
 what turns any surviving corruption into a loud, located failure.
 
+**The claim gaps (2026-09-19).** The decode timeline's `skew` had been read
+as the peers' arrival spread ("jitter, not structure"). The window log's
+`graph window claims:` line — the gaps between consecutive claims of one
+generation, in claim order — says otherwise: on the four-node GLM-5.3-Flash
+step the gaps were pinned at 7–10 us (80–85 % of them, none under 5 us) on
+every rank. A claim round is a scan of system loads over the doorbell
+cells, a gate pass over the payload and an ack; the graph kernel elected
+one cell per round, so three co-resident doorbells paid three rounds back
+to back, two of them inside `skew`. `bus_allreduce_graph_kernel` now runs
+one election per peer per round and gates every claimed peer behind a
+single scan (the eager kernel keeps the one-cell election): a quarter to a
+third of the gaps fell to 3–5 us, the collective 43.8 → 41.6 us, results
+bitwise (the fold is the canonical chain either way). What remained inside
+a round was the gate pass itself (~4 us per peer at 16 KiB, one peer at a
+time) and everything a round serializes around it.
+
+**The interleaved gate (2026-09-19, same kernel; `DGPP_BUS_GATE=sequential`
+keeps the per-peer gates).** A round of the graph kernel is a chain of
+system-load round trips, each of which the other 255 threads wait out at a
+barrier, so the work was to take round trips out of the chain — the gate's
+arithmetic was never the cost:
+* the round's co-claimed peers are gated by ONE pass
+  (`block_fold_payloads`: every pending row folded — and staged — with the
+  peers' loads interleaved, four per peer in flight, one barrier) and acked
+  together; a lone claim takes the sequential gate's very pass. At two
+  loads per peer the joint pass was two round trips — as long as the passes
+  it replaced — and the collective did not move;
+* the claimant reads the rest of its door — `{seq, len, ctl}` and `{hash}`,
+  the first two 16-byte vectors of the one cache line the sender's doorbell
+  DMA wrote whole — in ONE round trip behind its `seq` acquire, where the
+  sequential gate pays a dependent load each for `ctl` and `len` and two or
+  three more on thread 0 for the hash and the claim record;
+* thread 0 looks for the engine's poison (`done_seq`, a system-scope
+  acquire) every eighth round instead of every round, the last claim ends
+  the wait without another round, and the open gates are derived on every
+  thread from the settled elections — one barrier fewer per claim.
+Rank 0's collective on the four-node GLM-5.3-Flash step (16 KiB rows): 40.9
+-> 35.7 us (handshake 15.3 -> 14.5, skew 16.4 -> 13.7, fold 5.5 -> 3.9), the
+co-claims' gaps under 3 us and a round 5-7 us where it was 7-10. The fold is
+the canonical chain either way: transcripts identical. Long rows (48-64
+KiB, three and four live requests — past the 80 KiB staging budget, so the
+fold re-reads the NIC-placed rows) are level with the sequential gate: the
+shorter rounds' gain (handshake + skew 55.8 -> 51.9 us) goes back in an
+unstaged fold that re-reads rows whose loads have only just been issued
+(12.3 -> 16.6 us); taking those rows peer by peer inside the pass was worse
+(77.4 us: the first ack waits for all three) and was reverted.
+`benchmarks/micro/uar_probe.cpp` records that the GB10 does map an mlx5
+doorbell page for device access (`cudaHostRegisterIoMemory`), the
+precondition of a kernel-rung send doorbell (~3 us of each handshake: the
+engine's notice and post).
+
+**The prefill fold overlap (2026-09-19, GLM-5.3-Flash).** A prefill chunk's
+two bulk folds per layer were 15–17 % of its GPU time with nothing beside
+them. A chunk of 1024 rows or more runs each KDA layer's attention site in
+two row blocks: block A's fold (`BoundaryReducer::begin_async`, the bulk
+machine's submit without its wait) is in flight while block B's site
+computes — the recurrence and conv state carry from A to B as across a
+chunk cut — and the FFN site's fold of block B while the next KDA layer's
+block A computes; the FFN site keeps the whole chunk (its experts are read
+once per chunk). Every kernel of a KDA site is row-independent, its state
+carries bitwise, and its Lt projections take the chunk's algorithm
+(`CublasLtGemm::set_plan_rows`), so the walk is bitwise the unsplit one —
+checked at production scale with the asynchronous folds (2K–30K prompts:
+first tokens, transcripts, MTP passes and acceptance identical). A DSA site
+in row blocks is not (the same A/B moved transcripts, as any change of the
+chunk cuts does), so the DSA layers keep their sites and both folds whole:
+37 % of the fold bytes are hidden instead of 50. Cold prefill −5.2 / −4.7 /
+−3.9 % at ~2K / ~8K / ~32K. `DGPP_PREFILL_OVERLAP=off` restores the unsplit
+walk.
+
 ## 7. Attention and state semantics
 
 ### 7.1 KDA
@@ -1378,6 +1448,133 @@ speculative verification and occupancy changes do not change the row's
 arithmetic. Weight storage uses device allocations; collective staging
 uses registered pinned memory.
 
+**Lossless 12-bit bf16 weights (`engine.bf16_weights: "bf12"` or
+`"bf12+bf16"`; every template enables one of them, the binary's default is
+`checkpoint`).** Over half of a
+GLM-5.3-Flash step's bytes are native bf16 (the KDA projections, the lm
+head), two thirds of GLM-4.7's, and a trained bf16 weight spends only ~2.6
+bits of entropy on its exponent. `kernels/bf12_gemv.hpp` keeps a second
+resident form of those matrices: the sign+mantissa byte plus a 4-bit
+exponent code against a per-row window of fifteen exponents, the rare
+weights outside it (1.5e-4) in a per-row side table, and a row with more
+than 64 of those (outlier channels: 35 rows of GLM-5.3-Flash) kept bf16 —
+its warp, which is one weight row, runs the bf16 chain itself. The kernel
+rebuilds the exact bf16 bits in registers and keeps the bf16 core's lane
+ownership and FMA order, so its outputs are bitwise `launch_bf16_gemv`'s: a
+storage format, not a quantization, and served transcripts do not move.
+Up to four rows stage whole activation rows as the bf16 core does; five to
+eight stage them a 1024-column window at a time (16 KB of shared memory, a
+barrier on both sides of every restage) with the lane accumulators carried
+across the windows — still the scalar chain, and ahead of the Lt algorithm
+those batches took (80 → 57 us on a KDA projection, 1,400 → 940 us on the
+head, at eight rows). `CublasLtGemm::register_bf12` holds the companions
+and `set_bf12_wide` opens the five-to-eight-row launches to DECODE batches
+only: the interface cannot tell a decode call from a short prefill chunk,
+and a 5–8-row chunk (a prefix-cache cut leaves them) must keep the Lt
+algorithm its transcripts went through. `Bf12Companions` (one per model)
+packs each layer as it lands, owns the memory and sizes it for the plan,
+and the prefetch windows ask `IGemm::resident_view` for the bytes a launch
+will stream.
+
+*Residency* (`common/bf16_residency.hpp`). Prefill GEMMs and decode batches
+past eight rows read the bf16 bytes, so `"bf12+bf16"` keeps both forms
+resident — 1.75 of those matrices' memory, no other cost. `"bf12"` keeps the
+12-bit form ALONE, 0.75 of it:
+* *Loading.* A packable matrix is a SIDE GRANT of its layer's bump
+  (`LayerBump::alloc_side`): its own range of the CUDA virtual-memory API
+  (`loaders/releasable_range.hpp`) instead of a span of the layer's
+  `cudaMalloc`. The staging mirror, the byte formula and the resident image
+  keep the grant order — an image written in one mode restores in the
+  other — and only the device placement differs. As soon as a layer's
+  companions exist the model returns its ranges
+  (`release_packed`: unmap + release; 2 MiB granularity, the full size back
+  at once), so no more than one layer's bf16 bytes ever sit beside their
+  companions — the GLM-5.3-Flash loader allocates its caches BEFORE its
+  weights, and a release at the end of the load would not have fitted the
+  recipes this exists for. The address range stays reserved: it is still
+  the key every call site holds, no later allocation can alias it, and a
+  stray read of a released weight is a clean fault rather than another
+  tensor's bytes.
+* *Prefill.* An Lt call against a released weight expands the rows it needs
+  into a small scratch first (`launch_bf12_expand`: the exact bf16 bits, at
+  the device memcpy's rate — 130 us for 16.8 MB), so the algorithm computes
+  what it always did. A matrix larger than the scratch slot — the lm head —
+  runs in WEIGHT-row blocks under the whole call's pinned algorithm, which
+  is bitwise the whole call (an output element's reduction does not depend
+  on the weight rows sharing its call; blocks are multiples of 64 rows — an
+  algorithm picked for an aligned n refuses a less aligned block). A short
+  call (a prefix-cache header chunk, a short prompt, a busy scheduler's
+  256-row chunk) is a bandwidth call, and whole-matrix expansion would
+  triple its DRAM traffic: it runs 8 MiB blocks instead, so the scratch is
+  written and read back inside the 24 MB L2 and only the packed bytes cross
+  DRAM (the expansion's cost on a KDA in_proj: 345 -> 132 us at eight rows,
+  358 -> 190 at 239). A wide chunk keeps whole matrices in two slots: the
+  fold overlap's row blocks call a site's in and o projections twice and
+  expand each once.
+* *Decode past eight rows* (the full GLM-5.3's sixteen-row shape, GLM-4.7's
+  to 32) takes eight-row packed launches — the scalar chain, tolerance-equal
+  to the Lt algorithm the other modes run at that width — so a captured
+  graph never touches the scratch.
+Every gate is bitwise against the bf16-resident build (`bf12_gemv_test`'s
+released instance with the bf16 bytes scribbled; `glm_loader_test`'s side
+grants; `glm_tp_test`'s three modes on a 1024-wide fixture). Measured on the fabric against the same binary with the
+key off, transcripts identical: GLM-5.3-Flash +6.0 / +4.3 / +6.4 / +6.1 %
+at one to four live requests (+8.5 % without MTP), GLM-4.7 +11–12 % single
+stream and +5–7 % at four.
+
+*Format v2: the tail, and Qwen (2026-09-19).* A packed row was whole
+1024-column super-blocks, which shut out Qwen3.8-Flash-Next — hidden 2560,
+1536-wide slices at world 4 — where 81 % of what a rank reads per token is
+bf16. Padding was not an option (2560 padded to 3072 streams a fifth more
+bytes: most of the gain). The columns that do not fill a super-block now
+follow the row's super-blocks in units cut by the 256-column steps they
+hold (`kernels/bf12_gemv.cuh`): two full steps as [sm 512 B | exp 256 B] —
+a lane owns sixteen sm bytes as in a super-block and eight exp bytes, an exp
+vector shared by a lane pair — and a single or partial step as [sm 8 B/lane
+| exp 4 B/lane], a vector shared by two and by four lanes. Twelve bits a
+weight, every load an aligned 16-byte vector inside the row, and a row with
+no tail laid out as before (k = 2560: eight loads a lane against the bf16
+core's ten). The row chain itself moved to that header, as the bf16 core's
+had (`bf16_gemv.cuh`), so the launches that bypass `matmul` could take it:
+`launch_bf12_gemv_multi` is the twin of the multi-problem launch the GDN's
+four input projections share, a problem whose matrix did not pack running
+the bf16 chain in its blocks, and `IGemm::bf12_lookup` lets a layer find the
+companion. Qwen's weights pack cleanly (2–7 escapes per 10,000, no raw rows,
+widest row 16). The microbench on its real shapes is what decided the scope:
+
+| shape (world 4) | cold, from DRAM | warm, from L2 |
+|---|---|---|
+| GDN / QSA projections, k = 2560 and 1536 | −15 to −21 % | +2 to +6 % at one row, +19 to +37 % at two |
+| lm head [62080 × 2560] | −26 % | (never warm) |
+| GR down [320 × 10240] | −4 to +10 % | +70 to +109 % |
+| GR up [10240 × 320] | ±1 % | +56 to +76 % |
+
+A thread here runs its ops in order: rebuilding a weight's bits is ~12
+integer ops where the bf16 core spends ~3, so the packed chain is ~2.3× the
+ops per FMA — invisible while DRAM is the limit, the whole cost once the
+bytes are in L2. The projections and the head are read cold or half-cold and
+win; the GR sites, the routers and the shared experts are read WARM behind
+the prefetch windows (that is how the GR kernels run above the DRAM rate),
+and the two GR shapes are latency- and scheduling-bound even cold (40 blocks
+of 20 KB rows; 1,280 blocks of 640-byte rows), so they keep their bf16 form.
+Packed on Qwen: the GDN's in/out projections, the QSA's q / k / v / index / o,
+the draft block's and its two fc matrices, the head — 1.7 of a world-4 rank's
+3.8 GB per token. Fabric, same binary, transcripts identical: world 4 +6.4 /
++3.8 / +2.4 / +1.3 % at one to four live requests, world 2 +9.0 / +6.7 / +6.6 /
++4.6 %. The family keeps both forms resident under either value of the key
+(every recipe has the room; its loader grants nothing aside), and under
+`dense_weights = "fp8"` the projections and the head are already block-FP8:
+nothing is packed. DeepSeek (tensor-core lowering) still packs nothing.
+
+*Companions and the prefetch windows.* `WeightPrefetcher::add` coalesces a
+window's adds and bridges holes of up to 2 MB between them — a read of
+whatever lies between, which inside one layer image is a neighbouring tensor
+but between two allocations can be unmapped: a released bf16 range stays
+reserved and unreadable, and a neighbouring image's edge is out of bounds
+(the Qwen walk's one-allocation-per-window rule exists for that reason). A
+companion is its own allocation, so its view enters a window through
+`add_isolated` (`add_view` picks): one launch of its own, never joined.
+
 **L2 prefetch.** `WeightPrefetcher` runs bounded weight windows on a
 low-priority side stream while the model executes collectives or other
 latency-bound work. Window placement and size are model-specific. GB10's
@@ -1580,6 +1777,18 @@ depth 1, 54–56 at depth 2 — a verify row is its own expert bytes (~10 ms),
 the chain row ~2.5 — and the second draft stands 45–65 % of the time
 (prose to code), so depth 2 is −4 % on prose and +4 % on code and JSON;
 depth 1 stays the default, the transcripts are identical at every depth.
+
+**Prefill rows are state-only (2026-09-19).** The block runs over every
+prompt row to fill its caches, and no head runs for those rows: nothing
+reads their output, and a chain row's hidden comes from a decode row. What
+later drafts read — the block's latent rows, index pools and tail ring —
+is a function of the DSA site's input alone, so `mtp_run_rows` stops a
+prefill row once `DsaLayer::enqueue_prefill(..., state_only)` has written
+them: no selection or attention, no feed-forward site (it ran through the
+host-segmented path and was 5 % of a prefill by itself), no folds. Cold
+prefill −6 to −7.6 % at 2K–32K with identical first tokens, long-context
+transcripts, passes and acceptance; `DGPP_MTP_PREFILL_FULL=1` runs the
+whole block as before.
 
 ### On-device verification and drafting
 

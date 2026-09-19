@@ -127,9 +127,14 @@ void KdaLayer::enqueue(const void* hidden_in, float* recurrent_state,
                gemm_ws_bytes_, stream);
   // Steps 2-5 below are latency-bound (~45 us at decode) and the output
   // projection is the next weight the chain reads: start it now.
-  if (prefetch)
-    prefetch->prefetch_after(stream, w_.o_proj, o_proj_bytes(), 0,
-                             prefetch->layer_rate());
+  if (prefetch) {
+    // The bytes the o_proj launch streams (its packed companion's when the
+    // GEMM holds one for these rows).
+    const void* view = nullptr;
+    size_t view_bytes = 0;
+    gemm_.resident_view(w_.o_proj, o_proj_bytes(), tokens, &view, &view_bytes);
+    prefetch->prefetch_after(stream, view, view_bytes, 0, prefetch->layer_rate());
+  }
   // 2) decay logits g1 = f_b(f_a) and o_norm gate g2 = g_b(g_a); both read
   //    K-column slices of the fused projection row (strided activations).
   //    At decode both are 5 us launches of mostly fixed cost: one dual

@@ -1,0 +1,116 @@
+[
+  {
+    "words": 1600,
+    "prompt_sha256": "92ca08d36dd14a69228bc3888f8aedcd92a215222284a03c60fd296d9b49233f",
+    "data_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+    "wall_s": 4.473261619999903,
+    "prefill_ms": 1543.7,
+    "response": {
+      "id": "chatcmpl-29deded4af6466a4",
+      "object": "chat.completion",
+      "created": 1789849175,
+      "model": "Qwen/Qwen3.8-Flash-Next-FP8",
+      "system_fingerprint": null,
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "We need answer user's request. Need summarize mathematical topics below in ten paragraphs. User provided many word problems. Need likely produce ten paragraphs summarizing mathematical topics. Need maybe identify topics: arithmetic, rates, percentages, ratios, algebra, linear equations, geometry/distance, averages, sequences? Need ten paragraphs. Need ensure exactly ten paragraphs? \"Summarize the mathematical topics below in ten paragraphs.\" So final should be 10 paragraphs. Could be each paragraph a topic. Need maybe no bullets? Paragraphs. Need cover all problems? Summarize mathematical topics, not solve. Need maybe mention GLM prefill validation 1",
+            "refusal": null
+          },
+          "logprobs": null,
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 2199,
+        "completion_tokens": 128,
+        "total_tokens": 2327,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 128
+        }
+      }
+    }
+  },
+  {
+    "words": 6000,
+    "prompt_sha256": "0526198593813368e206cd25da183e167329f63e31339b2f6dcf50f068c7273e",
+    "data_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+    "wall_s": 8.056454300000041,
+    "prefill_ms": 5003.5,
+    "response": {
+      "id": "chatcmpl-29deded4af6466a5",
+      "object": "chat.completion",
+      "created": 1789849179,
+      "model": "Qwen/Qwen3.8-Flash-Next-FP8",
+      "system_fingerprint": null,
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "We need answer user's request. Need summarize mathematical topics below in ten paragraphs. User provided a long list of word problems, ending abruptly \"Pam and\". Need likely summarize mathematical topics in ten paragraphs. Need maybe identify topics: arithmetic, algebra, ratios, percentages, rates, geometry, etc. Need ten paragraphs. Need maybe not solve all problems, just summarize mathematical topics. Need ensure ten paragraphs exactly? \"Summarize the mathematical topics below in ten paragraphs.\" So final should be ten paragraphs. Could be each paragraph a topic. Need maybe mention the collection covers arithmetic operations, word problems, rates, percentages, ratios, algebra,",
+            "refusal": null
+          },
+          "logprobs": null,
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 7892,
+        "completion_tokens": 128,
+        "total_tokens": 8020,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 128
+        }
+      }
+    }
+  },
+  {
+    "words": 24000,
+    "prompt_sha256": "606c097d381ee2ecf308552b6673f0329e998ae0b6bf10cd1dfb4f1ec24da290",
+    "data_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+    "wall_s": 23.536278526999922,
+    "prefill_ms": 20424.9,
+    "response": {
+      "id": "chatcmpl-29deded4af6466a6",
+      "object": "chat.completion",
+      "created": 1789849187,
+      "model": "Qwen/Qwen3.8-Flash-Next-FP8",
+      "system_fingerprint": null,
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "We need answer user's request. User: \"GLM prefill validation 24000. Summarize the mathematical topics below in ten paragraphs.\n\n[long list of word problems]\"\n\nNeed summarize mathematical topics below in ten paragraphs. Likely need produce 10 paragraphs summarizing mathematical topics present in the list. Need maybe not solve all problems, just summarize topics. Need ensure ten paragraphs. Could be each paragraph a topic. Need maybe mention arithmetic, algebra, ratios, percentages, rates, geometry, etc. Need likely no need to solve. But maybe \"GLM prefill validation 24000",
+            "refusal": null
+          },
+          "logprobs": null,
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 31414,
+        "completion_tokens": 128,
+        "total_tokens": 31542,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 128
+        }
+      }
+    }
+  }
+]

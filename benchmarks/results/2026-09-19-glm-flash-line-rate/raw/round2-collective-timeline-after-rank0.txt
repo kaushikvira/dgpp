@@ -1,0 +1,8 @@
+rank 0: 1388 windows | per collective (median of window avgs, us): total 41.6 = copy 3.7 + handshake 15.8 + skew 16.6 + fold 5.5; engine post 3.3; max skew 65; compute between gens 292.9
+        wait hist <20/<50/<100/<200/<500/>=500 us: [16473.0, 102209.0, 11074.0, 648.0, 62.0, 6.0]; even (attention-side) 33.2 us, odd (FFN-side) 34.9 us
+        peer rank1: lag 24 us avg, arrived last 31786 times
+        peer rank2: lag 25 us avg, arrived last 43442 times
+        peer rank3: lag 24 us avg, arrived last 55244 times
+        claim 1->2: gap 8.3 us avg; % <3/<5/<7/<10/<15/<25/>=25 us: [0, 24, 18, 45, 6, 2, 4]
+        claim 2->3: gap 9.1 us avg; % <3/<5/<7/<10/<15/<25/>=25 us: [1, 33, 26, 26, 4, 5, 6]
+rank 1: 2520 windows | per collective (median of window avgs, us): total 42.8 = copy 3.6 + handshake 14.6 + skew 19.0 + fold 5.6; engine post 3.0; max skew 65; compute between gens 293.1

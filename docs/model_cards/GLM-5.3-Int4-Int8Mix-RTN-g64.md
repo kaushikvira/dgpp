@@ -88,7 +88,14 @@ GiB per rank, bitwise the replicated lookup) — the ceilings under the
 engine's 4 GiB headroom on a 121.6 GiB node, after the loader's 2.2 GiB
 staging mirror was measured, made a plan item and freed before the caches
 are allocated and a one-hour soak at the 120K shape showed flat memory and
-no reclaim on any node (2026-09-12/13, `docs/measurements.md`).
+no reclaim on any node (2026-09-12/13, `docs/measurements.md`). Since
+2026-09-19 the shipped template keeps the BF16 matrices decode streams in
+their lossless 12-bit form (`engine.bf16_weights: "bf12"`: +5–6.5 %
+single-stream decode, transcripts identical) — that form ALONE: each matrix's
+BF16 bytes go back to the node as its layer loads and prefill expands what it
+reads (within 1 % on this model), so the footprint is 0.3 GiB UNDER the BF16
+plan and the template carries the 120K shape above. (With both forms resident
+— `"bf12+bf16"`, the first form of this feature — the node held 100K.)
 
 **What the engine multiplies:** the packed codes times the bf16 group
 scale, exactly (fp32), in the GEMV core the decode and the grouped prefill

@@ -9,6 +9,7 @@
 
 #include "common/cuda_check.hpp"
 #include "common/log.hpp"
+#include "kernels/bf12_gemv.hpp"
 #include "kernels/bf16_gemv.hpp"
 #include "kernels/mma_gemv.hpp"
 #include "kernels/dsa.hpp"
@@ -315,6 +316,28 @@ void QwenGdnLayer::in_projections(const uint16_t* x, int tokens, cudaStream_t st
   if (tokens <= std::min(4, g_.gemv_rows) && bf16_gemv_accepts(w_.in_proj_qkv, tokens, H) &&
       bf16_gemv_accepts(w_.in_proj_z, tokens, H) && bf16_gemv_accepts(w_.in_proj_a, tokens, H) &&
       bf16_gemv_accepts(w_.in_proj_b, tokens, H)) {
+    // Their lossless 12-bit companions (engine.bf16_weights), when the GEMM
+    // holds any: the multi launch's packed twin — bitwise this launch, 0.75
+    // of the bytes; a projection without one runs the bf16 chain in its
+    // blocks.
+    const Bf12Matrix* pk[4] = {g_.gemm->bf12_lookup(w_.in_proj_qkv), g_.gemm->bf12_lookup(w_.in_proj_z),
+                               g_.gemm->bf12_lookup(w_.in_proj_a), g_.gemm->bf12_lookup(w_.in_proj_b)};
+    if (pk[0] || pk[1] || pk[2] || pk[3]) {
+      const uint16_t* wt[4] = {w_.in_proj_qkv, w_.in_proj_z, w_.in_proj_a, w_.in_proj_b};
+      void* outs[4] = {qkv_, z_, a_, b_};
+      const int ns[4] = {C, LV, lv_, lv_};
+      Bf12GemvProblem q[4];
+      for (int i = 0; i < 4; ++i) {
+        q[i].act = x;
+        q[i].act_row_stride = static_cast<size_t>(H);
+        if (pk[i]) q[i].packed = *pk[i];
+        q[i].weight = wt[i];
+        q[i].out = outs[i];
+        q[i].n = ns[i];
+      }
+      launch_bf12_gemv_multi(q, 4, /*out_f32=*/false, tokens, H, stream);
+      return;
+    }
     Bf16GemvProblem p[4];
     p[0].act = x; p[0].act_row_stride = static_cast<size_t>(H); p[0].weight = w_.in_proj_qkv; p[0].out = qkv_; p[0].n = C;
     p[1].act = x; p[1].act_row_stride = static_cast<size_t>(H); p[1].weight = w_.in_proj_z; p[1].out = z_; p[1].n = LV;

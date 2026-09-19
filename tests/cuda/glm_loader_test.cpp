@@ -16,6 +16,7 @@
 //     no-drift contract), and streaming frees the previous layer.
 // The dequant kernel's ragged-tail handling is pinned by a direct
 // [1000, 1000] test against the host oracle.
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +29,7 @@
 
 #include <cuda_runtime.h>
 
+#include "common/bf16_residency.hpp"
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
 #include "common/test.hpp"
@@ -658,6 +660,203 @@ DGPP_TEST(glm_loader_resident_mode_serves_cache_hits_without_storage_reads) {
     formula += dgpp::GlmLayerStream::layer_bytes(fx.cfg, l);
   require(dgpp::GlmLayerStream::resident_bytes(fx.cfg) == formula,
           "resident_bytes formula differs from the per-layer sum");
+}
+
+// bf12-only residency's loader half (LayerBump's side grants): a packable
+// matrix gets its own releasable range while the STAGING layout — the byte
+// formula, the mirror, the image — stays the grant order.
+DGPP_TEST(layer_bump_side_grants_keep_the_staging_layout_and_release) {
+  const size_t gran = dgpp::ReleasableRange::granularity();
+  require(gran >= 4096 && (gran & (gran - 1)) == 0, "the mapping granularity is a power of two");
+  // Grants: main 1000 B | side 3 MiB | main 300 B, main 5000 B | side 100 KiB | main 64 B.
+  const size_t sizes[] = {1000, size_t{3} << 20, 300, 5000, size_t{100} << 10, 64};
+  const bool aside[] = {false, true, false, false, true, false};
+  size_t total = 0, side_total = 0;
+  for (int i = 0; i < 6; ++i) {
+    total += dgpp::align_up_256(sizes[i]);
+    if (aside[i]) side_total += dgpp::align_up_256(sizes[i]);
+  }
+  // The counting pass: the same totals without touching memory.
+  {
+    dgpp::LayerBump count;
+    count.counting = true;
+    count.side_mode = true;
+    count.capacity = SIZE_MAX;
+    for (int i = 0; i < 6; ++i) (void)(aside[i] ? count.alloc_side(sizes[i]) : count.alloc(sizes[i]));
+    require(count.cursor == total && count.side_bytes == side_total && count.dev_cursor == total - side_total,
+            "the counting pass splits the layer's bytes");
+  }
+  std::vector<uint8_t> stage(total), back(total, 0);
+  for (size_t i = 0; i < total; ++i) stage[i] = static_cast<uint8_t>(i * 2654435761u >> 11);
+  for (const bool side_mode : {false, true}) {
+    dgpp::LayerBump bump;
+    bump.side_mode = side_mode;
+    bump.init(side_mode ? total - side_total : total);
+    bump.stage = stage.data();
+    void* grant[6];
+    size_t off = 0;
+    for (int i = 0; i < 6; ++i) {
+      grant[i] = aside[i] ? bump.alloc_side(sizes[i]) : bump.alloc(sizes[i]);
+      // The build writes through host(): always the grant-order offset.
+      require(bump.host(static_cast<uint8_t*>(grant[i])) == stage.data() + off,
+              "host() of a grant is its grant-order staging offset");
+      require(bump.host(static_cast<uint8_t*>(grant[i]) + sizes[i] - 1) == stage.data() + off + sizes[i] - 1,
+              "host() inside a grant");
+      off += dgpp::align_up_256(sizes[i]);
+    }
+    require(bump.cursor == total, "the cursor walks every grant");
+    require(bump.dev_cursor == (side_mode ? total - side_total : total), "the main allocation's bytes");
+    const char* base = static_cast<const char*>(bump.base);
+    for (int i = 0; i < 6; ++i) {
+      const char* g = static_cast<const char*>(grant[i]);
+      const bool inside = g >= base && g < base + bump.capacity;
+      require(inside == !(side_mode && aside[i]), "a side grant lives outside the layer's allocation");
+    }
+    bump.upload(nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    // Each grant's device bytes are its staging bytes...
+    off = 0;
+    for (int i = 0; i < 6; ++i) {
+      std::vector<uint8_t> got(sizes[i]);
+      DGPP_CUDA_OK(cudaMemcpy(got.data(), grant[i], sizes[i], cudaMemcpyDeviceToHost));
+      require(std::memcmp(got.data(), stage.data() + off, sizes[i]) == 0, "a grant's device bytes");
+      off += dgpp::align_up_256(sizes[i]);
+    }
+    // ...and the download is the mirror again, whatever the placement.
+    std::fill(back.begin(), back.end(), 0);
+    bump.download(back.data());
+    require(back == stage, "download returns the grant-order bytes");
+    if (!side_mode) {
+      require(bump.release_side(grant[1]) == 0, "nothing to release without side grants");
+      continue;
+    }
+    size_t free_before = 0, free_after = 0, device_total = 0;
+    DGPP_CUDA_OK(cudaMemGetInfo(&free_before, &device_total));
+    const size_t freed = bump.release_side(grant[1]);
+    DGPP_CUDA_OK(cudaMemGetInfo(&free_after, &device_total));
+    require(freed >= dgpp::align_up_256(sizes[1]) && freed % gran == 0, "the release returns the mapped range");
+    require(free_after + (gran << 1) >= free_before + freed,
+            "the device's free memory grows by the released bytes");
+    require(bump.release_side(grant[1]) == 0, "a second release is a no-op");
+    require(bump.release_side(grant[0]) == 0, "a main grant is not releasable");
+    bool threw = false;
+    try {
+      bump.download(back.data());
+    } catch (const std::logic_error&) {
+      threw = true;
+    }
+    require(threw, "a download after a release is refused");
+    // The other side grant and the main spans are untouched.
+    std::vector<uint8_t> got(sizes[4]);
+    DGPP_CUDA_OK(cudaMemcpy(got.data(), grant[4], sizes[4], cudaMemcpyDeviceToHost));
+    size_t off4 = 0;
+    for (int i = 0; i < 4; ++i) off4 += dgpp::align_up_256(sizes[i]);
+    require(std::memcmp(got.data(), stage.data() + off4, sizes[4]) == 0, "the other side grant survives");
+  }
+}
+
+// An image captured in one residency mode restores in the other: the
+// packable matrices — every KDA layer's in and out projections and the draft
+// layer's eh_proj ([512, 1024]); format v2 packs any row of a multiple of
+// eight columns — are granted aside under bf12-only residency, the image
+// bytes are the same, and a range gives its memory back.
+DGPP_TEST(glm_loader_side_grants_share_the_image_and_release) {
+  const Fixture fx = write_fixture();
+  const int max_layer = fx.cfg.num_hidden_layers + (fx.cfg.mtp_layer() >= 0 ? 1 : 0);
+  const int mtp = fx.cfg.mtp_layer();
+  require(mtp >= 0, "the fixture carries a draft layer");
+  const fs::path cache = fx.dir / "resident-cache-side";
+  const std::string saved = dgpp::GlmLayerStream::resident_image_dir();
+  dgpp::GlmLayerStream::set_resident_image_dir(cache.string());
+  struct Restore {
+    std::string dir;
+    ~Restore() {
+      dgpp::set_bf16_residency(dgpp::Bf16Residency::Checkpoint);
+      dgpp::GlmLayerStream::set_resident_image_dir(dir);
+    }
+  } restore{saved};
+
+  const size_t eh_bytes = dgpp::align_up_256(size_t{512} * 1024 * 2);
+  require(dgpp::GlmLayerStream::layer_side_bytes(fx.cfg, mtp) == eh_bytes,
+          "the draft layer's side bytes are eh_proj's");
+  // A KDA layer's: the fused in_proj [2 head_dim + 3 proj + heads, hidden]
+  // and o_proj [hidden, proj]; a DSA layer grants nothing aside.
+  const size_t kda_hidden = static_cast<size_t>(fx.cfg.hidden_size);
+  const size_t kda_proj = static_cast<size_t>(fx.cfg.kda_num_heads) * fx.cfg.kda_head_dim;
+  const size_t kda_side =
+      dgpp::align_up_256((2 * static_cast<size_t>(fx.cfg.kda_head_dim) + 3 * kda_proj + fx.cfg.kda_num_heads) *
+                         kda_hidden * 2) +
+      dgpp::align_up_256(kda_hidden * kda_proj * 2);
+  for (int l = 0; l < fx.cfg.num_hidden_layers; ++l)
+    require(dgpp::GlmLayerStream::layer_side_bytes(fx.cfg, l) ==
+                (fx.cfg.layers[static_cast<size_t>(l)] == dgpp::GlmLayerKind::Kda ? kda_side : size_t{0}),
+            ("layer " + std::to_string(l) + ": the side bytes are the KDA projections'").c_str());
+
+  // Built and captured with the bf16 bytes in place...
+  std::vector<std::vector<uint8_t>> built(static_cast<size_t>(max_layer));
+  {
+    dgpp::GlmLayerStream first(fx.cfg, fx.dir.string(), 0, 1, dgpp::GlmResidency::Resident);
+    require(!first.side_grants(), "checkpoint residency grants nothing aside");
+    for (int l = 0; l < max_layer; ++l) {
+      (void)first.load_layer(l);
+      built[static_cast<size_t>(l)].resize(dgpp::GlmLayerStream::layer_bytes(fx.cfg, l));
+      first.copy_resident_layer(l, built[static_cast<size_t>(l)].data());
+    }
+    require(first.image_layers_captured() == max_layer, "the first stream captures every layer");
+  }
+  // ...restored under bf12-only residency from the SAME image...
+  dgpp::set_bf16_residency(dgpp::Bf16Residency::Bf12);
+  {
+    dgpp::GlmLayerStream second(fx.cfg, fx.dir.string(), 0, 1, dgpp::GlmResidency::Resident);
+    require(second.side_grants(), "bf12-only residency grants aside");
+    for (int l = 0; l < max_layer; ++l) {
+      const dgpp::GlmLayerResident& r = second.load_layer(l);
+      std::vector<uint8_t> got(built[static_cast<size_t>(l)].size());
+      second.copy_resident_layer(l, got.data());
+      require(got == built[static_cast<size_t>(l)],
+              ("layer " + std::to_string(l) + ": a side-grant restore is the built bytes").c_str());
+      const auto [base, bytes] = second.resident_layer_span(l);
+      require(bytes == built[static_cast<size_t>(l)].size() - dgpp::GlmLayerStream::layer_side_bytes(fx.cfg, l),
+              "the layer's own allocation excludes its side grants");
+      if (l != mtp) continue;
+      const char* eh = reinterpret_cast<const char*>(r.eh_proj);
+      require(eh < static_cast<const char*>(base) || eh >= static_cast<const char*>(base) + bytes,
+              "eh_proj lives in its own range");
+      require_bytes_eq(r.eh_proj, fx.at("model.language_model.layers." + std::to_string(mtp) + ".eh_proj.weight"),
+                       512 * 1024, "eh_proj (side grant)");
+      require(second.release_packed(mtp, r.eh_proj) >= eh_bytes, "eh_proj's range returns its memory");
+      require(second.release_packed(mtp, r.eh_proj) == 0, "once");
+      require(second.release_packed(mtp, r.ln1) == 0, "a main grant is not releasable");
+    }
+    require(second.image_layers_restored() == max_layer && second.image_layers_captured() == 0,
+            "the side-grant stream restores every layer from the other mode's image");
+  }
+  // ...and built under bf12-only residency (a fresh cache): the same bytes,
+  // an image the bf16 mode restores.
+  const fs::path cache2 = fx.dir / "resident-cache-side-built";
+  dgpp::GlmLayerStream::set_resident_image_dir(cache2.string());
+  {
+    dgpp::GlmLayerStream third(fx.cfg, fx.dir.string(), 0, 1, dgpp::GlmResidency::Resident);
+    for (int l = 0; l < max_layer; ++l) {
+      (void)third.load_layer(l);
+      std::vector<uint8_t> got(built[static_cast<size_t>(l)].size());
+      third.copy_resident_layer(l, got.data());
+      require(got == built[static_cast<size_t>(l)],
+              ("layer " + std::to_string(l) + ": a side-grant build is the bf16-mode build").c_str());
+    }
+    require(third.image_layers_captured() == max_layer, "the side-grant stream captures every layer");
+  }
+  dgpp::set_bf16_residency(dgpp::Bf16Residency::Checkpoint);
+  {
+    dgpp::GlmLayerStream fourth(fx.cfg, fx.dir.string(), 0, 1, dgpp::GlmResidency::Resident);
+    for (int l = 0; l < max_layer; ++l) {
+      (void)fourth.load_layer(l);
+      std::vector<uint8_t> got(built[static_cast<size_t>(l)].size());
+      fourth.copy_resident_layer(l, got.data());
+      require(got == built[static_cast<size_t>(l)], "a bf16-mode restore of a side-grant image");
+    }
+    require(fourth.image_layers_restored() == max_layer, "restored across modes");
+  }
 }
 
 DGPP_TEST(glm_loader_resident_image_restore_is_bitwise_and_reads_no_source) {

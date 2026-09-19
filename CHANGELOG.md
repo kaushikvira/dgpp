@@ -6,6 +6,107 @@ The history by milestone. The dated engineering record in
 
 ## Unreleased
 
+- **Lossless 12-bit weights on Qwen3.8-Flash-Next; format v2** (2026-09-19;
+  round four of `benchmarks/results/2026-09-19-glm-flash-line-rate/`). The
+  format no longer needs rows of whole 1024-column super-blocks: the columns
+  left over follow the row in units cut by the 256-column steps they hold,
+  twelve bits a weight without padding (`kernels/bf12_gemv.cuh`; k = 2560,
+  1536, 320, any multiple of eight), and a row without a tail is laid out as
+  before. The row chain moved to that shared device header, the multi-problem
+  launch got its packed twin (`launch_bf12_gemv_multi`: the GDN's four input
+  projections) and layers find companions through `IGemm::bf12_lookup`. Qwen
+  packs its GDN and QSA projections, the draft block's and the head (81 % of
+  what a world-4 rank reads per token is BF16; 1.65 → 1.24 GiB per rank):
+  same-binary fabric A/B on the FP8 checkpoint, transcripts identical —
+  world 4 +6.4 / +3.8 / +2.4 / +1.3 % at one to four live requests, world 2
+  +9.0 / +6.7 / +6.6 / +4.6 %, prefill unchanged. The GR sites, routers and
+  shared experts stay BF16: they are read warm behind the prefetcher, where
+  the packed chain's extra integer work loses (microbenched: +56 to +109 %
+  from L2, no gain cold at those shapes). Qwen keeps both forms resident
+  under either value of `engine.bf16_weights` (every recipe has the room);
+  under `dense_weights: "fp8"` nothing is packed. Qwen templates:
+  `"bf12+bf16"`. Also: a companion enters an L2 prefetch window through
+  `WeightPrefetcher::add_isolated` — the coalescing add bridges holes of up to
+  2 MB between adds, which between two allocations can be a released
+  (unmapped) BF16 range; no fault was ever seen, the hazard was latent under
+  `"bf12"` on the full GLM-5.3's small indexer matrices.
+- **bf12-only residency: `engine.bf16_weights: "bf12"` now SAVES memory, and
+  the two ceiling-bound templates have their contexts back** (2026-09-19;
+  round three of `benchmarks/results/2026-09-19-glm-flash-line-rate/`). The
+  12-bit form can now be the only resident one: each packable BF16 matrix
+  loads into its own releasable range (the CUDA virtual-memory API —
+  `loaders/releasable_range.*`, `LayerBump::alloc_side`), is packed as its
+  layer lands, and its BF16 bytes go back to the node at once while the
+  address stays reserved as the key (a stray read is a clean fault). The
+  staging mirror, byte formula and resident image keep their layout — an
+  image written in one mode restores in another, no rebuild. A prefill GEMM
+  expands the rows it reads into a small scratch (`launch_bf12_expand`, at
+  the device memcpy's rate) and runs the algorithm it always ran: whole
+  matrices for wide chunks (two slots: the fold overlap's row blocks reuse an
+  expansion), 8 MiB weight-row blocks that stay in the L2 for calls of up to
+  256 rows, weight-row blocks for the lm head — bitwise the unsplit call
+  under the pinned algorithm. Decode batches past eight rows take eight-row
+  packed launches, so a captured graph never touches the scratch. The key now
+  has three values: `"checkpoint"`, `"bf12"` (the 12-bit form alone: 0.5–1.4
+  GiB per rank UNDER the BF16 plan; about 10 ms per prefill chunk on
+  four-node GLM-5.3-Flash — +1–2 % at 8K–32K, +25–40 ms to a short prompt's
+  first token — within 1 % on the full GLM-5.3) and `"bf12+bf16"` (both forms
+  resident: the previous behaviour, no prefill cost). Transcripts identical
+  to the both-forms build on GLM-5.3-Flash (four and two nodes), GLM-4.7 and
+  the full GLM-5.3; decode level at every concurrency, the full GLM-5.3's
+  sixteen-row batches included. Templates: two-node GLM-5.3-Flash `"bf12"` at
+  160K again (4.8 GiB of the node left at boot, where both forms left 0.05),
+  the full GLM-5.3 `"bf12"` at 120K again (both forms were refused there);
+  four-node GLM-5.3-Flash and GLM-4.7 `"bf12+bf16"`. `DGPP_BF12=off|on|both`
+  overrides for A/B runs.
+- **Decode collective: the interleaved gate, −5 us per collective**
+  (2026-09-19, same record). The graph all-reduce kernel gates a round's
+  co-claimed peers in one interleaved pass, reads the rest of a claimed
+  doorbell ({len, ctl}, {hash}: one cache line) in one round trip behind its
+  `seq` acquire instead of four or five dependent system loads, looks for the
+  engine's poison every eighth round, and ends the wait on the last claim.
+  Rank 0's collective on the four-node GLM-5.3-Flash step: 40.9 → 35.7 us
+  (−0.5 ms of a 32.5 ms step); single-stream decode +0.9–1.5 %, two to four
+  live requests level (their 32–64 KiB rows are past the staging budget, and
+  the unstaged fold gives the rounds' gain back). Results bitwise (the
+  canonical fold), transcripts identical, seven-minute soak clean;
+  `DGPP_BUS_GATE=sequential` keeps the per-peer gates.
+- **Lossless 12-bit BF16 decode weights, `engine.bf16_weights: "bf12"`**
+  (2026-09-19; `benchmarks/results/2026-09-19-glm-flash-line-rate/`): a second
+  resident form of the BF16 matrices the decode GEMV streams — the
+  sign+mantissa byte plus a 4-bit exponent code against a per-row window,
+  exact side tables for the 1.5e-4 of weights outside it, outlier rows kept
+  BF16 (`src/kernels/bf12_gemv.*`, `bf12_companions.*`). Bitwise the BF16 GEMV
+  at one to eight rows, 0.75 of the bytes: served transcripts are identical.
+  Same-binary fabric A/B: GLM-5.3-Flash decode +6.0 / +4.3 / +6.4 / +6.1 % at
+  one to four live requests (+8.5 % without MTP), GLM-4.7 +11–12 % single
+  stream and +5–7 % at four, the full GLM-5.3 +5–6.5 % and +3–7 %. Off by
+  default in the binary; every deployment template enables it. The companions
+  sit beside the BF16 bytes (prefill and wider batches keep those): +1.9 GiB
+  per rank on the four-node Flash recipe, +4.8 on GLM-4.7; the two templates
+  sized to their nodes' ceiling pay from the context pool (two-node Flash
+  160K → 132K, full GLM-5.3 120K → 100K; `--bf16-weights checkpoint
+  --kv-capacity …` restores either). Qwen and DeepSeek accept the key and
+  pack nothing yet. Peers now also apply the head's `embed_sharding`.
+- **GLM-5.3-Flash prefill −10 to −12 %** (2026-09-19): the draft block's
+  prefill rows stop once their DSA cache state is written (nothing read
+  their output; the MoE there ran the host-segmented path: −6.0 / −7.3 /
+  −7.6 % at ~2K / ~8K / ~32K, transcripts, passes and acceptance identical;
+  `DGPP_MTP_PREFILL_FULL=1` restores), and chunks of 1024 rows or more run
+  each KDA attention site in two row blocks so block A's bulk fold flies
+  beside block B's compute and the FFN fold's second half beside the next
+  layer's first (`BoundaryReducer::begin_async`, `CublasLtGemm::set_plan_rows`:
+  bitwise the unsplit walk, a further −5.2 / −4.7 / −3.9 %;
+  `DGPP_PREFILL_OVERLAP=off` restores). Cold service prefill now 1.30 / 5.26 /
+  24.5 s.
+- **Decode collectives claim every ready peer per round** (2026-09-19): the
+  timeline's new `graph window claims:` line showed the gaps between a
+  generation's consecutive claims pinned at 7–10 us — the graph kernel gated
+  co-resident peers one scan round at a time, and two of the three rounds
+  were being read as peer skew. One election per peer per round: 43.8 → 41.6
+  us per collective, results bitwise. `scripts/bus_window_skew.py` reports the
+  gaps; `benchmarks/micro/uar_probe.cpp` records that the GB10 maps an mlx5
+  doorbell page for device access.
 - **Streaming images and GLM prefill scheduling** (2026-09-19): remove
   history-wide image count/token caps. Stage visual embeddings through fixed
   single-image and chunk buffers, including MTP lookahead and cached suffixes.

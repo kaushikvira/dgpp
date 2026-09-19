@@ -162,6 +162,7 @@ struct GlmDsaLoaderFamily {
                             LayerBump& bump, GlobalsResident& out, uint64_t& source_bytes,
                             uint64_t& verbatim_bytes, LoaderHeadSharding head);
   static size_t globals_bytes(const Config& c, int rank, int world, LoaderHeadSharding head);
+  static size_t globals_side_bytes(const Config& c, int rank, int world, LoaderHeadSharding head);
   static size_t extra_resident_bytes(const Config&, int, int) { return 0; }
   static size_t min_staging_bytes() { return 0; }
   static void after_restore(const Config&, int, const LoaderTensorMap&, LayerResident&) {}

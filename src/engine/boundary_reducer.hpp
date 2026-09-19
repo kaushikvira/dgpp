@@ -33,6 +33,16 @@ struct BoundaryReducer {
   virtual void bind_stream(void* /*cudaStream_t*/) {}
   virtual void settle() {}
 
+  // The asynchronous form of a prefill-class fold (2026-09-19, the fold
+  // overlap): begin_async() submits the fold of partial[rows, hidden] and
+  // returns at once — these rows' producing kernels are quiesced, and the
+  // caller may enqueue and run OTHER rows' work on its stream meanwhile —
+  // and end_async() waits for it. One fold outstanding at a time. False
+  // from begin_async(): this shape or transport folds synchronously only
+  // (nothing was submitted; call reduce()).
+  virtual bool begin_async(uint16_t* /*partial*/, int /*rows*/, int /*hidden*/) { return false; }
+  virtual void end_async() {}
+
   // Measurement interface (2026-09-09, the Qwen plan's Q0): one extra collective
   // of `rows x cols` bf16 over a scratch buffer nobody reads, issued right
   // after a boundary fold — the shape and position of the all-reduce a

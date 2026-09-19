@@ -458,6 +458,14 @@ struct CollectiveBus::Impl {
       uint64_t n_even = 0, n_odd = 0;
       double peer_lag_us[kBusMaxPeers] = {};  // staging written -> peer gated
       uint64_t peer_last[kBusMaxPeers] = {};  // times this peer arrived last
+      // The gaps between consecutive claims in claim order (2026-09-19): the
+      // kernel claims one peer per round, a gate pass over its payload in
+      // every round, so co-resident doorbells are gated one after another
+      // and the later ones' passes land in `skew`. Gaps pinned at one
+      // pass's length are that serialization; gaps that spread are the
+      // peers' own arrival spread. Hist: <3 <5 <7 <10 <15 <25 >=25 us.
+      double claim_gap_us[kBusMaxPeers] = {};
+      uint64_t claim_gap_hist[kBusMaxPeers][7] = {};
     } tl;
     uint64_t armed_gt = 0;  // graph_replay_arm's host time, on the gt base
     // The window's slot-credit carrier: graph posts have no request of
@@ -1238,6 +1246,17 @@ struct CollectiveBus::Impl {
       if (c.gt_claim[p] > c.gt_claim[last]) last = p;
     }
     ++t.peer_last[last];
+    // The claims in claim order and the gaps between them.
+    uint64_t claims[kBusMaxPeers];
+    const size_t np = std::min<size_t>(peer_ranks.size(), kBusMaxPeers);
+    for (size_t p = 0; p < np; ++p) claims[p] = c.gt_claim[p];
+    std::sort(claims, claims + np);
+    for (size_t p = 1; p < np; ++p) {
+      const double gap = us(claims[p - 1], claims[p]);
+      t.claim_gap_us[p] += gap;
+      const int gb = gap < 3 ? 0 : gap < 5 ? 1 : gap < 7 ? 2 : gap < 10 ? 3 : gap < 15 ? 4 : gap < 25 ? 5 : 6;
+      ++t.claim_gap_hist[p][gb];
+    }
   }
 
   void log_window_timeline() {
@@ -1291,6 +1310,15 @@ struct CollectiveBus::Impl {
     ::dgpp::logf(lvl, "graph window peers: rank {} (staging written -> peer "
                   "payload gated, avg; times arrived last):{}",
                   opt.my_rank, peers_txt);
+    std::string gaps_txt;
+    for (size_t p = 1; p < std::min<size_t>(peer_ranks.size(), kBusMaxPeers); ++p) {
+      gaps_txt += " claim " + std::to_string(p) + "->" + std::to_string(p + 1) + " avg " +
+                  std::format("{:.1f}", t.claim_gap_us[p] / n) + " us hist";
+      for (int i = 0; i < 7; ++i) gaps_txt += " " + std::to_string(t.claim_gap_hist[p][i]);
+      gaps_txt += ";";
+    }
+    ::dgpp::logf(lvl, "graph window claims: rank {} (gaps between consecutive claims, hist "
+                  "<3 <5 <7 <10 <15 <25 >=25 us):{}", opt.my_rank, gaps_txt);
     t = GraphState::Timeline{};
   }
 

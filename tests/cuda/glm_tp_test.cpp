@@ -49,6 +49,7 @@
 
 #include <cuda_runtime.h>
 
+#include "common/bf16_residency.hpp"
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
 #include "common/log.hpp"
@@ -75,6 +76,8 @@ dgpp::GlmTextConfig glm_tp_test_config();
 void glm_tp_write_fixture(const std::string& dir);
 dgpp::GlmTextConfig glm_tp_test_config_fp4();
 void glm_tp_write_fixture_fp4(const std::string& dir);
+dgpp::GlmTextConfig glm_tp_test_config_wide();
+void glm_tp_write_fixture_wide(const std::string& dir);
 
 using dgpp::GlmBusBoundaryReducer;
 using dgpp::GlmDiagnosticModel;
@@ -5180,6 +5183,131 @@ DGPP_TEST(glm_tp_first_run_is_bitwise_the_second_run) {
       else
         require(vs_ref < 1e-2, "the cut prefill vs forward exceeds 1e-2");
     }
+  }
+}
+
+DGPP_TEST(glm_tp_prefill_fold_overlap_row_blocks_are_bitwise_the_chunk) {
+  // The fold overlap runs a chunk's attention site in two row blocks and
+  // defers block B's FFN stream update past the next layer's block A. The
+  // blocks must be bitwise the chunk: main logits, the draft block's state,
+  // and the decode that continues from it — dense and sparse regimes, a
+  // cut prompt, a ragged chunk (the blocks are 16-row aligned, not halves).
+  // (max_tokens below the production chunk: one chunk per uncut prompt.)
+  const auto cfg = glm_tp_test_config();
+  const std::string dir = "glm_tp_fixture";
+  glm_tp_write_fixture(dir);
+  GlmDiagnosticModel whole(cfg, dir, 128, 1024, nullptr, 0, 1, GlmResidency::Resident,
+                           GlmHeadSharding::Full, 2, true);
+  GlmDiagnosticModel blocks(cfg, dir, 128, 1024, nullptr, 0, 1, GlmResidency::Resident,
+                            GlmHeadSharding::Full, 2, true);
+  whole.set_prefill_fold_overlap(false);
+  blocks.set_prefill_fold_overlap(true, /*min_rows=*/32, /*without_reducer=*/true);
+  const auto pick = [](const GlmDiagnosticModel::Outputs& out) {
+    return local_max(out.logits.data(), out.lm_vocab_count, out.lm_vocab_begin).id;
+  };
+  for (const int T : {32, 47, 96, 128}) {
+    const auto prompt = make_tokens(T, cfg.vocab_size);
+    // A cut prompt too: an overlapped 64-row chunk, then a short tail.
+    const std::vector<int64_t> cuts = T == 96 ? std::vector<int64_t>{64} : std::vector<int64_t>{};
+    const auto want = whole.session_prefill(0, prompt, cuts);
+    const auto got = blocks.session_prefill(0, prompt, cuts);
+    require(want.logits == got.logits,
+            "fold overlap, T=" + std::to_string(T) + ": the row blocks' logits are bitwise the chunk's");
+    int64_t token = pick(want);
+    for (int step = 0; step < 3; ++step) {
+      require(whole.session_draft(0, {token}).logits == blocks.session_draft(0, {token}).logits,
+              "fold overlap: the draft block's state is bitwise the chunk's");
+      const auto a = whole.session_step(0, token);
+      const auto b = blocks.session_step(0, token);
+      require(a.logits == b.logits, "fold overlap: decode continues bitwise");
+      token = pick(a);
+    }
+    whole.session_close(0);
+    blocks.session_close(0);
+  }
+}
+
+DGPP_TEST(glm_tp_bf16_residency_modes_are_bitwise_the_checkpoint) {
+  // engine.bf16_weights on a geometry inside the packing contract: the same
+  // checkpoint built with the bf16 bytes alone, with the 12-bit companions
+  // beside them, and with the companions ALONE (the bf16 bytes of every
+  // packed matrix returned as its layer landed, prefill GEMMs through the
+  // expansion scratch — the head in weight-row blocks, the fold overlap's
+  // row blocks reusing a slot). Prefill logits — cut and ragged chunks, a
+  // five-to-eight-row tail that must keep its Lt algorithm — the draft
+  // block's state and the decode that continues are bitwise across all three.
+  const auto cfg = glm_tp_test_config_wide();
+  const std::string dir = "glm_tp_fixture_wide";
+  glm_tp_write_fixture_wide(dir);
+  struct Restore {
+    ~Restore() { dgpp::set_bf16_residency(dgpp::Bf16Residency::Checkpoint); }
+  } restore;
+  const auto build = [&](dgpp::Bf16Residency mode) {
+    dgpp::set_bf16_residency(mode);
+    auto m = std::make_unique<GlmDiagnosticModel>(cfg, dir, 128, 1024, nullptr, 0, 1, GlmResidency::Resident,
+                                                  GlmHeadSharding::Full, 2, true);
+    m->set_prefill_fold_overlap(true, /*min_rows=*/32, /*without_reducer=*/true);
+    return m;
+  };
+  const auto plain = build(dgpp::Bf16Residency::Checkpoint);
+  const auto both = build(dgpp::Bf16Residency::Bf12AndBf16);
+  size_t free_before = 0, free_after = 0, total = 0;
+  DGPP_CUDA_OK(cudaMemGetInfo(&free_before, &total));
+  const auto only = build(dgpp::Bf16Residency::Bf12);
+  DGPP_CUDA_OK(cudaMemGetInfo(&free_after, &total));
+  require(plain->bf12_companions().matrices() == 0, "checkpoint residency packs nothing");
+  // Two KDA layers' in/o projections, the draft's eh_proj, the head.
+  require(both->bf12_companions().matrices() == 6 && both->bf12_companions().released() == 0,
+          "bf12+bf16 packs every matrix and keeps its bf16 bytes");
+  require(only->bf12_companions().matrices() == 6 && only->bf12_companions().released() == 6,
+          "bf12 packs every matrix and returns its bf16 bytes");
+  require(only->bf12_companions().released_bytes() >= only->bf12_companions().bf16_bytes(),
+          "the released ranges cover the packed matrices");
+  {
+    // The plan tells the same story: bf12 alone is the smallest footprint.
+    const auto plan_of = [&](dgpp::Bf16Residency mode) {
+      dgpp::set_bf16_residency(mode);
+      return GlmDiagnosticModel::plan_memory(cfg, 128, 1024, 0, 1, GlmResidency::Resident, GlmHeadSharding::Full, 2,
+                                             true)
+          .total_bytes();
+    };
+    const size_t p_plain = plan_of(dgpp::Bf16Residency::Checkpoint);
+    const size_t p_both = plan_of(dgpp::Bf16Residency::Bf12AndBf16);
+    const size_t p_only = plan_of(dgpp::Bf16Residency::Bf12);
+    require(p_both > p_plain, "both forms resident cost memory");
+    require(p_only < p_both, "the companions alone cost less than both forms");
+    // What the build really took against what the plan says it takes.
+    const size_t used = free_before > free_after ? free_before - free_after : 0;
+    require(used <= p_only + (size_t{64} << 20), "the bf12-only build stays inside its plan (+64 MiB of slack)");
+  }
+  const auto pick = [](const GlmDiagnosticModel::Outputs& out) {
+    return local_max(out.logits.data(), out.lm_vocab_count, out.lm_vocab_begin).id;
+  };
+  for (const int T : {5, 32, 47, 96, 103, 128}) {
+    const auto prompt = make_tokens(T, cfg.vocab_size);
+    // Cut prompts: an overlapped 64-row chunk then a tail; a 96-row chunk
+    // then a seven-row tail (Lt in every mode, not the packed wide launch).
+    const std::vector<int64_t> cuts = T == 96    ? std::vector<int64_t>{64}
+                                      : T == 103 ? std::vector<int64_t>{96}
+                                                 : std::vector<int64_t>{};
+    const auto want = plain->session_prefill(0, prompt, cuts);
+    const auto got_both = both->session_prefill(0, prompt, cuts);
+    const auto got_only = only->session_prefill(0, prompt, cuts);
+    require(want.logits == got_both.logits, "bf12+bf16, T=" + std::to_string(T) + ": prefill logits are bitwise");
+    require(want.logits == got_only.logits, "bf12, T=" + std::to_string(T) + ": prefill logits are bitwise");
+    int64_t token = pick(want);
+    for (int step = 0; step < 4; ++step) {
+      const auto d = plain->session_draft(0, {token});
+      require(d.logits == both->session_draft(0, {token}).logits, "bf12+bf16: the draft block is bitwise");
+      require(d.logits == only->session_draft(0, {token}).logits, "bf12: the draft block is bitwise");
+      const auto a = plain->session_step(0, token);
+      require(a.logits == both->session_step(0, token).logits, "bf12+bf16: decode continues bitwise");
+      require(a.logits == only->session_step(0, token).logits, "bf12: decode continues bitwise");
+      token = pick(a);
+    }
+    plain->session_close(0);
+    both->session_close(0);
+    only->session_close(0);
   }
 }
 

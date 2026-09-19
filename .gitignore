@@ -46,6 +46,7 @@ dist/
 # The TP tests write this fixture into their working directory; never track a copy
 glm_tp_fixture/
 glm_tp_fixture_fp4/
+glm_tp_fixture_wide/
 qwen_engine_fixture/
 qwen_loader_fixture/
 glm_dsa_loader_fixture/

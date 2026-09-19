@@ -28,7 +28,9 @@
 
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
+#include "kernels/bf12_gemv.hpp"
 #include "loaders/fp8_quant.hpp"
+#include "loaders/releasable_range.hpp"
 #include "loaders/safetensors.hpp"
 #include "models/quant_matrix.hpp"
 
@@ -81,12 +83,36 @@ struct PackJob {
   bool src_on_device;
 };
 
+// SIDE GRANTS (2026-09-19, bf12-only residency — common/bf16_residency.hpp).
+// A bf16 matrix that a lossless 12-bit companion will replace is granted
+// ASIDE: its own releasable range (loaders/releasable_range.hpp) instead of
+// a span of the layer's allocation, so that its bytes can be returned once
+// the companion exists (release_side) while its address stays a unique key.
+// The STAGING layout does not change: `cursor` still walks every grant in
+// order, so the mirror, the byte formula and the resident image are the
+// same bytes whatever the mode (an image written in one mode restores in
+// another). Only the device placement differs — `runs` maps the main
+// allocation's spans to their staging offsets, `sides` the ranges'.
 struct LayerBump {
   void* base = nullptr;   // device memory: the addresses alloc() hands out
-  void* stage = nullptr;  // pinned host mirror for the build (same offsets)
-  size_t capacity = 0;
-  size_t cursor = 0;
+  void* stage = nullptr;  // pinned host mirror for the build (grant order)
+  size_t capacity = 0;    // device bytes behind base
+  size_t cursor = 0;      // the layer's bytes in grant order (mirror, image, formula)
   bool counting = false;
+  bool side_mode = false;  // alloc_side grants go aside (set before the first grant)
+  size_t dev_cursor = 0;   // bytes granted from base (== cursor while nothing went aside)
+  size_t side_bytes = 0;   // bytes granted aside
+
+  struct SideGrant {
+    size_t stage_off = 0;
+    size_t bytes = 0;  // the 256-aligned grant
+    ReleasableRange range;
+  };
+  struct Run {  // a maximal span of main grants
+    size_t stage_off = 0, dev_off = 0, bytes = 0;
+  };
+  std::vector<SideGrant> sides;
+  std::vector<Run> runs;
 
   ~LayerBump() {
     if (base) cudaFree(base);
@@ -95,33 +121,118 @@ struct LayerBump {
   LayerBump(const LayerBump&) = delete;
   LayerBump& operator=(const LayerBump&) = delete;
 
+  // `cap`: the bytes alloc() will grant (the layer's bytes less its side
+  // grants when side_mode is on).
   void init(size_t cap) {
-    DGPP_CUDA_OK(cudaMalloc(&base, cap));
+    if (cap > 0) DGPP_CUDA_OK(cudaMalloc(&base, cap));
     capacity = cap;
-    cursor = 0;
+    cursor = dev_cursor = side_bytes = 0;
   }
 
   // The host-side address of a device grant: where the build writes.
   template <typename T>
   T* host(T* dev) const {
     if (!stage) throw std::logic_error("weight bump has no staging");
-    return reinterpret_cast<T*>(static_cast<char*>(stage) +
-                                (reinterpret_cast<const char*>(dev) -
-                                 static_cast<const char*>(base)));
+    const char* d = reinterpret_cast<const char*>(dev);
+    if (!side_mode)
+      return reinterpret_cast<T*>(static_cast<char*>(stage) + (d - static_cast<const char*>(base)));
+    for (const SideGrant& g : sides) {
+      const char* b = static_cast<const char*>(g.range.data());
+      if (d >= b && d < b + g.bytes)
+        return reinterpret_cast<T*>(static_cast<char*>(stage) + g.stage_off + (d - b));
+    }
+    const size_t off = static_cast<size_t>(d - static_cast<const char*>(base));
+    for (const Run& r : runs)
+      if (off >= r.dev_off && off < r.dev_off + r.bytes)
+        return reinterpret_cast<T*>(static_cast<char*>(stage) + r.stage_off + (off - r.dev_off));
+    throw std::logic_error("weight bump: host() of an address it did not grant");
   }
 
   // Every grant is 256-aligned, so a layer's total is exactly the sum of
   // per-tensor aligned sizes — no inter-allocation padding surprises.
   void* alloc(size_t bytes) {
     const size_t grant = align_up_256(bytes);
-    if (cursor + grant > capacity)
+    if (dev_cursor + grant > capacity)
       throw std::runtime_error("weight bump OOM");
-    void* p = counting ? nullptr : static_cast<char*>(base) + cursor;
+    void* p = counting ? nullptr : static_cast<char*>(base) + dev_cursor;
+    if (side_mode && !counting) {
+      if (!runs.empty() && runs.back().stage_off + runs.back().bytes == cursor)
+        runs.back().bytes += grant;
+      else
+        runs.push_back(Run{cursor, dev_cursor, grant});
+    }
     cursor += grant;
+    dev_cursor += grant;
     return p;
   }
 
-  void reset() { cursor = 0; }
+  // A grant a packed companion may replace: aside when side_mode is on
+  // (the caller checks the matrix is packable), alloc() otherwise.
+  void* alloc_side(size_t bytes) {
+    if (!side_mode) return alloc(bytes);
+    const size_t grant = align_up_256(bytes);
+    void* p = nullptr;
+    if (!counting) {
+      sides.push_back(SideGrant{cursor, grant, ReleasableRange(grant)});
+      p = sides.back().range.data();
+    }
+    cursor += grant;
+    side_bytes += grant;
+    return p;
+  }
+
+  // The staging mirror's bytes onto the device (the layer's one H2D).
+  void upload(cudaStream_t stream) const {
+    if (!side_mode) {
+      DGPP_CUDA_OK(cudaMemcpyAsync(base, stage, cursor, cudaMemcpyHostToDevice, stream));
+      return;
+    }
+    for (const Run& r : runs)
+      DGPP_CUDA_OK(cudaMemcpyAsync(static_cast<char*>(base) + r.dev_off,
+                                   static_cast<const char*>(stage) + r.stage_off, r.bytes,
+                                   cudaMemcpyHostToDevice, stream));
+    for (const SideGrant& g : sides)
+      if (g.range.mapped())
+        DGPP_CUDA_OK(cudaMemcpyAsync(g.range.data(), static_cast<const char*>(stage) + g.stage_off,
+                                     g.bytes, cudaMemcpyHostToDevice, stream));
+  }
+
+  // The device bytes back into `dst` in grant order (the image capture).
+  // Synchronous; every side grant must still be mapped.
+  void download(void* dst) const {
+    if (!side_mode) {
+      DGPP_CUDA_OK(cudaMemcpy(dst, base, cursor, cudaMemcpyDeviceToHost));
+      return;
+    }
+    for (const Run& r : runs)
+      DGPP_CUDA_OK(cudaMemcpy(static_cast<char*>(dst) + r.stage_off,
+                              static_cast<const char*>(base) + r.dev_off, r.bytes,
+                              cudaMemcpyDeviceToHost));
+    for (const SideGrant& g : sides) {
+      if (!g.range.mapped()) throw std::logic_error("weight bump: download after a side release");
+      DGPP_CUDA_OK(cudaMemcpy(static_cast<char*>(dst) + g.stage_off, g.range.data(), g.bytes,
+                              cudaMemcpyDeviceToHost));
+    }
+  }
+
+  // Returns the bytes of the side grant at `dev` to the device (its address
+  // stays reserved); 0 when `dev` is not a mapped side grant. The caller
+  // guarantees nothing outstanding reads it.
+  size_t release_side(const void* dev) {
+    for (SideGrant& g : sides)
+      if (g.range.data() == dev && g.range.mapped()) {
+        const size_t freed = g.range.mapped_bytes();
+        g.range.release();
+        return freed;
+      }
+    return 0;
+  }
+
+  void reset() {
+    cursor = dev_cursor = side_bytes = 0;
+    sides.clear();
+    runs.clear();
+  }
 };
 
 inline void run_host_pack(const PackJob& j, const LayerBump& bump) {
@@ -263,14 +374,27 @@ struct WeightBuilder {
       fail("slice of '" + name + "' out of bounds");
   }
 
+  // A bf16 [n, k] matrix's grant. `packable`: the model packs this matrix
+  // into a 12-bit companion (kernels/bf12_gemv.hpp) — inside the packing
+  // contract it goes ASIDE when the bump runs side grants (LayerBump), so
+  // its bf16 bytes can be returned once the companion exists.
+  void* grant_bf16(int64_t n, int64_t k, bool packable) {
+    const size_t bytes = static_cast<size_t>(n) * static_cast<size_t>(k) * 2;
+    const bool aside = packable && n > 0 && n <= INT32_MAX && k > 0 && k <= INT32_MAX &&
+                       bf12_shape_ok(static_cast<int>(n), static_cast<int>(k));
+    return aside ? bump.alloc_side(bytes) : bump.alloc(bytes);
+  }
+
   // ---- verbatim loads (replicated at every world; world=1: everything) --
-  const void* load_raw(const std::string& name) {
+  const void* load_raw(const std::string& name, bool packable = false) {
     const Expected& e = expected(name);
     if (sharded() && !verbatim_ok(e))
       fail("TP read-class drift — '" + name +
            "' is sharded but was loaded verbatim (the slicing build and "
            "the replicated classifier disagree; fix one of them)");
-    void* dst = bump.alloc(e.nbytes());
+    void* dst = packable && e.shape.size() == 2 && e.nbytes() == static_cast<size_t>(e.numel()) * 2
+                    ? grant_bf16(e.shape[0], e.shape[1], true)
+                    : bump.alloc(e.nbytes());
     if (copy) {
       const TensorInfo& t = source(name);
       std::memcpy(bump.host(dst), t.data, e.nbytes());
@@ -279,8 +403,8 @@ struct WeightBuilder {
     note_read(e, e.nbytes());
     return dst;
   }
-  uint16_t* load_bf16(const std::string& name) {
-    return static_cast<uint16_t*>(const_cast<void*>(load_raw(name)));
+  uint16_t* load_bf16(const std::string& name, bool packable = false) {
+    return static_cast<uint16_t*>(const_cast<void*>(load_raw(name, packable)));
   }
   float* load_f32(const std::string& name) {
     return static_cast<float*>(const_cast<void*>(load_raw(name)));
@@ -313,12 +437,11 @@ struct WeightBuilder {
 
   // ---- contiguous row/element slices (bf16/f32 — no scale grid) --------
   uint16_t* load_bf16_rows(const std::string& name, int64_t row_start,
-                          int64_t rows) {
+                          int64_t rows, bool packable = false) {
     const Expected& e = expected(name);
     check_range(name, row_start, rows, e.shape[0]);
     const int64_t width = static_cast<int64_t>(e.numel()) / e.shape[0];
-    uint16_t* dst = static_cast<uint16_t*>(
-        bump.alloc(static_cast<size_t>(rows) * static_cast<size_t>(width) * 2));
+    uint16_t* dst = static_cast<uint16_t*>(grant_bf16(rows, width, packable));
     if (copy) {
       const TensorInfo& t = source(name);
       const uint8_t* src = static_cast<const uint8_t*>(t.data);
@@ -333,13 +456,12 @@ struct WeightBuilder {
   // A column slice of a BF16 [rows, full_cols] matrix, packed contiguous
   // [rows, cols] (a host-source pack in phase one).
   uint16_t* load_bf16_cols(const std::string& name, int64_t col_start,
-                          int64_t cols) {
+                          int64_t cols, bool packable = false) {
     const Expected& e = expected(name);
     if (e.shape.size() != 2) fail("'" + name + "' is not a matrix");
     const int64_t rows = e.shape[0], full = e.shape[1];
     check_range(name, col_start, cols, full);
-    uint16_t* dst = static_cast<uint16_t*>(
-        bump.alloc(static_cast<size_t>(rows) * static_cast<size_t>(cols) * 2));
+    uint16_t* dst = static_cast<uint16_t*>(grant_bf16(rows, cols, packable));
     if (copy) {
       const TensorInfo& t = source(name);
       packs.push_back(PackJob{static_cast<const uint16_t*>(t.data) + col_start, dst,

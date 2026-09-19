@@ -54,6 +54,7 @@
 #include "engine/decode_outputs.hpp"
 #include "engine/memory_plan.hpp"
 #include "engine/session_model.hpp"
+#include "kernels/bf12_companions.hpp"
 #include "kernels/l2_prefetch.hpp"
 #include "kernels/gemm.hpp"
 #include "kernels/glm_spec.hpp"
@@ -126,6 +127,8 @@ class QwenModel : public SessionModel<QwenModel> {
   using Base::session_snapshot_bytes;
 
   const QwenTextConfig& config() const { return cfg_; }
+  // The bf16 decode weights' 12-bit companions (gates read its counters).
+  const Bf12Companions& bf12_companions() const { return bf12_; }
   const QwenKvPool& kv_pool() const { return pool_; }
 
   // ---- the session core's hooks (engine/session_model.hpp) --------------------
@@ -230,6 +233,18 @@ class QwenModel : public SessionModel<QwenModel> {
   // Decode rows open a window before each fold with the other side's
   // first weights in consumption order (GLM's boundary windows); the
   // side stream rejoins before the walk's end. DGPP_L2_PREFETCH=off A/Bs.
+  // The bf16 decode weights' lossless 12-bit companions (engine.bf16_weights;
+  // kernels/bf12_companions.hpp): the GDN and QSA projections, the draft
+  // block's, the head — packed as each layer lands in graph_prepare. The GR
+  // sites, the routers and the shared experts keep their bf16 form (their
+  // decode kernels are latency-bound at those shapes: the record's round 4).
+  void pack_layer_companions(int layer, const QwenLayerResident& r);
+  void finish_companions();
+  static size_t bf12_plan_bytes(const QwenTextConfig& cfg, const QwenLocalGeometry& geo, bool mtp);
+  Bf12Companions bf12_;
+  bool bf12_built_ = false;
+  double bf12_s_ = 0.0;
+  int walk_rows_ = 1;  // the rows of the walk in flight (the prefetch windows' view)
   WeightPrefetcher prefetch_;
   size_t prefetch_window_bytes_ = 0;  // 0 = the prefetcher's default (the DGPP_L2_PREFETCH_MB knob)
   void prefetch_gr(const QwenGrResident& g, bool inject);
@@ -237,6 +252,9 @@ class QwenModel : public SessionModel<QwenModel> {
   void prefetch_attention_side(int layer);
   void prefetch_head(const QwenGrResident& mixer);
   void prefetch_add(const char* what, const void* p, size_t bytes);
+  // A bf16 matmul weight into the open window: the bytes the walk's launch
+  // streams — its packed companion's when the GEMM holds one.
+  void prefetch_bf16(const char* what, const uint16_t* w, size_t bytes);
   void prefetch_fp8(const char* what, const GlmQuantMatrix& q);
   void prefetch_ple_key_side(const QwenLayerResident& r);
   void prefetch_ple_value_side(const QwenLayerResident& r);

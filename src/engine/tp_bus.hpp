@@ -86,8 +86,30 @@ struct BusBoundaryReducer final : BoundaryReducer {
     return staged_;
   }
 
+  // The bulk machine's submit without its wait (the fold overlap): only
+  // prefill-class boundaries, and never beside a staged handout.
+  bool begin_async(uint16_t* partial, int rows, int hidden) override {
+    const size_t total = static_cast<size_t>(rows > 0 ? rows : 0) * static_cast<size_t>(hidden > 0 ? hidden : 0);
+    if (staged_ != nullptr || async_id_ != 0 || hidden <= 0 || hidden % 2 != 0 ||
+        static_cast<size_t>(hidden) > max_elems_ || total <= 2 * max_elems_)
+      return false;
+    std::string err;
+    async_id_ = bus_.allreduce_bulk(partial, partial, total, &err);
+    if (async_id_ == 0) throw std::runtime_error("boundary reduce: bulk rejected: " + err);
+    return true;
+  }
+  void end_async() override {
+    if (async_id_ == 0) return;
+    step_timing::Scope tick(step_timing::kFold);
+    const uint64_t id = async_id_;
+    async_id_ = 0;
+    wait_collective(id, "boundary bulk (async)");
+  }
+
   void reduce(uint16_t* partial, int rows, int hidden) override {
     step_timing::Scope tick(step_timing::kFold);
+    if (async_id_ != 0)
+      throw std::runtime_error("boundary reduce: an asynchronous fold is outstanding");
     if (hidden <= 0 || static_cast<size_t>(hidden) > max_elems_ ||
         hidden % 2 != 0)
       throw std::invalid_argument(
@@ -158,6 +180,7 @@ struct BusBoundaryReducer final : BoundaryReducer {
   int timeout_ms_ = 60000;
   size_t max_elems_ = 0;        // one latency slot, in bf16
   uint16_t* staged_ = nullptr;  // held pre-stage handout, if any
+  uint64_t async_id_ = 0;       // the outstanding asynchronous fold, if any
   uint16_t* probe_buf_ = nullptr;  // the Q0 probe's device scratch (lazy)
 };
 

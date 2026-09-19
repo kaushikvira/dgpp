@@ -120,6 +120,7 @@ endif()
 
 add_library(dgpp_core STATIC
   src/common/log.cpp
+  src/common/bf16_residency.cpp
   src/common/process_memory.cpp
   src/core/trace.cpp)
 dgpp_set_common(dgpp_core)
@@ -148,6 +149,13 @@ target_include_directories(dgpp_rope_scaling PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/
 target_link_libraries(dgpp_rope_scaling PUBLIC dgpp_common)
 dgpp_set_common(dgpp_rope_scaling)
 
+# Device ranges whose memory can be returned while the address stays reserved
+# (the CUDA virtual-memory API: the driver library, beside the runtime). The
+# weight loaders' side grants — bf12-only residency — are built on it.
+add_library(dgpp_device_ranges STATIC src/loaders/releasable_range.cpp)
+target_link_libraries(dgpp_device_ranges PUBLIC CUDA::cudart CUDA::cuda_driver)
+dgpp_set_common(dgpp_device_ranges)
+
 add_library(dgpp_kernels STATIC
   src/kernels/gemm_cublaslt.cpp
   src/kernels/kernels.cu
@@ -160,6 +168,8 @@ add_library(dgpp_kernels STATIC
   src/kernels/packq_gemm.cu
   src/kernels/scale_gemm.cu
   src/kernels/bf16_gemv.cu
+  src/kernels/bf12_gemv.cu
+  src/kernels/bf12_companions.cpp
   src/kernels/mma_gemv.cu
   src/kernels/l2_prefetch.cu
   src/kernels/glm_mhc.cu
@@ -258,7 +268,7 @@ dgpp_set_common(dgpp_models_glm4)
 add_library(dgpp_models_glm4_loader STATIC
   src/models/glm4/loader.cpp)
 target_include_directories(dgpp_models_glm4_loader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(dgpp_models_glm4_loader PUBLIC dgpp_models_glm4 dgpp_loaders CUDA::cudart)
+target_link_libraries(dgpp_models_glm4_loader PUBLIC dgpp_models_glm4 dgpp_loaders CUDA::cudart dgpp_device_ranges)
 dgpp_set_common(dgpp_models_glm4_loader)
 
 # The GLM-4.7 layer objects and model (the paged K/V pool first; the layers
@@ -293,7 +303,7 @@ dgpp_set_common(dgpp_models_glm_dsa)
 add_library(dgpp_models_glm_dsa_loader STATIC
   src/models/glm_dsa/loader.cpp)
 target_include_directories(dgpp_models_glm_dsa_loader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(dgpp_models_glm_dsa_loader PUBLIC dgpp_models_glm_dsa dgpp_loaders CUDA::cudart)
+target_link_libraries(dgpp_models_glm_dsa_loader PUBLIC dgpp_models_glm_dsa dgpp_loaders CUDA::cudart dgpp_device_ranges)
 dgpp_set_common(dgpp_models_glm_dsa_loader)
 
 # DeepSeek-V4.1-Flash (2026-09-13, docs/deepseek_v41_flash_plan.md): the
@@ -312,7 +322,7 @@ dgpp_set_common(dgpp_models_dsv41)
 add_library(dgpp_models_dsv41_loader STATIC
   src/models/dsv41/loader.cpp)
 target_include_directories(dgpp_models_dsv41_loader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(dgpp_models_dsv41_loader PUBLIC dgpp_models_dsv41 dgpp_loaders CUDA::cudart)
+target_link_libraries(dgpp_models_dsv41_loader PUBLIC dgpp_models_dsv41 dgpp_loaders CUDA::cudart dgpp_device_ranges)
 dgpp_set_common(dgpp_models_dsv41_loader)
 
 # The CSA2 attention layer and its caches (plan G4).
@@ -350,7 +360,7 @@ dgpp_set_common(dgpp_models_qwen)
 add_library(dgpp_models_qwen_loader STATIC
   src/models/qwen/loader.cpp)
 target_include_directories(dgpp_models_qwen_loader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(dgpp_models_qwen_loader PUBLIC dgpp_models_qwen dgpp_loaders CUDA::cudart)
+target_link_libraries(dgpp_models_qwen_loader PUBLIC dgpp_models_qwen dgpp_loaders CUDA::cudart dgpp_device_ranges)
 dgpp_set_common(dgpp_models_qwen_loader)
 
 # The Qwen layers (Q3): the MoE on the shared MoE layer, with its oracle.
@@ -426,7 +436,7 @@ add_library(dgpp_models_glm_loader STATIC
   src/models/glm/tp.cpp
   src/models/glm/tp_parity.cpp)
 target_link_libraries(dgpp_models_glm_loader
-  PUBLIC dgpp_models_glm dgpp_models_moe dgpp_kernels dgpp_models_kda dgpp_models_dsa)
+  PUBLIC dgpp_models_glm dgpp_models_moe dgpp_kernels dgpp_models_kda dgpp_models_dsa dgpp_device_ranges)
 dgpp_set_common(dgpp_models_glm_loader)
 
 add_executable(glm_bind_check apps/glm_bind_check.cpp)
@@ -1144,7 +1154,7 @@ add_test(NAME qwen_engine_row_independent
   COMMAND ${CMAKE_COMMAND} -E env DGPP_DENSE_GEMV_ROWS=256 DGPP_TEST_FILTER=wide
           $<TARGET_FILE:qwen_engine_test>)
 set_tests_properties(qwen_engine_test qwen_engine_row_independent PROPERTIES RESOURCE_LOCK qwen_engine_world)
-set_tests_properties(qwen_engine_row_independent PROPERTIES LABELS "gpu;rdma")
+set_tests_properties(qwen_engine_row_independent PROPERTIES LABELS "gpu;rdma" RUN_SERIAL TRUE)
 add_test(NAME qwen_engine_fp8_wide
   COMMAND ${CMAKE_COMMAND} -E env DGPP_DENSE_GEMV_ROWS=4 DGPP_TEST_DENSE_FP8=1 DGPP_TEST_FILTER=wide
           $<TARGET_FILE:qwen_engine_test>)
@@ -1167,6 +1177,14 @@ add_test(NAME qwen_engine_mtp3_rows64_row_independent
 set_tests_properties(qwen_engine_fp8_mtp3_rows64 qwen_engine_mtp3_rows64_row_independent
   PROPERTIES RESOURCE_LOCK qwen_engine_world LABELS "gpu;rdma")
 
+# The graph engines with the bf16 decode weights' 12-bit companions on
+# (engine.bf16_weights; DGPP_BF12 overrides the process setting): the packed
+# multi launch and the packed GEMVs under capture and replay, against the
+# same references — the form is bitwise, so every gate holds unchanged.
+add_test(NAME qwen_engine_bf12
+  COMMAND ${CMAKE_COMMAND} -E env DGPP_BF12=both $<TARGET_FILE:qwen_engine_test>)
+set_tests_properties(qwen_engine_bf12 PROPERTIES RESOURCE_LOCK qwen_engine_world LABELS "gpu;rdma" RUN_SERIAL TRUE)
+
 add_executable(qwen_forward_check apps/qwen_forward_check.cpp)
 target_link_libraries(qwen_forward_check PRIVATE dgpp_models_qwen_layers dgpp_bus dgpp_loaders CUDA::cudart Threads::Threads)
 dgpp_set_common(qwen_forward_check)
@@ -1187,6 +1205,12 @@ target_link_libraries(bf16_gemv_test PRIVATE dgpp_kernels CUDA::cudart)
 dgpp_set_common(bf16_gemv_test)
 add_test(NAME bf16_gemv_test COMMAND bf16_gemv_test)
 set_tests_properties(bf16_gemv_test PROPERTIES SKIP_RETURN_CODE 2)
+add_executable(bf12_gemv_test tests/cuda/bf12_gemv_test.cu)
+target_include_directories(bf12_gemv_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(bf12_gemv_test PRIVATE dgpp_kernels CUDA::cudart)
+dgpp_set_common(bf12_gemv_test)
+add_test(NAME bf12_gemv_test COMMAND bf12_gemv_test)
+set_tests_properties(bf12_gemv_test PROPERTIES SKIP_RETURN_CODE 2)
 
 add_executable(mma_gemv_test tests/cuda/mma_gemv_test.cu)
 target_include_directories(mma_gemv_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1395,6 +1419,16 @@ if(DGPP_ENABLE_IBV)
   dgpp_set_common(micro_gdr_probe)
   target_link_libraries(micro_gdr_probe PRIVATE ${IBVERBS_LIBRARY})
   target_include_directories(micro_gdr_probe PRIVATE ${IBVERBS_INCLUDE_DIR})
+
+  # The send-doorbell mapping probe (2026-09-19): mlx5 direct verbs, only
+  # where libmlx5 is installed.
+  find_library(MLX5_LIBRARY NAMES mlx5)
+  if(MLX5_LIBRARY)
+    add_executable(micro_uar_probe benchmarks/micro/uar_probe.cpp)
+    dgpp_set_common(micro_uar_probe)
+    target_link_libraries(micro_uar_probe PRIVATE ${MLX5_LIBRARY} ${IBVERBS_LIBRARY} CUDA::cudart)
+    target_include_directories(micro_uar_probe PRIVATE ${IBVERBS_INCLUDE_DIR})
+  endif()
 
   add_executable(micro_ibv_smoke
     benchmarks/micro/ibv_smoke.cpp
