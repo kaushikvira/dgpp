@@ -306,3 +306,119 @@ values a coder needs to wire the partials without guessing. The
 reference-mapping (the single `sparse_attn` over the concatenated KV,
 the sink in the denominator only, the inverse rotation) is what makes
 the split-partial form numerically the reference's attention.
+
+## 2. The 64-head indexer selection (C4A only)
+
+The indexer is a small side-attention that scores the compressed
+positions so each query keeps just `index_topk` = 512 of them. It runs
+only on the C4A layers (`is_index_layer`, ratio 4;
+`src/models/dsv4/config.hpp:131-132`). The V4 geometry is the NEW
+64-head fold (the dsv41 base is 32 heads, `spec:§2.1(d)`): 64 index
+heads × 128 dim (`kCsa2IndexDim`), `indexer.wq_b` = `[8192, 1024]` fp8
+(`spec:§1`; `src/models/dsv4/binding.cpp:66`).
+
+### 2.1 The query side (the fused q op)
+
+`indexer_query` (`src/models/dsv4/csa2_layer.cu:273-291`), for the
+`index_source` layers:
+
+1. **Project** `idx_wq_b` (the fp8 128×128 grid, `[8192, 1024]`) over
+   the q-latent `qr_` (the `q_norm(wq_a(x))` output, §1) → `idx_q_`
+   `[tokens, 64 * 128]` bf16.
+2. **Rotate** the last 64 dims of every head (the `rope_head_dim`) with
+   the layer's `inv_freq` table (`csa2_rope_apply`, the fp32 angle
+   `pos * inv_freq[i]`, `cosf`/`sinf`, ONE bf16 rounding —
+   `src/kernels/csa2.hpp:63-70`).
+3. **Quant** to e4m3 with one power-of-two row scale
+   (`csa2_index_q_quant`, `src/kernels/csa2.hpp:131-141`): `q_fp8_`
+   `[tokens * 64, 128]` e4m3 + `q_scale_` `[tokens * 64]` fp32,
+   `S = 2^(k_max - 6)` (the row's largest block exponent). A block
+   farther than 14 binades from the largest loses codes and is counted
+   in `violations_` (read by `index_violations()`).
+4. **Fold the learned weights**: `iw_ = weights_proj(x)` (bf16
+   `[tokens, 64]`, the `idx_wp` GEMM), then `csa2_fold_weights`
+   (`src/kernels/csa2.hpp:150-153`):
+   `w_folded[i] = (fp32(bf16 w[i]) * (1/64)) * q_scale[i]` — the
+   reference's `weights_proj` output times `128^-0.5 * n_heads^-0.5`
+   (= `2^-3 * 2^-3` = **2^-6 = 0.015625**, exact) with the q scale
+   folded in for the fp8 dot.
+
+**Reference correspondence + deltas (GAP G5/G6):** the checkpoint's
+indexer q is `wq_b(qr)` → RoPE → **Hadamard `rotate_activation`** →
+in-place fp4 (e2m1 + e8m0/32) (ck:model.py:417-421, the
+`rotate_activation` at ck:model.py:253-259). The C++ drops the Hadamard
+rotation and re-expresses the fp4 as e4m3 + one fp32 row scale (a
+documented quant-class re-expression, the `violations` counter is the
+escape hatch). The reference's `weights` scaling is
+`softmax_scale * n_heads^-0.5` = `128^-0.5 * 64^-0.5` (ck:model.py:425),
+exactly the 2^-6 the C++ folds in.
+
+### 2.2 The per-entry logit (the 64-head dot)
+
+`dsv4_csa2_entry_logit` (`src/models/dsv4/csa2_layer.cu:456-466`): for
+one index-cache entry, the logit is the sum over the 64 heads of
+`w_folded[h] * relu(dot_h) * k_scale`, where `dot_h = Σ_d
+e4m3(q_fp8[h*128+d]) * e4m3(k_row[d])` (the e4m3×e4m3 exact in fp32,
+the entry's `k_scale` the index cache's fp32 row scale). This is the
+reference's `index_score = (relu(einsum("bshd,btd->bsht", q, k)) *
+weights).sum(-1)` (ck:model.py:427-428) re-expressed over the e4m3
+dequantized dots. (The scalar form is a stand-in; the completion swaps
+it for the 64×64 SMEM tile exchange — `spec:§2.1(d)`'s locked gotcha.)
+
+### 2.3 The composite-key total order + tie-break + causal mask
+
+The decode selection (`dsv4_csa2_select_decode_kernel`,
+`src/models/dsv4/csa2_layer.cu:480-549`) streams the index cache's
+visible entries per row and keeps a running top-`select_k` (512):
+
+- **The composite key** (`dsv4_csa2_sortable_key`,
+  `src/models/dsv4/csa2_layer.cu:435-453`):
+  `key = (sortable_fp32(logit) << 21) | (entry_idx & (2^21 - 1))`,
+  where `sortable_fp32` is the total-order encoding (finite logits by
+  magnitude, `-inf → 0`, `+inf → 0xFFFFFFFF`). The 21 idx bits bound
+  the entry count to 2^21.
+- **The running top-k** keeps the HIGHEST `select_k` keys (the
+  `if (key > skeys[j])` insertion, `src/models/dsv4/csa2_layer.cu:523-534`),
+  so `topk_out` is emitted in **score-descending** order with `-1`
+  padding past `min(select_k, visible)` (`src/models/dsv4/csa2_layer.cu:546-548`),
+  and `counts[r] = min(select_k, visible)`.
+- **The causal mask**: a row at `pos` sees `visible = pos_sel + 1`
+  entries where `pos_sel = (pos + 1) / ratio - 1`
+  (`csa2_entry_positions`, `src/kernels/csa2.hpp:75-79`;
+  `src/models/dsv4/csa2_layer.cu:414`). Only entries `e < visible` are
+  streamed (`src/models/dsv4/csa2_layer.cu:491,515`) — the compressed
+  entries a query at `pos` can see (a block is visible once the query
+  has passed its last token). This matches the reference's decode
+  `topk = min(index_topk, end_pos // ratio)` (ck:model.py:435;
+  `end_pos = pos + 1` for one decode row).
+
+**The tie-break — FLAGGED (GAP G-tiebreak):** the composite key
+`(sortable << 21) | idx` with a MAX top-k resolves EXACT score ties to
+the **HIGHER** entry index (larger idx → larger key → ranks higher).
+The kernel's own comment claims "the exact ties to the lower entry
+index" (`src/models/dsv4/csa2_layer.cu:427-433`), but that is the
+dsv41 base's convention, which achieves it differently: the dsv41
+shared kernel uses `(~sortable << idx_bits) | idx` with a MIN top-k
+(`src/kernels/csa2.cu:382`, `src/kernels/dsa.cu:985-1010`), where a
+lower idx → lower composite key → wins the min-top-k. The V4 prefill
+selection and the pinned CPU oracle both resolve ties to the **LOWER**
+index (`dsv4_csa2_select_prefill`'s `(score desc, index asc)`
+stable-sort, `src/models/dsv4/csa2_layer.cu:590-600`; the
+`dsv4_indexer_topk_tiebreak_and_causal` oracle,
+`tests/unit/dsv4_csa2_oracle_test.cpp:489-558`). So the V4 DECODE
+kernel's tie-break (higher index) DISAGREES with the pinned reference /
+prefill / dsv41-base tie-break (lower index). See GAPS G-tiebreak.
+
+### 2.4 The C128A layers (no indexer — the plain selection)
+
+The C128A layers (ratio 128, `coff 1`, NOT index layers) do not score:
+the reference lists every visible compressed entry
+(`get_compress_topk_idxs`, ck:model.py:275-284 — a plain topk list, no
+scoring, offset by the window width). The C++ runs the same
+`csa2_entry_positions` causal bound (visible = `(pos+1)/128`, always
+≤ `index_topk` = 512) so the selection degenerates to "every visible
+entry". The index-key plane for a C128A layer is the main compressor's
+`wkv`/`norm` (the 512-dim latent doubles as the index key,
+`src/models/dsv4/model.cpp:556-557`), vs the C4A layers' own 128-wide
+rotated indexer compressor (`a.idx_comp_wkv`,
+`src/models/dsv4/model.cpp:556`).
