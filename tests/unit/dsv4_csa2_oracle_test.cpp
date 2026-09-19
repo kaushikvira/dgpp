@@ -802,4 +802,84 @@ DGPP_TEST(dsv4_csa2_select_prefill_layout) {
   if (counts[1] != 2) throw std::runtime_error("the select's row 1's counts's != 2's");
 }
 
+// CPU-qualifiable: the planar main + index cache geometry (the no-pool
+// positional state, the dsv41 Csa2StatePool's planes' raw-pointer re-
+// expression — the dsv4 seam S1b's): the allocation sizes (the
+// Dsv4Csa2Layer's static's, the cache_tokens' a multiple of block_tokens'),
+// the record stride (the kFp4Block main's 288 B/row's the self-describing's
+// + the e4m3 index's 128 B/row's + the fp32 row-scale's 4 B/row's), the
+// identity block table mapping (entry e at slot e's, one block per
+// request's the block b is physical b's). The dsv4_csa2_oracle_test's the
+// real layer code's (the CPU-qualifiable's, no CUDA initialization).
+DGPP_TEST(dsv4_csa2_planar_cache_geometry) {
+  using dgpp::Dsv4Csa2Layer;
+  // The record stride (the G-cache-format's csa2's physical layout's):
+  // the kFp4Block main's 288 B/row's (the 512 e2m1 nibbles' 2/byte's 256
+  // + the 32 e4m3 block-scales' 32's, the self-describing's the scales'
+  // inside the row's — NOT the DSpark's 584 B kFp8 pool's), the e4m3
+  // index's 128 B/row's (the kCsa2IndexDim's), the fp32 row-scale's 4
+  // B/row's (the per-row's, one scale per entry row's).
+  const size_t main_row = dgpp::latent_row_bytes(dgpp::LatentFormat::kFp4Block, dgpp::kCsa2Latent);
+  if (main_row != 288)
+    throw std::runtime_error("the kFp4Block main row's 288 B (the 512 e2m1's 2/byte's 256 + the 32 e4m3's 32's), got " +
+                             std::to_string(main_row));
+  if (dgpp::kCsa2IndexDim != 128)
+    throw std::runtime_error("the e4m3 index row's 128 B (the kCsa2IndexDim's), got " + std::to_string(dgpp::kCsa2IndexDim));
+  const size_t scale_row = sizeof(float);
+  if (scale_row != 4) throw std::runtime_error("the fp32 row-scale's 4 B, got " + std::to_string(scale_row));
+  // The allocation sizes (the Dsv4Csa2Layer's static's, the cache_tokens'
+  // a multiple of block_tokens' the 128-token block's): the C4A's (ratio
+  // 4) the epb's 128/4 = 32 entries/128-token block's (the spec's §1.3's
+  // epb's), the C128A's (ratio 128) the epb's 128/128 = 1's.
+  const int block_tokens = 128;
+  const int64_t cache_tokens = int64_t{128} * 256;  // 256 blocks, 32768 tokens
+  for (const int ratio : {4, 128}) {
+    const int64_t entries = Dsv4Csa2Layer::cache_entries(ratio, cache_tokens, block_tokens);
+    // The (cache_tokens / block_tokens) blocks' each (block_tokens / ratio)
+    // entries's = cache_tokens / ratio's.
+    const int64_t want_entries = cache_tokens / ratio;
+    if (entries != want_entries)
+      throw std::runtime_error("the cache entries' (ratio " + std::to_string(ratio) + ")'s " + std::to_string(entries) +
+                               " != cache_tokens / ratio's " + std::to_string(want_entries));
+    const size_t main_bytes = Dsv4Csa2Layer::main_cache_bytes(ratio, cache_tokens, block_tokens);
+    if (main_bytes != static_cast<size_t>(entries) * main_row)
+      throw std::runtime_error("the main cache bytes' (ratio " + std::to_string(ratio) + ")'s " + std::to_string(main_bytes) +
+                               " != entries * 288's " + std::to_string(static_cast<size_t>(entries) * main_row));
+    const size_t index_bytes = Dsv4Csa2Layer::index_cache_bytes(ratio, cache_tokens, block_tokens);
+    if (index_bytes != static_cast<size_t>(entries) * dgpp::kCsa2IndexDim)
+      throw std::runtime_error("the index cache bytes' (ratio " + std::to_string(ratio) + ")'s " + std::to_string(index_bytes) +
+                               " != entries * 128's " + std::to_string(static_cast<size_t>(entries) * dgpp::kCsa2IndexDim));
+    const size_t scale_bytes = Dsv4Csa2Layer::index_scale_bytes(ratio, cache_tokens, block_tokens);
+    if (scale_bytes != static_cast<size_t>(entries) * scale_row)
+      throw std::runtime_error("the index scale bytes' (ratio " + std::to_string(ratio) + ")'s " + std::to_string(scale_bytes) +
+                               " != entries * 4's " + std::to_string(static_cast<size_t>(entries) * scale_row));
+    // The epb's (the entries per 128-token block's the spec's §1.3's):
+    // the C4A's 32's, the C128A's 1's.
+    if (ratio == 4 && entries != cache_tokens / 4)
+      throw std::runtime_error("the C4A's entries' != cache_tokens / 4's");
+    if (ratio == 128 && entries != cache_tokens / 128)
+      throw std::runtime_error("the C128A's entries' != cache_tokens / 128's");
+  }
+  // The identity block table mapping (the no-pool positional state's): the
+  // main block table's [max_decode_rows, max_blocks]'s the identity's (one
+  // block per request's, block b is physical b's), so the dsa_attn_listed's
+  // / the dsa_latent_append's block table's resolution's: block = e / epb,
+  // off = e % epb, phys_block = block (the identity's), slot = phys_block
+  // * epb + off = e's (entry e at slot e's).
+  const int epb = 128 / 4;  // the C4A's 32 entries/128-token block's
+  const int max_blocks = static_cast<int>(cache_tokens / block_tokens);  // the 256 blocks's
+  const std::vector<int64_t> test_entries = {0, 1, 31, 32, 63, 64, 1000};
+  for (const int64_t e : test_entries) {
+    const int block = static_cast<int>(e / epb);
+    const int off = static_cast<int>(e % epb);
+    const int32_t phys_block = block;  // the identity block table's (block b is physical b's)
+    const int64_t slot = int64_t(phys_block) * epb + off;  // the physical slot's
+    if (slot != e)
+      throw std::runtime_error("the identity block table's mapping's entry " + std::to_string(e) + " at slot " +
+                               std::to_string(slot) + " != e's");
+    if (block >= max_blocks)
+      throw std::runtime_error("the entry's block's out of the max_blocks' bound's (e " + std::to_string(e) + ")");
+  }
+}
+
 int main() { return ::dgpp::test::run_all(); }

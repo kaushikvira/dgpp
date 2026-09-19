@@ -263,6 +263,7 @@ class Dsv4Model : public SessionModel<Dsv4Model> {
   float* inv_freq_compressed_ = nullptr;  // device [32]
   std::vector<int> cache_ord_;            // per layer (-1: window only)
   std::vector<int> tail_ord_;             // per ratio-4 kv source (-1: none)
+  std::vector<int> cache_ratio_;           // per cache ordinal, the compress ratio (4 C4A / 128 C128A)
   int tails_ = 0;
   // The ratio-4 (C4A) overlapping compressor's per-request tails (2026-09-18,
   // the dsv4 dspark + compressor wiring; docs/dsv4_kernel_port_spec.md §2.1(b)):
@@ -274,6 +275,25 @@ class Dsv4Model : public SessionModel<Dsv4Model> {
   float* d_tails_ = nullptr;
   float* spec_tails_ = nullptr;
   int tails_w_ = kCsa2TailW;  // the W's (the C4A's compressor's output width's, the 1024's)
+  // The planar main + index caches (2026-09-19, the dsv4 seam S1b: the no-pool
+  // positional state, the dsv41 Csa2StatePool's planes' raw-pointer re-
+  // expression): per cache ordinal (kv source), the kFp4Block main cache
+  // (288 B/row, self-describing — the G-cache-format's csa2 physical layout,
+  // NOT the DSpark's 584 B kFp8 pool) + the planar index cache (e4m3
+  // [entries, 128] + fp32 row-scale [entries], one scale per entry row).
+  // The model allocates them (Dsv4Csa2Layer's static's, sized from the
+  // config's max_cache_tokens_'s + the per-ordinal ratio's) + frees them in
+  // the destructor's; the csa2 layer's publish_entries's writes the
+  // compressor's entries' into them (the identity's block table's, entry e
+  // at slot e's). The csa2 layer's attend's / the 64-head selection's read
+  // them (the main_cache != nullptr's gate's the kv sources' the real
+  // pointer's, the window-only's the SWA's the nullptr's).
+  std::vector<uint8_t*> main_cache_;  // per cache ordinal, the kFp4Block planar main cache
+  std::vector<uint8_t*> index_cache_;  // per cache ordinal, the planar e4m3 index keys
+  std::vector<float*> index_scale_;  // per cache ordinal, the fp32 row-scale
+  std::vector<size_t> main_cache_bytes_;  // per cache ordinal, the allocation's size's
+  std::vector<size_t> index_cache_bytes_;  // per cache ordinal, the allocation's size's
+  std::vector<size_t> index_scale_bytes_;  // per cache ordinal, the allocation's size's
   int targets_ = 0;                       // dspark target layers (the draft width is targets_ * H)
   int draft_row_ = 0;                     // the next block row a chain call emits (0: no block stands)
   // The hash gate tables' device copies (the num_hash_layers' tid2eid's

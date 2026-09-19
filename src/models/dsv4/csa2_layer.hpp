@@ -107,6 +107,27 @@ class Dsv4Csa2Layer {
                               int max_decode_rows = 16, int decode_n_split = 32,
                               size_t dot_budget = 64ull << 20);
 
+  // ---- the planar main / index cache's geometry (the no-pool positional
+  // state's the dsv41 pool's planes' raw-pointer re-expression's) --------
+  // The model allocates these (the dsv41 pool's init's the per-cache-
+  // ordinal's raw-pointer's re-expression's) and the layer's publish_entries's
+  // writes the compressor's entries's into them (the identity block table's,
+  // entry e at slot e's). `cache_tokens` (a multiple of `block_tokens`) holds
+  // cache_tokens / block_tokens blocks of block_tokens tokens, each block's
+  // block_tokens / ratio compressed entries's (the spec's §1.3's epb's), so
+  // the cache's entry capacity's cache_tokens / ratio's.
+  //   main cache  the kFp4Block planar form (latent_row_bytes(kFp4Block,
+  //                kCsa2Latent) = 288 B/row's the self-describing's the
+  //                scales' inside the row's, the G-cache-format's csa2's
+  //                physical layout's — NOT the DSpark's 584 B kFp8 pool's).
+  //   index cache  the planar e4m3 codes (kCsa2IndexDim bytes/row) + the
+  //                fp32 row-scale (sizeof(float)/row's the per-row's,
+  //                one scale per entry row's).
+  static int64_t cache_entries(int ratio, int64_t cache_tokens, int block_tokens);
+  static size_t main_cache_bytes(int ratio, int64_t cache_tokens, int block_tokens);
+  static size_t index_cache_bytes(int ratio, int64_t cache_tokens, int block_tokens);
+  static size_t index_scale_bytes(int ratio, int64_t cache_tokens, int block_tokens);
+
   // Points the object at a layer's weights and role (the three-class
   // dispatch's rebind: the ratio's validation, the projection geometry's
   // check against the config, the indexer / compressor's weight presence
@@ -152,7 +173,7 @@ class Dsv4Csa2Layer {
   // using the layer's own w_.comp_norm / cfg_.eps / w_.ratio (the dsv41's
   // contract's — the layer's the rebound's the values's) + the caller's tails /
   // tails_w (the model's state's).
-  void enqueue_decode(const void* hidden_in, void* main_cache, void* index_cache, const float* index_scale,
+  void enqueue_decode(const void* hidden_in, void* main_cache, void* index_cache, float* index_scale,
                       const int32_t* req_ids, const int64_t* pos, const int32_t* req_spans,
                       int num_requests, int tokens, void* out, cudaStream_t stream,
                       float* tail_snapshots = nullptr, float* tails = nullptr, int tails_w = 0);
@@ -190,6 +211,24 @@ class Dsv4Csa2Layer {
   void attend(int tokens, const int64_t* pos, const int32_t* req_ids, void* main_cache, cudaStream_t stream);
   // The grouped wo_a / wo_b (the block-diagonal over the groups).
   void project_out(int tokens, void* out, cudaStream_t stream);
+  // The publish (the dsv41 Csa2Layer::publish_entries's the no-pool's
+  // re-expression): the compressor's `latent_` (the ratio-4's the C4A's
+  // kCsa2TailW's 1024's pair-pooled's, the 512-dim's the main / index's
+  // latent's the overlap plane's the dims' 0..511's the G-tail-pool's gap's
+  // placeholder's the cudaMemcpy2DAsync's the first 512 dims' the
+  // latent_main_'s; the ratio-128's the plain's [T, 512]'s the latent_'s
+  // direct's) into the model's planar main / index caches (the kFp4Block
+  // main's + the planar e4m3's index's + the fp32 row-scale's, the
+  // identity block table's the main_block_table_'s the entry e at slot e's).
+  // The index keys (the index_source's the C4A's the idx_wk's the 128-wide's
+  // wk -> RMSNorm -> the tail's rotated at ent_pos_'s the csa2_index_k_
+  // append's); the main rows (the latent's tail's rotated's the
+  // dsa_latent_append's the kFp4Block's). `main_cache` null: the no-op's
+  // (the window-only's the SWA's); `index_cache` / `index_scale` null or
+  // the index_source's false: the index's append's skipped's (the C128A's
+  // the main-only's the plain's the no-index's the C4A's the both's).
+  void publish_entries(void* main_cache, void* index_cache, float* index_scale, const int32_t* req_ids,
+                       int tokens, cudaStream_t stream);
 
   IGemm& gemm_;
   Dsv4Csa2Config cfg_;
@@ -216,6 +255,7 @@ class Dsv4Csa2Layer {
   uint16_t* iw_ = nullptr;     // [T, 64] the indexer's weights
   float* w_folded_ = nullptr;  // [T * 64]
   uint16_t* latent_ = nullptr; // [T, kCsa2TailW] the compressor's latent (the C4A's 1024's)
+  uint16_t* latent_main_ = nullptr;  // [T, kCsa2Latent] the publish's 512-dim latent (the C4A's overlap plane's the G-tail-pool's placeholder's, the C128A's the latent_'s direct's)
   float* comp_kv_ = nullptr;   // [T, kCsa2TailW] fp32 the wkv's F32 out (the C4A's tail's comp_kv's)
   float* comp_score_ = nullptr;  // [T, kCsa2TailW] fp32 the wgate's F32 out (the C4A's tail's comp_score's)
   int64_t* entries_ = nullptr;   // [T] the entry's ordinal's (p / 2 on the odd's, -1 otherwise)

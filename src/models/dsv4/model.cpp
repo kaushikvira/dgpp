@@ -201,13 +201,61 @@ Dsv4Model::Dsv4Model(const Dsv4TextConfig& cfg, const std::string& checkpoint_di
   // The layer -> cache / tail ordinals.
   cache_ord_.assign(static_cast<size_t>(cfg_.max_layer()), -1);
   tail_ord_.assign(static_cast<size_t>(cfg_.max_layer()), -1);
+  cache_ratio_.clear();
   {
     int c = 0, t = 0;
     for (int l = 0; l < cfg_.max_layer(); ++l) {
-      if (cfg_.compress_ratio(l) > 0) cache_ord_[static_cast<size_t>(l)] = c++;
+      if (cfg_.compress_ratio(l) > 0) {
+        cache_ord_[static_cast<size_t>(l)] = c;
+        cache_ratio_.push_back(cfg_.compress_ratio(l));
+        ++c;
+      }
       if (cfg_.is_index_layer(l)) tail_ord_[static_cast<size_t>(l)] = t++;
     }
     tails_ = t;
+  }
+  // The planar main + index caches (2026-09-19, the dsv4 seam S1b: the no-
+  // pool positional state, the dsv41 Csa2StatePool's planes' raw-pointer
+  // re-expression): per cache ordinal (kv source), the kFp4Block main
+  // cache (288 B/row, self-describing) + the planar index cache (e4m3
+  // [entries, 128] + fp32 row-scale [entries]). The size's Dsv4Csa2Layer's
+  // static's (the per-ordinal ratio's the cache_ratio_'s, the
+  // max_cache_tokens_'s the rounded's the entry's count's the basis's, the
+  // kBlockTokens' the 128-token block's). The zero's the cold start's
+  // (the entry's the 0's the scale's the 0's the attention's the empty's
+  // the -inf's the no-op's). The C4A's publish's the csa2 layer's
+  // publish_entries's (the dsv41's re-expression's), the C128A's the
+  // separate item's (the C128A compressor's the G-c128a-compressor's gap's).
+  if (!cache_ratio_.empty()) {
+    const int64_t ct = max_cache_tokens_;  // the rounded cache capacity (a multiple of kBlockTokens)
+    const int n = static_cast<int>(cache_ratio_.size());
+    main_cache_.assign(static_cast<size_t>(n), nullptr);
+    index_cache_.assign(static_cast<size_t>(n), nullptr);
+    index_scale_.assign(static_cast<size_t>(n), nullptr);
+    main_cache_bytes_.assign(static_cast<size_t>(n), 0);
+    index_cache_bytes_.assign(static_cast<size_t>(n), 0);
+    index_scale_bytes_.assign(static_cast<size_t>(n), 0);
+    for (int o = 0; o < n; ++o) {
+      const int r = cache_ratio_[static_cast<size_t>(o)];
+      main_cache_bytes_[static_cast<size_t>(o)] = Dsv4Csa2Layer::main_cache_bytes(r, ct, kBlockTokens);
+      index_cache_bytes_[static_cast<size_t>(o)] = Dsv4Csa2Layer::index_cache_bytes(r, ct, kBlockTokens);
+      index_scale_bytes_[static_cast<size_t>(o)] = Dsv4Csa2Layer::index_scale_bytes(r, ct, kBlockTokens);
+      main_cache_[static_cast<size_t>(o)] =
+          reinterpret_cast<uint8_t*>(dev_alloc<char>(main_cache_bytes_[static_cast<size_t>(o)]));
+      index_cache_[static_cast<size_t>(o)] =
+          reinterpret_cast<uint8_t*>(dev_alloc<char>(index_cache_bytes_[static_cast<size_t>(o)]));
+      index_scale_[static_cast<size_t>(o)] =
+          reinterpret_cast<float*>(dev_alloc<char>(index_scale_bytes_[static_cast<size_t>(o)]));
+      // The zero's the cold start's (the entry's the 0's the scale's the
+      // 0's the attention's the empty's the -inf's the no-op's).
+      DGPP_CUDA_OK(cudaMemsetAsync(main_cache_[static_cast<size_t>(o)], 0, main_cache_bytes_[static_cast<size_t>(o)],
+                                   stream_));
+      DGPP_CUDA_OK(cudaMemsetAsync(index_cache_[static_cast<size_t>(o)], 0, index_cache_bytes_[static_cast<size_t>(o)],
+                                   stream_));
+      DGPP_CUDA_OK(cudaMemsetAsync(index_scale_[static_cast<size_t>(o)], 0, index_scale_bytes_[static_cast<size_t>(o)],
+                                   stream_));
+    }
+    log_memory_ledger("dsv4: the planar main + index caches (the no-pool positional state)");
   }
   // The layer surfaces' scratch (the caller's contract: the model allocates
   // it, the layers carve it).
@@ -357,6 +405,9 @@ Dsv4Model::~Dsv4Model() {
   cudaFree(union_attn_scratch_);
   cudaFree(d_tails_);
   cudaFree(spec_tails_);
+  for (uint8_t* p : main_cache_) cudaFree(p);
+  for (uint8_t* p : index_cache_) cudaFree(p);
+  for (float* p : index_scale_) cudaFree(p);
   cudaFree(inv_freq_window_);
   cudaFree(inv_freq_compressed_);
   cudaFree(streams_a_);
@@ -431,6 +482,29 @@ Dsv4Model::MemoryPlan Dsv4Model::plan_memory(const Dsv4TextConfig& cfg, int max_
   plan.add("csa2 scratch (projections, selection, attention)",
            Dsv4Csa2Layer::scratch_bytes(c2, max_tokens, cache_tokens, std::min(kDecodeRowsCap, max_tokens),
                                         kDecodeSplit, kDotBudget));
+  // The planar main + index caches (2026-09-19, the dsv4 seam S1b: the no-pool
+  // positional state, the dsv41 Csa2StatePool's planes' raw-pointer re-
+  // expression): per cache ordinal (kv source), the kFp4Block main cache
+  // (288 B/row) + the planar index cache (e4m3 [entries, 128] + fp32 row-
+  // scale), sized from the config's cache_tokens + the per-ordinal ratio's
+  // (the Dsv4Csa2Layer's static's, the model's allocation's the same
+  // formula's).
+  {
+    size_t cache_bytes = 0;
+    int n_caches = 0;
+    for (int l = 0; l < cfg.max_layer(); ++l) {
+      const int r = cfg.compress_ratio(l);
+      if (r > 0) {
+        cache_bytes += Dsv4Csa2Layer::main_cache_bytes(r, cache_tokens, kBlockTokens);
+        cache_bytes += Dsv4Csa2Layer::index_cache_bytes(r, cache_tokens, kBlockTokens);
+        cache_bytes += Dsv4Csa2Layer::index_scale_bytes(r, cache_tokens, kBlockTokens);
+        ++n_caches;
+      }
+    }
+    if (n_caches > 0)
+      plan.add("csa2 planar main + index caches (the no-pool positional state, the kFp4Block main's + the e4m3 index's)",
+               cache_bytes);
+  }
   plan.add("hash moe scratch (the fused router's top-k staging, the MXFP4 expert's planes)",
            hash_scratch_bytes(cfg, tp_world, max_tokens));
   if (mtp)
@@ -834,11 +908,15 @@ void Dsv4Model::enqueue_layer(const Dsv4LayerResident& r, int layer, int T, cons
   if (!csa2_->prepare(T)) throw std::runtime_error("run_rows: CSA2 GEMM plans unavailable");
   // The decode path (the prefill's chunks ride it too): the window ring's
   // the layer scratch's (always available), the main / index cache's the
-  // model's planar positional state's (nullptr for now — the model's cache
-  // allocation's the GPU-gate pending's completion's, the main source's +
-  // the 64-head selection's skipped until then, the window source's always
-  // runs). index_scale's the index cache's fp32 row-scale's (the planar
-  // index cache's the e4m3 codes' + the fp32 scale's the two arrays's).
+  // model's planar positional state's (2026-09-19, the dsv4 seam S1b's the
+  // real pointer's the dsv41 pool's planes' re-expression's): the main
+  // cache's the kFp4Block planar's (the kv sources' the ratio > 0's the
+  // real pointer's, the window-only's the SWA's the nullptr's the window
+  // source's always runs), the index cache's the planar e4m3's + the fp32
+  // row-scale's (the index sources' the C4A's the 64-head selection's the
+  // real pointer's, the C128A's the no-index's the nullptr's). The csa2
+  // layer's publish_entries's writes the compressor's entries' into them
+  // (the C4A's, the C128A's the separate item's the unpopulated's).
   // The compressor's per-request tail (the ratio-4's overlapping's, the
   // model's d_tails_'s the tail's ordinal's plane's — the dsv41's
   // pool.tails(w_.tail_ord)'s no-pool's re-expression's): the live per-request
@@ -852,8 +930,23 @@ void Dsv4Model::enqueue_layer(const Dsv4LayerResident& r, int layer, int T, cons
                      ? d_tails_ + static_cast<size_t>(tord) * static_cast<size_t>(max_requests_) * 2 *
                            static_cast<size_t>(tails_w_)
                      : nullptr;
-  csa2_->enqueue_decode(x_, nullptr, nullptr, nullptr, rows.req_ids, rows.pos, rows.spans, rows.num_requests, T, attn_out,
-                       stream_, nullptr, tails, tails_w_);
+  // The planar main / index cache pointers (2026-09-19, the dsv4 seam S1b's):
+  // the main cache's the kv sources' (the ratio > 0's the cord >= 0's) the
+  // real pointer's (the main source's attention's the csa2 layer's the
+  // main_cache != nullptr's gate's), the index cache's the index sources'
+  // (the C4A's the is_index_layer's the 64-head selection's) the real
+  // pointer's + the fp32 row-scale's, the C128A's the no-index's the
+  // nullptr's, the window-only's the SWA's the nullptr's (the window
+  // source's always runs).
+  const int cord = cache_ord_[static_cast<size_t>(layer)];
+  uint8_t* main_cache =
+      (cord >= 0 && cord < static_cast<int>(main_cache_.size())) ? main_cache_[static_cast<size_t>(cord)] : nullptr;
+  uint8_t* index_cache = (cord >= 0 && cfg_.is_index_layer(layer) && cord < static_cast<int>(index_cache_.size()))
+                            ? index_cache_[static_cast<size_t>(cord)]
+                            : nullptr;
+  float* index_scale = (index_cache != nullptr) ? index_scale_[static_cast<size_t>(cord)] : nullptr;
+  csa2_->enqueue_decode(x_, main_cache, index_cache, index_scale, rows.req_ids, rows.pos, rows.spans, rows.num_requests,
+                       T, attn_out, stream_, nullptr, tails, tails_w_);
   // The DSpark union attention (2026-09-18, the dsv4 dspark + compressor
   // wiring; the dsv4_dspark_union_attn's the 3-phase's single softmax's over
   // [compressed | raw ring | block]'s): the draft stages' (43/44/45's)
