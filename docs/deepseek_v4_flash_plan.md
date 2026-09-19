@@ -404,3 +404,24 @@ rejects anything). The instrumentation (the `prepare`'s per-call
 shape/result log + the `ensure_plan`'s rejection-reason WARN) lands
 first, so the window's run names the exact `(m, n, k, io, out, stride)`
 and the cuBLASLt status of the false.
+
+### The kernels-only graph blocker: the copy sites (narrowed 2026-09-19)
+
+The capture reports `21 memcpy` nodes. A read of the decode/prefill paths
+narrows the candidates to two families (file:line):
+
+1. **`SessionModel::push_position`** (`src/engine/session_model.hpp:349-352`, the
+   8-byte `d_session_pos_` H2D) — called from the PREFILL path at `:829`
+   (`session_prefill_chunks`) and `:904` (`session_prefill_advance`), and the MTP
+   twin `push_mtp_position` (`:357`). These are per-chunk, not per-token.
+2. **`PagedBlocks`' block-table pushes** (`src/engine/paged_blocks.hpp:89`, `:106`,
+   `:150`) — `cudaMemcpyAsync(tables_ + req * total_blocks_ + have, row + have,
+   extra * 4, H2D, stream)`. These follow block allocation/rollback, i.e. they
+   land on the DECODE step whenever a request crosses a block boundary — the
+   likeliest source of a per-step copy, and they are per-request each time.
+
+The open question the next attempt must answer with instrumentation (name each
+captured node) is which of the 21 are which, and what the Qwen/GLM precedent is:
+the live Qwen lane runs `decode_graph: true` on the same `SessionModel`, so
+whichever of these copies qwen also performs must already happen OUTSIDE the
+captured span — the dsv4 family's difference is what to mirror.
