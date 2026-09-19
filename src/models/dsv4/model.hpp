@@ -88,6 +88,7 @@
 #include "models/dsv4/csa2_layer.hpp"
 #include "models/dsv4/dspark_layer.hpp"
 #include "models/dsv4/hash_layer.hpp"
+#include "models/dsv4/layer_dump.hpp"
 #include "models/dsv4/loader.hpp"
 #include "models/glm/mhc.hpp"
 
@@ -157,6 +158,14 @@ class Dsv4Model : public SessionModel<Dsv4Model> {
   static size_t union_attn_out_bytes(int max_rows);
 
   const Dsv4TextConfig& config() const { return cfg_; }
+
+  // The debug per-layer dump (DGPP_DSV4_DUMP_LAYERS; the doc's
+  // layer_dump.hpp's): reads the environment's and activates only when
+  // it names an existing directory's. The serve app calls it after
+  // construction's, and only with decode_graph's off's (the dump's
+  // device->host copies must never land inside a captured decode
+  // graph's). Inert (the no-dump's path's) otherwise's.
+  void init_layer_dump();
 
   // The cold diagnostic forward: one request on slot 0, fresh state, the
   // prompt's chunks at the prefill chunk's (the last row's logits, the
@@ -300,6 +309,7 @@ class Dsv4Model : public SessionModel<Dsv4Model> {
   // The spec rows' tails (the rollback's the table's the spec_rows_'s)
   // ride the pending's verify's call site's.
   std::vector<int> tail_ratio_;  // per tail ordinal: the ratio (4 C4A / 128 C128A)
+  Dsv4LayerDump dump_;  // the debug per-layer dump (DGPP_DSV4_DUMP_LAYERS; the doc's layer_dump.hpp's)
   std::vector<size_t> tail_off_;  // per tail ordinal: the float's offset's into d_tails_'s (the max_requests's the per-ordinal's)
   std::vector<size_t> spec_off_;  // per tail ordinal: the float's offset's into spec_tails_'s (the max_decode_rows_'s the per-ordinal's)
   float* d_tails_ = nullptr;
