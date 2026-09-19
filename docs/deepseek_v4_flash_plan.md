@@ -214,6 +214,17 @@ between them is now the gate, and it is itemized here so it cannot be lost:
 4. **The union-attn call site passes stand-in scratch** (`model.cpp`'s draft
    path): the csa2 projection's 512-dim q-latent / block-kv is private to the
    csa2 layer and is not yet handed to `dsv4_dspark_union_attn`.
+   **✅ Resolved 2026-09-20 (dsv4 S3, commit `3bbbf4b`): the q-latent +
+   block-kv now reach `union_attn` as the csa2 projection's real outputs
+   (the `q_latent()` / `block_kv()` getters on `Dsv4Csa2Layer`); the model
+   stages only the out latent `[max_decode_rows, 64, 512]` + a zeroed q
+   fallback (the tp>1 head-count delta). The pool / raw-ring phases stay
+   null (`n_comp == 0`, `raw_n == 0` — the DRAFT is SWA-only); the C4A
+   (`n_comp > 0`) VERIFY phase is still unreachable (the 584 B pool fill +
+   the ring append are the missing inputs — see the spec's G-union-wiring
+   for what must land first: the prefill compressor / C4A publish to the
+   584 B pool, the 584 B record encoder kernel, the per-stage raw ring +
+   main-walk append).**
 5. **The main/index cache publish** (the compressor's output -> the planar
    caches, the dsv41 `publish_entries` equivalent) is the other half of (2).
 

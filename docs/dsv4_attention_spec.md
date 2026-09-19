@@ -877,23 +877,49 @@ the window's 128's, the max_block's 8's, the max_tokens's 4096's, the
 the `local_heads()` = 64's (the MLA's single latent KV head's the
 replicated's).
 
-### 4.7 The current's model's wiring (the pending's)
+### 4.7 The current's model's wiring (the 2026-09-20's dsv4 S3's: the
+q / the block's wired's, the pool's / the ring's null's)
 
 The model's calls's the union attention's on's the decode/draft's
-path's (the `src/models/dsv4/model.hpp:30-31`'s comment's):
+path's (the `src/models/dsv4/model.cpp`'s `enqueue_layer`'s the draft
+stages' the `layer >= num_hidden_layers`'s branch's):
 `dspark_->union_attn(q_latent, nullptr, nullptr, 0, nullptr, 0,
-block_kv, cfg_.dspark_block_size, out_latent, T, stream_)` (
-`src/models/dsv4/model.cpp:849-854`'s) — the BLOCK phase's only's
-(the pool's / the ring's the nullptr's 0's, the draft's `n_comp ==
-0`'s the ratio-0's class's); the q latent's + the block kv's stand in
-the csa2 seam's (the csa2 projection's the 512-dim's latent's the
-csa2 layer's the private's, the model's staging's the csa2 seam's the
-fill's, the `src/models/dsv4/model.cpp:842-848`'s comment's) — the
-pool's / the ring's phases' wiring's pending's (§5's G-union-wiring'
-s). The `Dsv4DsparkLayer::union_attn`'s the layer's method's (the
-`src/models/dsv4/dspark_layer.cu:137-140`'s) passes's the
-`w_.attn_sink`'s (the nullable's the DSpark stage's sink's, the
-`src/models/dsv4/dspark_layer.hpp:68`'s).
+block_kv, cfg_.dspark_block_size, out_latent, T, stream_)` — the
+BLOCK phase's + the q's the real input's (the 2026-09-20's dsv4 S3's
+q-latent's + the block-kv's wiring's), the pool's / the ring's still
+null's (the `n_comp == 0`'s the `raw_n == 0`'s, the DRAFT's the
+SWA-only's the ratio-0's class's):
+
+- **The q latent's + the block kv's: the real input's (the 2026-09-20's
+  S3's).** The csa2 projection's 512-dim's q latent's (the `q_'s the
+  wq_b's output's + the RoPE's, the q-renorm's the G-q-renorm's gap's
+  the absent's) + the in-memory's block kv's (the `kv_'s the wkv's
+  output's the unquantized's bf16's the step's rows' own's kv_latent's)
+  the csa2 layer's the exposed's via the `q_latent()'s / the
+  block_kv()'s the getter's (the `src/models/dsv4/csa2_layer.hpp`'s)
+  + the model's the passed's to `union_attn`'s as the `q_latent`'s /
+  the `block_kv`'s. The 2026-09-18's stand-in's scratch's (the csa2
+  seam's the fill's) the replaced's. The model's the staged's only the
+  out latent's `[max_decode_rows, 64, 512]'s the bf16`'s (the
+  `union_attn_out_bytes`'s static's) + the q fallback's (the zeroed's
+  stand-in's the tp>1's the head count's delta's the no-OOB's safe's
+  interim's).
+- **The DSpark kernel's 64-head's form (the `kHeads`'s) vs. the csa2
+  layer's `local_heads()`'s (the 64/tp's):** the real q's the csa2
+  `q_'s the match's only when's they's agree (the tp=1's the 64's);
+  the tp>1's the head count's the DSpark's replicated's 64-head's vs.
+  the csa2's sharded's local's the geometry's delta's (the zeroed's q
+  fallback's the interim's, the parity's gate's settles's the DSpark's
+  sharding's decision's).
+- **The pool's / the raw ring's: still null's (the `n_comp == 0`'s the
+  `raw_n == 0`'s).** The C4A's compressed pool's (the 584 B's kFp8's
+  pool's + the `kv_slots`'s) + the raw ring's (the projected-main-
+  hidden's 128-slot's the 584 B's record's ring's) the not's wired's
+  yet's — the `G-union-wiring`'s the §5's the status's + the what's
+  must's land's first's. The `Dsv4DsparkLayer::union_attn`'s the
+  layer's method's (the `src/models/dsv4/dspark_layer.cu:137-140`'s)
+  passes's the `w_.attn_sink`'s (the nullable's the DSpark stage's
+  sink's, the `src/models/dsv4/dspark_layer.hpp:68`'s).
 
 ## 5. GAPS
 
@@ -1157,21 +1183,76 @@ s is a real's numeric's delta's if's left's out's — the completion's
 must's add's it's (the csa2's q's path's + the DSpark's q's staging'
 s) or' document's the delta's.
 
-### G-union-wiring — the model's only wires's the BLOCK phase
+### G-union-wiring — the pool's / the raw ring's phases' still null's (the
+q / the block's wired's the 2026-09-20's S3's)
 
-The model's calls's the union attention's with' the pool's / the
-ring's NULL's (the `dspark_->union_attn(q_latent, nullptr, nullptr,
-0, nullptr, 0, block_kv, cfg_.dspark_block_size, out_latent, T,
-stream_)`'s, the `src/models/dsv4/model.cpp:849-854`'s) — the
-BLOCK's phase's only's (the `n_comp == 0`'s the DSpark DRAFT's
-ratio-0's class's, the §4.7's); the q latent's + the block kv's stand
-in the csa2 seam's (the csa2 projection's the 512-dim's latent's the
-csa2 layer's the private's, the model's staging's pending's, the
-`src/models/dsv4/model.cpp:842-848`'s comment's). Unresolved: the
-pool's / the ring's phases' wiring's (the 584 B's pool's fill's, the
-ring's append's) + the q's renorm's (G-q-renorm's) are pending's —
-the VERIFY's C4A's phase's (the `n_comp > 0`'s) is not's reachable'
-s from's the model's yet's.
+**The 2026-09-20's dsv4 S3's the q-latent's + the block-kv's wiring's
+landed's:** the model's the union attention's the real input's (the
+csa2 projection's q latent's the `q_'s the `q_latent()'s the getter's
++ the in-memory's block kv's the `kv_'s the `block_kv()'s the getter's,
+the `src/models/dsv4/csa2_layer.hpp`'s the 2026-09-20's the exposed's)
+— the 2026-09-18's stand-in's scratch's the csa2 seam's the fill's the
+replaced's. The model's the staged's only the out latent's (the
+`[max_decode_rows, 64, 512]'s the bf16`'s the `union_attn_out_bytes`'s
+static's) + the q fallback's (the zeroed's the tp>1's the head count's
+delta's the no-OOB's safe's interim's).
+
+**The pool's / the raw ring's phases' still null's (the `n_comp == 0`'s
+the `raw_n == 0`'s):** the DRAFT's the SWA-only's the ratio-0's class's
+(the `n_comp == 0`'s, the §4.7's), so the C4A's compressed pool's (the
+584 B's kFp8's pool's + the `kv_slots`'s the [n_rows, n_comp]'s list's)
++ the raw ring's (the projected-main-hidden's 128-slot's the 584 B's
+record's ring's the `main_kv`'s the `wkv`'s + the `kv_norm`'s + the
+RoPE's + the `act_quant`'s, the ck:model.py:759's) the not's wired's
+yet's. The `VERIFY`'s C4A's phase's (the `n_comp > 0`'s) is not's
+reachable's from's the model's yet's.
+
+**The what's must's land's first's (the separate's named's gap's the
+2026-09-20's S3's the not's done's, the spec's the open's geometry's):**
+- **The pool's (the compressed's the `n_comp > 0`'s):** the C4A's
+  publish's the 584 B's kFp8's pool record's + the `kv_slots`'s the
+  [n_rows, n_comp]'s list's (the C4A selection's the `topk`'s the
+  `kv_slots`'s the physical's pool token's indices's). The C4A's
+  publish's path's (the `publish_entries`'s the §3.6's) the 2026-09-19's
+  S1b's landed's the `kFp4Block`'s 288 B's main cache's + the e4m3's
+  index cache's (the §1.3's), NOT the DSpark's 584 B's kFp8's pool's
+  (the `G-cache-format`'s the two's physical's format's the open's
+  decision's). The pool's fill's the 584 B's record's encoder's (the
+  `act_quant`'s the per-64's fp8's over's the NoPE's 448's + the RoPE's
+  64's bf16's + the 7's ue8m0's scales's, the §4.5's the layout's)
+  the CUDA's kernel's the not's in's the tree's yet's (the CPU's
+  oracle's the `assemble_record`'s the `dsv4_csa2_oracle_test.cpp:158`'s
+  the pinned's, the device's encoder's pending's). The `VERIFY`'s
+  C4A's phase's (the `n_comp > 0`'s the dsv4-native's verify's m = 6's
+  the C4A's 2,048-compressed's) the the pool's fill's + the `kv_slots`'s
+  the `VERIFY`'s call site's the reached's (the `VERIFY`'s the model's
+  the not's the draft's path's the draft's the `n_comp == 0`'s).
+- **The raw ring's (the `raw_n > 0`'s):** the projected-main-hidden's
+  128-slot's ring's (the per-DSpark-stage's the `main_kv`'s the
+  `wkv`'s + the `kv_norm`'s + the RoPE's + the `act_quant`'s the 584 B's
+  record's, the ck:model.py:759's the §4.2's) the the ring's append's
+  (the main walk's the every's token's the `main_x`'s the target's
+  layers' stream mean's the `main_proj`'s + the `main_norm`'s the
+  `main_x_`'s the `draft_first`'s the computed's, the ring's the per-
+  stage's the 128-slot's the 584 B's record's the `pos % 128`'s slot's
+  the written's) the not's wired's yet's. The 584 B's record's encoder's
+  (the same's the pool's the `act_quant`'s the §4.5's) the CUDA's
+  kernel's the not's in's the tree's yet's. The raw ring's the per-
+  stage's the allocation's (the 3's stages' the 128-slot's the 584 B's
+  each's the ~224 KB's) + the main walk's the GEMM's wiring's (the per-
+  stage's the `wkv`'s the `main_x`'s the projection's) the separate's
+  item's (the prefill's the not's the required's, the ring's the decode's
+  the append's the main walk's the every's token's).
+
+**The q's renorm's (the G-q-renorm's) still pending's:** the csa2's q
+path's + the DSpark's q staging's the ad-hoc's q re-normalization's (the
+`q *= rsqrt(q.square().mean(-1) + eps)`'s the ck:model.py:775-776's)
+the absent's (the csa2's `project_q_kv`'s the `csa2_layer.cu:253-272`'s
+the no per-head's rescale's, the DSpark's union's kernel's the q's the
+pre-renormalized's the caller's the `dspark_layer.cu:207-210`'s
+contract's, the model's the stand-in's the not's the done's the 2026-
+09-20's S3's the q's the csa2 q's the real's pointer's the passed's
+the renorm's the still's the absent's).
 
 ### G-cache-format — two physical formats's for's the C4A's compressed's entries
 
