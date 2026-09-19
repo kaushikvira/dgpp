@@ -2658,6 +2658,11 @@ void dsa_prepare_kernel_smem() {
     opt_in(std::integral_constant<LatentFormat, LatentFormat::kFp4>{});
     opt_in(std::integral_constant<LatentFormat, LatentFormat::kFp8Block>{});
     opt_in(std::integral_constant<LatentFormat, LatentFormat::kFp4Block>{});
+    // The window ring's mixed-precision record (2026-09-20). Its absence here
+    // is the reason a launch over the ring failed with "invalid argument":
+    // the opt-in is per kernel SYMBOL, so a format the list forgets keeps the
+    // 48 KiB default and any larger dynamic request is rejected.
+    opt_in(std::integral_constant<LatentFormat, LatentFormat::kFp8BlockRope>{});
   }
 }
 
