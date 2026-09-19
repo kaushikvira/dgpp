@@ -422,3 +422,258 @@ entry". The index-key plane for a C128A layer is the main compressor's
 `src/models/dsv4/model.cpp:556-557`), vs the C4A layers' own 128-wide
 rotated indexer compressor (`a.idx_comp_wkv`,
 `src/models/dsv4/model.cpp:556`).
+
+## 3. The ratio-4 (C4A) overlapping compressor's tail update
+
+Built on the W = 1024 resolution (§0.3): the per-request tail is fp32
+[2, W] (W = coff × kCsa2Latent = 2 × 512 = 1024, the `wkv`/`wgate`
+output width), and the checkpoint's decode pool is the 8-entry × 512-dim
+pair-pooling over the overlap/normal plane split, APE on the score half
+only, the one-rounding RMSNorm, the entry published every ratio-th
+token. The C++ tree carries BOTH a checkpoint-faithful CPU oracle (the
+state store + the boundary compress into the 584 B record,
+`tests/unit/dsv4_csa2_oracle_test.cpp:187-275`) and the dsv41-form CUDA
+tail kernel (`src/models/dsv4/compress.cu`, the even-stash / odd-pool
+pair pooling) — the two DISAGREE on the pool's entry count (2 × W vs
+8 × 512) and the publish cadence (every 2 tokens vs every 4); §5
+(G-tail-cadence / G-tail-pool) flags it. The checkpoint reference is
+the parity oracle (§0.1), so the reference's semantics are the
+contract and the kernel's deltas are the gaps.
+
+### 3.1 The [2, W] per-request state
+
+- **The layout**: fp32 [2, W] per request, per C4A layer (`tails_` =
+  the count of `is_index_layer` layers, `src/models/dsv4/model.cpp:
+  201-210`): the FIRST W = the pending token's kv plane, the SECOND W =
+  its gate score plane (`src/models/dsv4/compress.hpp:13-16` "the
+  per-request tail is fp32 [2, W] (W = the layer's compressor output
+  width, coff * 512): the pending even token's kv (the first W) and
+  gate score (the second W)"). The model's allocation `per_req =
+  tails_ * 2 * tails_w_` (`src/models/dsv4/model.cpp:225`), `d_tails_`
+  per request + `spec_tails_` per spec row (`model.cpp:226-227`).
+- **What the planes hold**: the `wkv`/`wgate` GEMM outputs verbatim —
+  `kv = self.wkv(x)`, `score = self.wgate(x)` (ck:model.py:329-330),
+  stored into the state rows at ck:model.py:353-354 (the decode's
+  `kv_state[:, ratio + start_pos % ratio] = kv.squeeze(1)` + the score
+  with the APE, §3.4). The C++ kernel takes `comp_kv` / `comp_score`
+  as the GEMM outputs (fp32 [tokens, W] each, the contract at
+  `src/models/dsv4/compress.hpp:35-39`).
+- **The APE-on-the-score-half-only pin**: `dsv4_csa2_compressor_state_store`
+  (`tests/unit/dsv4_csa2_oracle_test.cpp:426-465`, ratio 4, W = 1024,
+  K = 512): the state row's first W = the GEMM's bf16 value (untouched),
+  the second W = the GEMM's bf16 value + `ape[p % ratio]` — the score
+  half only, indexed `position % ratio` (the reference's
+  `save_partial_states` APE index, `tests/unit/dsv4_csa2_oracle_test.
+  cpp:216-217` the `arow = p % ratio`'s).
+- **The snapshot/rollback**: the tails are the ONLY per-request state
+  the DSpark rollback tables (the positional rings need no snapshot —
+  a rejected draft's slot is never read by a later query,
+  `src/models/dsv4/model.cpp:466-475`): `reset_slot_state` the
+  memset's (`model.cpp:483-487`), the `spec_segments` rollback table
+  (`model.cpp:493-505`), the `write/read_state_snapshot`'s
+  (`model.cpp:509-530`). The kernel's `tail_snapshots` (optional, the
+  speculative rows' the tail's as it stands's after every row's that
+  is not its request's last's, `src/models/dsv4/compress.cu:132-136`;
+  the rollback's contract "rolling back to `a` accepted rows copies
+  row start + a - 1 over the tail", `src/models/dsv4/compress.hpp:
+  18-20`).
+
+### 3.2 The even-stash / odd-pool pair pooling (the C++ kernel)
+
+`dsv4_compress_tail_update_kernel` (`src/models/dsv4/compress.cu:84-138`):
+one CTA per request span, 256 threads (`kThreads`, `compress.cu:25`),
+per token of the span (the `req_spans`'s the [start, start + len)'s):
+
+- **The padding row** (`p < 0`, `compress.cu:106-113`): the latent
+  zeroed, the entry -1, the tail untouched (the no-op's).
+- **The even** (`(p & 1) == 0`, `compress.cu:114-123`): the STASH —
+  `tail[c] = kvt[c]` (the kv plane), `tail[W + c] = st[c]` (the score
+  plane), the latent zeroed, the entry -1 (no pool this row).
+- **The odd** (`compress.cu:124-131`): the POOL —
+  `dsv4_pool_pair_and_norm(tail, tail + W, kvt, st, ...)` pools the
+  stashed (even) with the current (odd) into the normed latent;
+  `entries_out[t] = p / 2` (the entry's ordinal, the dsv41's `p / 2`'
+  s), `ent_pos_out[t] = (p / 2) * ratio` (the entry's rotation
+  position, `compress.cu:128-129`).
+
+**The pair pooling + the one-rounding RMSNorm** (`dsv4_pool_pair_and_norm`,
+`src/models/dsv4/compress.cu:49-75`, the dsv41's `pool_pair_and_norm`'
+'s re-expression parameterized in W, `src/kernels/csa2.cu:242-270`):
+the per-dim's softmax over (s0[c], s1[c]) (the fp32's, the max-shift's,
+`compress.cu:57-62`), the weighted kv sum's ONE bf16 rounding
+(`compress.cu:63-64`, the `.to(bf16)` before the norm's), the RMSNorm's
+fp32 interior (the `dsv4_block_sum_256`'s the W's the ss's,
+`compress.cu:27-40,68-69`) + the norm_w's bf16's exact upcast's + the
+ONE bf16 rounding's (`compress.cu:70-73`). `kPer = W / 256` (the
+1024's 4's, `compress.cu:53-54`, the `pooled[8]`'s the W's <= 2048's
+bound's the launcher's guard's `W % 256 == 0 && W <= 8 * 256`,
+`compress.cu:148-150`).
+
+**The oracle**: `tests/unit/dsv4_compress_tail_test.cpp` pins the
+[2, W] layout on a small synthetic shape at `W = 512` (the dsv41's
+`kCsa2Latent`'s — a valid smaller instantiation of the same [2, W]
+contract, §0.3 point 5): `dsv4_compress_tail_layout_two_planes`
+(:192-239, the even's stash's the bit-exact copy's the kv's first W's
++ the score's second W's), `dsv4_compress_tail_pool_norm_independent`
+(:241-290, the fp32 vs the INDEPENDENT double-precision formulation,
+the `pair_pool_norm_ref`'s / `pair_pool_norm_ref_d64`'s at :96-152,
+the 1e-5 relative's budget's), `dsv4_compress_tail_even_odd_cycle`
+(:292-340, the 4-token's p = [0,1,2,3]'s the entries' (-1, 0, -1,
+1)'s the tail's the last even's), `dsv4_compress_tail_padding_row`
+(:342-368).
+
+### 3.3 The overlap-plane vs the normal-plane's split (the dims' 0..511's vs 512..1023's)
+
+- **The split's comment**: "When overlap, the first half of dims is
+  for overlapping compression, second half for normal" (ck:model.py:
+  302, the `wkv`/`wgate`'s `coff * head_dim`'s the 1024's, the
+  ck:model.py:303-304's).
+- **The state's rows**: the `kv_state` / `score_state`'s the [b, 8,
+  1024]'s (the ck:model.py:308-310's, "With overlap: state[:, :ratio]
+  = overlapping window, state[:, ratio:] = current window"; the
+  `kv_state`'s the zeros's, the `score_state`'s the -inf's init's —
+  the empty's slots' the exp(-inf) = 0's the weight 0's in the
+  pool's softmax's).
+- **The decode's pool's the 8-entry's × 512's**: `torch.cat([kv_state
+  [:, :ratio, :d], kv_state[:, ratio:, d:]], dim=1)` (ck:model.py:
+  356-357, `d = head_dim` = 512): the previous's group's rows' (the
+  `:ratio`'s, the overlap window's) the OVERLAP's plane's (the dims'
+  0..511's) + the current's group's rows' (the `ratio:`'s, the
+  current window's) the NORMAL's plane's (the dims' 512..1023's) →
+  the 8-entry's × 512-dim's pool → the 512-dim's latent's
+  (ck:model.py:358, the `(kv_state * score_state.softmax(dim=1)).sum
+  (dim=1, keepdim=True)`'s).
+- **The prefill's `overlap_transform`'s the same's split's**: rows'
+  `[ratio:]` the `tensor[..., d:]` (the normal's plane's), rows'
+  `[1:, :ratio]` the PREVIOUS's group's `tensor[..., :d]` (the
+  overlap's plane's) (ck:model.py:313-320), the prefill's pool's the
+  8-entry's × 512's after's the transform's (ck:model.py:346-348).
+- **The oracle's `head_off`'s the split's pin's**: `head_off = (i >=
+  ratio) ? 512 : 0` (the C4A's the `(row >= ratio)`'s gate's,
+  `tests/unit/dsv4_csa2_oracle_test.cpp:247,258` the
+  `compressor_compress`'s; the test's independent recompute's at
+  :526,535) — the boundary's the p = 15's the 8-row's gather's the
+  positions' [8..15]'s: the first's 4's (8..11, the previous's
+  group's) the overlap's plane's (0..511's), the last's 4's (12..15,
+  the current's group's) the normal's plane's (512..1023's)
+  (`tests/unit/dsv4_csa2_oracle_test.cpp:467-476` the test's comment's
+  + the `start = p - n_gather + 1`'s at :236's, `n_gather() = coff()
+  * ratio` = 8, `tests/unit/dsv4_csa2_oracle_test.cpp:192-193`).
+
+### 3.4 The APE's on-the-score-half's only's
+
+- **The parameter**: the `ape`'s the F32's [ratio, coff * head_dim]'s
+  (the C4A's [4, 1024]'s, ck:model.py:300; the checkpoint's ships'
+  it F32, `spec:§1` tensor census; the C++ binding
+  `src/models/dsv4/binding.cpp:48-57`).
+- **The decode's add's**: `score += self.ape[start_pos % ratio]`
+  (ck:model.py:351) — the SCORE's ONLY's (the kv's plane's never's
+  the APE's), BEFORE the state's store's (ck:model.py:353-354's) and
+  the pool's (ck:model.py:356-358's).
+- **The prefill's adds's**: the overlap's rows' seed's the
+  ck:model.py:338's `+ self.ape`'s, the remainder's the ck:model.py:
+  341's `+ self.ape[:remainder]`'s, the pool's input's the
+  ck:model.py:344's `+ self.ape`'s.
+- **The C++'s kernel's has NO APE parameter**: `dsv4_compress_tail_update`
+  takes the `comp_kv` / `comp_score`'s the GEMM's outputs's as-is'
+  (the `src/models/dsv4/compress.hpp:35-39`'s contract's) — the
+  caller's MUST add the `ape[p % ratio]`'s to the score's plane's
+  before's the call's (the `dsv4_csa2_compressor_state_store`'s
+  oracle's the contract's pin's, `tests/unit/dsv4_csa2_oracle_test.
+  cpp:426-465`'s the score's half's the GEMM's + ape's, the kv's
+  half's untouched's) — the wiring's pending's (§5's G-tail-ape's).
+- **The C128A's too's**: the APE's the ratio-128's layers's the
+  [128, 512]'s F32's (ck:model.py:300's, the `spec:§1`'s) — the
+  decode's add's the ck:model.py:351's applies' to BOTH classes's
+  (the overlap's branch's only's the pool's shape's differs's, the
+  C128A's the plain's 128-entry's pool's the ck:model.py:362-365's).
+
+### 3.5 The one-rounding's RMSNorm's
+
+- **The reference's**: `kv = self.norm(kv.to(dtype))` (ck:model.py:
+  368) — the pool's output's cast's to bf16's BEFORE's the norm's
+  (the ONE's bf16's rounding's at's the pool's out's), the RMSNorm's
+  itself's the fp32's interior's (the `x.float()`'s the var's the
+  rsqrt's, ck:model.py:197-201, the `weight`'s the bf16's
+  checkpoint's stored's the fp32's here's) + the ONE's bf16's
+  rounding's at's the output's (the `.to(dtype)`'s).
+- **The kernel's the same's rounding's structure's**: the pool's sum's
+  the ONE's bf16's rounding's (the `.to(bf16)`'s before's the norm's,
+  `src/models/dsv4/compress.cu:63-64`'s), the norm's fp32's interior's
+  + the norm_w's bf16's exact's upcast's + the ONE's bf16's rounding's
+  (the `src/models/dsv4/compress.cu:68-73`'s).
+- **The oracle's the double's path's**: the `pair_pool_norm_ref`'s /
+  `pair_pool_norm_ref_d64`'s (the `tests/unit/dsv4_compress_tail_test.
+  cpp:96-152`'s) cross-checked at the 1e-5 relative's budget's (the
+  `dsv4_compress_tail_pool_norm_independent`'s, :241-290's).
+
+### 3.6 The entry's publish's cadence's (the every's ratio-th's token's) + the 584 B's record's
+
+- **The reference's cadence's**: `should_compress = (start_pos + 1) %
+  self.compress_ratio == 0` (ck:model.py:350) — the entry's
+  published's the EVERY's ratio-th's token's (the C4A's every's 4's,
+  the C128A's every's 128's); the entry's index's the `start_pos //
+  ratio`'s (ck:model.py:379, the `self.kv_cache[:bsz, start_pos //
+  ratio] = kv.squeeze(1)`'s), the RoPE's position's the `start_pos +
+  1 - ratio`'s (ck:model.py:372, the group's START's position's, the
+  [start_pos - 3..start_pos]'s for's the ratio 4's).
+- **The publish's steps's after's the pool's**: the one-rounding'
+  RMSNorm's (ck:model.py:368's, §3.5's), the RoPE's on's the last's
+  64's dims's at's the group's start's (ck:model.py:373's), the
+  indexer's compressor's the Hadamard's `rotate_activation`'s + the
+  fp4's quant's (ck:model.py:374-376's, the `rotate=True`'s variant's
+  the 128-wide's indexer's K's), the main's compressor's the per-64'
+  fp8's `act_quant`'s on's the NoPE's 448's dims's (ck:model.py:378's,
+  the RoPE's 64's the bf16's unquantized's — the 584 B's record's
+  [448 e4m3 NoPE | 64 bf16 RoPE | 7 ue8m0 + 1 pad]'s, the
+  `tests/unit/dsv4_csa2_oracle_test.cpp:127-156`'s layout's + the
+  `assemble_record`'s at :158's the bf16-round-trip's parity's step's
+  the quant's input's the bf16-rounded's value's not's the fp32's),
+  then's the publish's (ck:model.py:377-379's).
+- **The state's roll's after's the publish's**: the `kv_state[:,
+  :ratio] = kv_state[:, ratio:]` (ck:model.py:359-360's) — the
+  current's group's rows's become's the next's group's overlap's
+  rows's (the prefill's seeds's the overlap's rows's from's the prefill's
+  last's 4's tokens's, ck:model.py:337-338's).
+- **The oracle's the CHECKPOINT's cadence's**: the
+  `dsv4_csa2_compressor_compress_record`'s (the
+  `tests/unit/dsv4_csa2_oracle_test.cpp:467-558`'s) runs's the full's
+  state's store's (n = 16's tokens's) + the boundary's compress's at'
+  the p = 15's ((15 + 1) % 4 == 0's, the group's [12..15]'s + the
+  overlap's [8..11]'s the 8-row's gather's, the `gpos = (15 / 4) * 4`
+  = 12's the RoPE's position's, `tests/unit/dsv4_csa2_oracle_test.
+  cpp:237`'s), verifying's the 584 B's record's layout's (the pad's
+  0's, the 7's real's scale's bytes's the finite's powers-of-two's,
+  :503-506's) + the NoPE's dequant's vs's the INDEPENDENT's max-shift'
+  pool's (the :516-558's the 512-dim's recompute's the record's
+  assembly's a different's code's path's).
+- **The C++'s kernel's the CADENCE's DISAGREES's (G-tail-cadence's)**:
+  the odd's parity's hardcoded's 2-token's (the
+  `src/models/dsv4/compress.cu:114`'s), the entry's ordinal's the
+  `p / 2`'s (the `src/models/dsv4/compress.cu:128`'s) + the
+  `ent_pos`'s the `(p / 2) * ratio`'s (the `src/models/dsv4/compress.
+  cu:129`'s) — the dsv41's ratio-2's convention's (the
+  `src/kernels/csa2.cu:320`'s the dsv41's `p / 2`'s), the `ratio`'
+  s parameter's only's the ent_pos's scale's (the parity's / the
+  ordinal's not's ratio-parameterized's). The main's cache's
+  geometry's the `epb = block_tokens / ratio` = 128 / 4 = 32's
+  entries's per's 128-token's block's (the
+  `src/models/dsv4/csa2_layer.cu:318`'s) assumes's the 4-token's
+  cadence's — the 2-token's kernel's would's publish's 2x's the
+  entries's. See §5's (G-tail-cadence's).
+
+### 3.7 The delta vs flash-native (the plain's compressor's)
+
+The fn:model.py:429-487's `Compressor`'s the PLAIN's
+(non-overlapping's) one's: the state's [b, ratio, 512]'s (the coff 1's,
+the fn:model.py:452-456's the `state_shape`'s), the pool's the
+ratio-entry's softmax's over's the full's 512's dims's (the
+fn:model.py:482's the `(self.kv_state[:bsz] * self.score_state[:bsz]
+.softmax(dim=1)).sum(dim=1, keepdim=True)`'s), NO's the overlap's
+plane's split's, NO's the APE's, the `wkv`'s / `wgate`'s the [512,
+4096]'s (the fn:model.py:441-445's the fp32's promotion's the
+ratio > 1's). The checkpoint's reference's the PARITY's oracle's
+(§0.1's) — the C4A's overlapping's form's (the 8-entry's × 512's
+pool's, the APE's, the [b, 8, 1024]'s state's) is the checkpoint's
+only's; where's they's disagree's this's doc's follows's the
+checkpoint's (the §0.1's rule's).
