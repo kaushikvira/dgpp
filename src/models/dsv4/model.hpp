@@ -27,8 +27,13 @@
 // bound) ride the decode path: the committed CSA2 surface's prefill
 // enqueue and the DSpark draft stages' union attention (the
 // [compressed pool | raw ring | block]'s 3-phase's single softmax's,
-// dsv4_dspark_union_attn) are the GPU-gate pending's completion's (the
-// paged pool's wiring's) — the model passes the planar cache pointers
+// dsv4_dspark_union_attn) — the model now calls the union attention on
+// the decode/draft path (the 2026-09-18's dsv4 dspark + compressor
+// wiring's the enqueue_layer's the draft stages' the SWA-only's the no-
+// compressed-phase's, the no-raw-ring's, the in-memory block's), the q
+// latent's + the block kv's stand in the csa2 seam's (the parallel
+// agent's the csa2 partial fills's) until the wiring's complete's — the
+// model passes the planar cache pointers
 // (nullptr for now, the layer's the caller's contract's) and runs the
 // draft stages' walk on the CSA2 decode enqueue. The numerics' the
 // committed surface's (the parity gate's the GPU's the morning's
@@ -36,9 +41,16 @@
 //
 // No paged pool: the attention's state is positional (the window ring's
 // the layer scratch's, the slot's the position's the ring's slot's), so
-// the snapshots hold no per-request state (snapshot_state_bytes 0, the
-// spec segments' empty's, the rollback's a no-op's) and the prefix
-// cache's off's (the arena's 0's slots' the state's 0's bytes's).
+// the positional rings need no snapshot (a rejected draft's slot is
+// never read by a later query). The ratio-4 (C4A) overlapping
+// compressor's per-request tails (the 2026-09-18's dsv4 dspark +
+// compressor wiring's, the dsv41 csa2_compress_decode_update's
+// re-expression's, the fp32 [2, 512]'s the pending even's kv + the
+// score's) are the only per-request state (the snapshot_state_bytes'
+// the tails' bytes's, the spec segments' the tails' the rollback's table
+// the 2026-09-18's, the write / read's the snapshot's the copy's) and
+// the prefix cache's off's (the arena's 0's slots' the state's 0's
+// bytes's).
 //
 // TP: `tp_world` > 1 loads this rank's slices (64/W heads and 8/W output
 // groups, every expert's and the shared expert's I/W intermediate slice,
@@ -238,11 +250,29 @@ class Dsv4Model : public SessionModel<Dsv4Model> {
   size_t hash_scratch_bytes_ = 0;
   void* dspark_scratch_ = nullptr;
   size_t dspark_scratch_bytes_ = 0;
+  // The DSpark union attention's staging (2026-09-18, the dsv4 dspark +
+  // compressor wiring; the dsv4_dspark_union_attn's the 3-phase's single
+  // softmax's the q latent's + the in-memory block's kv's + the out latent's,
+  // the 512-dim's the dsv4 DSpark's kHeadDim's): the csa2 projection's
+  // outputs (the q latent's, the block kv's) stand in the csa2 seam's
+  // (the parallel agent's the csa2 partial fills's) until the wiring's
+  // complete's.
+  void* union_attn_scratch_ = nullptr;
+  size_t union_attn_scratch_bytes_ = 0;
   float* inv_freq_window_ = nullptr;      // device [32]
   float* inv_freq_compressed_ = nullptr;  // device [32]
   std::vector<int> cache_ord_;            // per layer (-1: window only)
   std::vector<int> tail_ord_;             // per ratio-4 kv source (-1: none)
   int tails_ = 0;
+  // The ratio-4 (C4A) overlapping compressor's per-request tails (2026-09-18,
+  // the dsv4 dspark + compressor wiring; docs/dsv4_kernel_port_spec.md §2.1(b)):
+  // fp32 [tails_][max_requests][2][tails_w_] (tails_w_ = 512, the dsv41's
+  // kCsa2Latent's — the pending even's kv (the first W) + the score (the second
+  // W), the dsv41 csa2_compress_decode_update's re-expression). The spec rows'
+  // tails (the rollback's the table's the spec_rows_').
+  float* d_tails_ = nullptr;
+  float* spec_tails_ = nullptr;
+  int tails_w_ = 512;  // the W's (the compressor's output width's, the 512's the re-expression's)
   int targets_ = 0;                       // dspark target layers (the draft width is targets_ * H)
   int draft_row_ = 0;                     // the next block row a chain call emits (0: no block stands)
   // The hash gate tables' device copies (the num_hash_layers' tid2eid's
