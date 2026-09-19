@@ -56,22 +56,34 @@ DGPP_TEST(latent_format_names_and_row_bytes) {
   require(dgpp::latent_format_from_string("bf16") == LatentFormat::kBf16 &&
               dgpp::latent_format_from_string("fp8") == LatentFormat::kFp8 &&
               dgpp::latent_format_from_string("fp4") == LatentFormat::kFp4 &&
+              dgpp::latent_format_from_string("fp8_block_rope") == LatentFormat::kFp8BlockRope &&
               !dgpp::latent_format_from_string("int8") &&
               !dgpp::latent_format_from_string(""),
-          "the three names parse and nothing else does");
+          "bf16 / fp8 / fp4 / fp8_block_rope parse and nothing else does");
   require(std::string(dgpp::latent_format_name(LatentFormat::kFp4)) == "fp4",
           "the name round-trips");
+  require(std::string(dgpp::latent_format_name(LatentFormat::kFp8BlockRope)) == "fp8_block_rope",
+          "the mixed record's name round-trips");
   // The real geometry: 512-wide rows.
   require(dgpp::latent_row_bytes(LatentFormat::kBf16, 512) == 1024, "bf16 row");
   require(dgpp::latent_row_bytes(LatentFormat::kFp8, 512) == 512, "fp8 row");
   require(dgpp::latent_row_bytes(LatentFormat::kFp4, 512) == 288, "fp4 row: 256 codes + 32 scales");
+  // The mixed record (the 584 B envelope — 448 e4m3 + 128 bf16 RoPE +
+  // 7 e8m0 + 1 pad; 8-byte aligned, NOT 16 — the tile loader's uint2's).
+  require(dgpp::latent_row_bytes(LatentFormat::kFp8BlockRope, 512) == 584, "the 584 B envelope");
+  require(dgpp::latent_row_bytes(LatentFormat::kFp8BlockRope, 512) % 8 == 0 &&
+                dgpp::latent_row_bytes(LatentFormat::kFp8BlockRope, 512) % 16 != 0,
+          "the 584's stride's 8-aligned's (the uint2's loads's)");
   // Rows keep 16-byte alignment (the tile loaders' vector loads).
   require(dgpp::latent_row_bytes(LatentFormat::kFp4, 32) == 32, "fp4 row padded to 16 bytes");
   require(dgpp::latent_row_bytes(LatentFormat::kFp4, 256) == 144, "fp4 256-wide row");
   require(!dgpp::latent_format_has_row_scale(LatentFormat::kBf16) &&
               dgpp::latent_format_has_row_scale(LatentFormat::kFp8) &&
-              dgpp::latent_format_has_row_scale(LatentFormat::kFp4),
-          "only the quantized formats carry a row scale");
+              dgpp::latent_format_has_row_scale(LatentFormat::kFp4) &&
+              !dgpp::latent_format_has_row_scale(LatentFormat::kFp8Block) &&
+              !dgpp::latent_format_has_row_scale(LatentFormat::kFp4Block) &&
+              !dgpp::latent_format_has_row_scale(LatentFormat::kFp8BlockRope),
+          "only the row-scaled formats carry a row scale (the block formats' self-describing's)");
 }
 
 DGPP_TEST(latent_format_e2m1_codec_is_exact_and_rounds_to_even) {
@@ -163,5 +175,120 @@ DGPP_TEST(latent_format_fp8_row_matches_the_elementwise_recipe) {
     require(dgpp::latent_fp8_decode_bf16(want, scale) ==
                 float_to_bf16_bits(dgpp::fp8_e4m3_bits_to_float(want) * scale),
             "decode " + std::to_string(i));
+  }
+}
+
+// The window ring's mixed-precision record (the G8's first bullet's close,
+// 2026-09-21): the reference's window KV quantizes ONLY the non-RoPE 448
+// dims to fp8 (per-64, e8m0) leaving the RoPE 64 in bf16 (ck:model.py:508-
+// 512 `act_quant(kv[..., :-rd], 64, ...)` — "FP8-simulate non-rope dims
+// to match QAT; rope dims stay bf16 for positional precision"). This
+// oracle pins the kFp8BlockRope record's byte layout (the 584 B envelope's,
+// the dsv4-native kv_cache.h's + the DSpark union kernel's
+// dsv4_dspark_decode_record's) and its round-trip: the RoPE dims bit-exact
+// bf16, the NoPE dims the release's per-64 e4m3/e8m0 (an independent
+// bit-field ceil-log2 cross-check, not the shared helper's).
+DGPP_TEST(latent_format_fp8blockrope_mixed_record_layout_and_roundtrip) {
+  const int kv_lora = 512;
+  const int n = dgpp::latent_fp8blockrope_nope(kv_lora);  // 448 the NoPE prefix
+  const size_t rope_off = dgpp::latent_fp8blockrope_rope_offset(kv_lora);
+  const size_t scale_off = dgpp::latent_fp8blockrope_scale_offset(kv_lora);
+  // ---- the byte layout (the 584 B envelope's the regions' pin) --------
+  require(dgpp::latent_row_bytes(LatentFormat::kFp8BlockRope, kv_lora) == 584, "the 584 B envelope");
+  require(n == 448, "the NoPE prefix's 448");
+  require(rope_off == 448, "the RoPE tail's at 448");
+  require(scale_off == 576, "the 7 scales' at 576");
+  require(scale_off + 7 == 583, "the pad's byte's at 583");
+  // A hand-crafted record: the known codes / scales / tail decode to the
+  // exact bf16 (the layout's pin, independent of the quantizer's).
+  {
+    std::vector<uint8_t> rec(584, 0);
+    for (int i = 0; i < 448; ++i) rec[static_cast<size_t>(i)] = 0x3C;  // e4m3's 1.5
+    rec[576] = 127;  // 2^(127 - 127) = 1.0
+    rec[577] = 128;  // 2^1 = 2.0
+    const uint16_t t0 = float_to_bf16_bits(3.5f);
+    for (int i = 0; i < 64; ++i) {
+      rec[448 + 2 * i] = static_cast<uint8_t>(t0 & 0xFFu);
+      rec[448 + 2 * i + 1] = static_cast<uint8_t>(t0 >> 8);
+    }
+    std::vector<uint16_t> back(static_cast<size_t>(kv_lora));
+    dgpp::latent_dequantize_row_host(LatentFormat::kFp8BlockRope, rec.data(), 1.0f, kv_lora, back.data());
+    for (int i = 0; i < 64; ++i) require(back[static_cast<size_t>(i)] == float_to_bf16_bits(1.5f),
+                                          "the block-0's decode's 1.5 x 1.0");
+    for (int i = 64; i < 128; ++i) require(back[static_cast<size_t>(i)] == float_to_bf16_bits(3.0f),
+                                            "the block-1's decode's 1.5 x 2.0");
+    for (int i = 448; i < kv_lora; ++i)
+      require(back[static_cast<size_t>(i)] == t0, "the RoPE tail's the raw bf16's the bit-exact's");
+  }
+  // ---- the round-trip (random rows: the RoPE's bit-exact's, the NoPE's
+  // the per-64's the e4m3/e8m0's the reference's the act_quant's) -------
+  for (uint64_t seed = 1; seed <= 8; ++seed) {
+    const std::vector<uint16_t> src = row(seed, kv_lora);
+    std::vector<uint8_t> bytes(dgpp::latent_row_bytes(LatentFormat::kFp8BlockRope, kv_lora), 0xAA);
+    float scale = -1.0f;
+    dgpp::latent_quantize_row_host(LatentFormat::kFp8BlockRope, src.data(), kv_lora, bytes.data(), &scale);
+    require(scale == 1.0f, "the self-describing's the row scale's the unused's");
+    std::vector<uint16_t> back(static_cast<size_t>(kv_lora));
+    dgpp::latent_dequantize_row_host(LatentFormat::kFp8BlockRope, bytes.data(), scale, kv_lora, back.data());
+    // The RoPE tail: bit-exact (the format's whole reason for existing —
+    // the positional signal the reference keeps exact).
+    for (int i = 448; i < kv_lora; ++i)
+      require(back[static_cast<size_t>(i)] == src[static_cast<size_t>(i)],
+              std::string("row ") + std::to_string(seed) + " RoPE dim " + std::to_string(i) + " bit-exact");
+    // The NoPE prefix: per-64 e4m3 with the e8m0 scale, against an
+    // independent per-block reference (the bit-field's ceil-log2's, the
+    // 1e-4's floor's, the e4m3's the RNE's encode's).
+    for (int b = 0; b < 7; ++b) {
+      float bmax = 0.0f;
+      for (int j = 0; j < 64; ++j) {
+        const float a = std::fabs(bf16_bits_to_float(src[static_cast<size_t>(b * 64 + j)]));
+        bmax = a > bmax ? a : bmax;
+      }
+      const float a = bmax > 1e-4f ? bmax : 1e-4f;
+      const uint32_t u = std::bit_cast<uint32_t>(a * (1.0f / 448.0f));
+      const int k = static_cast<int>((u >> 23) & 0xFFu) - 127 + ((u & 0x7FFFFFu) != 0u ? 1 : 0);
+      const int b_exp = k + 127;
+      const uint8_t want_sb = static_cast<uint8_t>(b_exp < 0 ? 0 : (b_exp > 254 ? 254 : b_exp));
+      require(bytes[scale_off + static_cast<size_t>(b)] == want_sb,
+              std::string("row ") + std::to_string(seed) + " block " + std::to_string(b) + "'s scale byte");
+      const float s = dgpp::e8m0_byte_to_float(want_sb);
+      for (int j = 0; j < 64; ++j) {
+        const int i = b * 64 + j;
+        const uint8_t want_code =
+            dgpp::float_to_fp8_e4m3_bits(bf16_bits_to_float(src[static_cast<size_t>(i)]) / s);
+        require(bytes[static_cast<size_t>(i)] == want_code,
+                std::string("row ") + std::to_string(seed) + " code " + std::to_string(i));
+        const uint16_t want_back =
+            float_to_bf16_bits(dgpp::fp8_e4m3_bits_to_float(want_code) * s);
+        require(back[static_cast<size_t>(i)] == want_back,
+                std::string("row ") + std::to_string(seed) + " dequant " + std::to_string(i));
+      }
+    }
+    // The e4m3 class's error bound over the NoPE (the 3-bit mantissa's).
+    require(rel_l2(src, back) <= 0.07, std::string("row ") + std::to_string(seed) + "'s NoPE's the e4m3's class's");
+    // The pad's byte's the written's (never the buffer's old contents's,
+    // the 0xAA's fill's the initcheck's discipline's).
+    require(bytes[583] == 0, "the pad's byte's the zero's");
+  }
+  // An all-zero row: every code 0, the scale's byte the 1e-4 floor's
+  // (2^-22's the 105's the 127 - 22's), the tail's zeros' the back's
+  // zeros's.
+  {
+    const std::vector<uint16_t> zeros(static_cast<size_t>(kv_lora), 0);
+    std::vector<uint8_t> bytes(dgpp::latent_row_bytes(LatentFormat::kFp8BlockRope, kv_lora), 0xFF);
+    float scale = -1.0f;
+    dgpp::latent_quantize_row_host(LatentFormat::kFp8BlockRope, zeros.data(), kv_lora, bytes.data(), &scale);
+    for (int i = 0; i < 448; ++i) require(bytes[static_cast<size_t>(i)] == 0, "the zero row's codes");
+    // The 1e-4 floor's byte (the a * (1/448)'s the bit-field's ceil's
+    // the 105's the 2^-22's) — computed independently here.
+    const uint32_t uf = std::bit_cast<uint32_t>(1e-4f * (1.0f / 448.0f));
+    const int kf = static_cast<int>((uf >> 23) & 0xFFu) - 127 + ((uf & 0x7FFFFFu) != 0u ? 1 : 0);
+    const uint8_t want_floor_byte =
+        static_cast<uint8_t>((kf + 127) < 0 ? 0 : ((kf + 127) > 254 ? 254 : (kf + 127)));
+    for (int b = 0; b < 7; ++b)
+      require(bytes[scale_off + static_cast<size_t>(b)] == want_floor_byte, "the zero row's scale");
+    std::vector<uint16_t> back(static_cast<size_t>(kv_lora), 1);
+    dgpp::latent_dequantize_row_host(LatentFormat::kFp8BlockRope, bytes.data(), scale, kv_lora, back.data());
+    for (uint16_t v : back) require(v == 0, "the zero row decodes to zeros");
   }
 }
