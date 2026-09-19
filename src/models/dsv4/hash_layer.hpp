@@ -63,6 +63,17 @@ struct Dsv4HashWeights {
   // the F8_E8M0's). The [n_experts * 3]'s gate, up, down's.
   const uint8_t* expert_payload = nullptr;  // I8 [n_experts * 3, ...]
   const uint8_t* expert_scales = nullptr;  // F8_E8M0 [n_experts * 3, ...]
+  // The slot path's expert views (the GLM MoE's expert table's re-
+  // expression's): the routed's MXFP4's triples's (the w1's w3's w2's
+  // per expert's, the inter's sliced at I/world's) + the fp8 shared
+  // expert's triple's + the slice's dims's (the world's I's / S's). The
+  // rebind's builds the device's view table's (the MoeExpertView's) from
+  // these's.
+  const GlmFp4Matrix* experts = nullptr;  // [n_experts * 3] (w1, w3, w2 per expert)
+  const GlmQuantMatrix* shared = nullptr;  // [3] (w1, w3, w2)
+  int n_experts = 0;
+  int64_t local_inter = 0;  // I/world (the routed expert's inter slice)
+  int64_t local_shared_inter = 0;  // S/world (the shared expert's inter slice)
   int layer = 0;  // the layer's ordinal (the hash check's: layer < num_hash_layers')
   bool hash_layer = false;  // the tid2eid's routing's (the rebind's the set's)
 };

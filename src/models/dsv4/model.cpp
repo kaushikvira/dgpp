@@ -742,11 +742,19 @@ Dsv4HashWeights Dsv4Model::hash_view(const Dsv4LayerResident& r, int layer) cons
                   ? d_tid2eid_[static_cast<size_t>(layer)]
                   : nullptr;
   // The MXFP4 expert's payload + scales (the [n_experts * 3]'s gate / up /
-  // down's). The loader's per-expert views (not one packed array): the
-  // expert's body (GPU-gate pending) reads the first's for now — the
-  // composition's the packed expert array's the completion's.
+  // down's). The loader's per-expert views (not one packed array):
+  // expert_payload / expert_scales carry the first expert's (the rebind's
+  // presence check's), the full table rides `experts` below's.
   w.expert_payload = m.experts.empty() ? nullptr : m.experts[0].payload;
   w.expert_scales = m.experts.empty() ? nullptr : m.experts[0].scales;
+  // The slot path's expert views (the MXFP4 table's + the fp8 shared's
+  // triple's + the slice's dims's — the layer's device view table's
+  // source's, the GLM MoE's expert table's re-expression's).
+  w.experts = m.experts.empty() ? nullptr : m.experts.data();
+  w.shared = m.shared;
+  w.n_experts = m.n_experts;
+  w.local_inter = m.local_inter;
+  w.local_shared_inter = m.local_shared_inter;
   w.layer = layer;
   return w;
 }
