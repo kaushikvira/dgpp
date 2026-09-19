@@ -198,18 +198,20 @@ void csa2_window_ring_writeback(const void* scratch, int window, int64_t pos0, i
 
 // ---- the indexer's fp4 e8m0/32 forms in the planar index cache ---------------------
 // The reference quantizes the index q and k to e2m1 with an e8m0 scale per
-// 32 (fp4_act_quant) and dequantizes in place. The q's the reference's
-// Hadamard-rotated's (the rotate_activation's the csa2_hadamard_rotate_bf16's,
-// the RoPE'd's before's — the checkpoint's wq_b's -> RoPE's -> the
-// rotate_activation's the :420's -> the fp4_act_quant's the :422's the
-// in-place's). Stored here as e4m3 codes
+// 32 (fp4_act_quant) and dequantizes in place. The V4 checkpoint's q's
+// the Hadamard-rotated's (the rotate_activation's the
+// csa2_hadamard_rotate_bf16's, the RoPE'd's before's — the checkpoint's
+// wq_b's -> RoPE's -> the rotate_activation's the :420's -> the
+// fp4_act_quant's the :422's the in-place's; the dsv41 base's the
+// unrotated's the plain's the quant's) — the kernel's the quant's the
+// bf16's rows's the caller's the form's the caller's. Stored here as e4m3 codes
 // with one power-of-two row scale S = 2^(k_max - 6) (k_max the row's
 // largest block exponent): every block within 14 binades of the largest
 // is exact in e4m3; a farther block loses codes and is counted in
 // *violations (may be null; one count per row).
-//   q: bf16 [rows, heads, 128] (the tail already rotated + the Hadamard's
-//   rotated's — the checkpoint's rotate_activation's before's the fp4's
-//   quant's) -> q_fp8 [rows * heads, 128] e4m3, q_scale [rows * heads] fp32.
+//   q: bf16 [rows, heads, 128] (the tail already rotated; the V4's the
+//   Hadamard's rotated's before's the quant's) -> q_fp8 [rows * heads,
+//   128] e4m3, q_scale [rows * heads] fp32.
 void csa2_index_q_quant(const void* q, int rows, int heads, void* q_fp8, float* q_scale,
                         unsigned* violations, cudaStream_t stream);
 //   k: bf16 [n, 128] (normed, the tail rotated) -> the index cache slots of
