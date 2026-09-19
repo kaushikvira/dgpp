@@ -425,3 +425,36 @@ captured node) is which of the 21 are which, and what the Qwen/GLM precedent is:
 the live Qwen lane runs `decode_graph: true` on the same `SessionModel`, so
 whichever of these copies qwen also performs must already happen OUTSIDE the
 captured span — the dsv4 family's difference is what to mirror.
+
+### 2026-09-19, third window: two blockers cleared, a new OOB exposed
+
+Run: world 2 / kv 262144 / `max_concurrency 2` / **MTP on / decode graph on**
+(`config/dgpp-dsv4-w2.json`), binary = the merged dsv4-flash build. Outcome:
+still no boot, but the failure MOVED, and both previous blockers are confirmed
+cleared:
+
+1. **The DSpark plan fix is validated on hardware** — the instrumentation
+   (agent A's) printed the exact shapes and the fix held:
+   `dsv4 dspark prepare: rows=5 plans ready — main-proj (m=5 n=4096 k=12288
+   io=BF16 out=BF16 stride=12288) + lm-head (m=5 n=64640 k=4096 io=BF16 out=F32
+   stride=4096)`. Note `stride=12288` — the corrected fused width.
+2. **The kernels-only graph blocker is cleared** — the capture no longer
+   reports the memcpy rejection. The 21 nodes were the 21 C4A layers'
+   `publish_entries` 1024->512 latent slice (`cudaMemcpy2DAsync`), now a kernel
+   (`dsv4_csa2_latent_slice_kernel`). The plan doc's earlier guess (the session
+   position / block-table pushes) was WRONG — the enumeration settled it.
+3. **New failure, one step further along:**
+   `ERROR serve: cuda failure 700: an illegal memory access was encountered |
+   cudaMemsetAsync(d_tails_ + t * tail_stride + req * per_req, 0, per_req *
+   sizeof(float), ...)` — the compressor's per-request tails reset.
+   The reset's own arithmetic is IN BOUNDS by construction (`t < tails_`, stride
+   `max_requests x 2 x tails_w_`, and `tail_ord` is a compacted ordinal —
+   `tail_ord_[l] = t++`, verified), so this is the **sticky-error pattern**:
+   the real out-of-bounds happened earlier and the next CUDA call surfaced it.
+   Prime suspects: the newly added `dsv4_csa2_latent_slice_kernel`, or the S1b
+   publish path, both of which first execute during the capture warm-up.
+
+NEXT STEP (do not guess): run the toolkit's sanitizer gate over exactly this
+shape — `DSV4_SMOKE_MODE=fabric bash scripts/dsv4_gates.sh sanitizer` (or
+compute-sanitizer on the direct dsv4 serve) — and read the FIRST invalid
+access, not the reported memset site.
