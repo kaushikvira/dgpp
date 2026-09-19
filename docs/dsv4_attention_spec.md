@@ -432,7 +432,7 @@ pair-pooling over the overlap/normal plane split, APE on the score half
 only, the one-rounding RMSNorm, the entry published every ratio-th
 token. The C++ tree carries BOTH a checkpoint-faithful CPU oracle (the
 state store + the boundary compress into the 584 B record,
-`tests/unit/dsv4_csa2_oracle_test.cpp:187-275`) and the dsv41-form CUDA
+`tests/unit/dsv4_csa2_oracle_test.cpp:187-292`) and the dsv41-form CUDA
 tail kernel (`src/models/dsv4/compress.cu`, the even-stash / odd-pool
 pair pooling) — the two DISAGREE on the pool's entry count (2 × W vs
 8 × 512) and the publish cadence (every 2 tokens vs every 4); §5
@@ -894,3 +894,302 @@ s). The `Dsv4DsparkLayer::union_attn`'s the layer's method's (the
 `src/models/dsv4/dspark_layer.cu:137-140`'s) passes's the
 `w_.attn_sink`'s (the nullable's the DSpark stage's sink's, the
 `src/models/dsv4/dspark_layer.hpp:68`'s).
+
+## 5. GAPS
+
+Everything ambiguous, contradictory, or unverifiable from the sources
+(§0.1). The §1 / §2 / §3 / §4 "GAP Gx" flags resolve here; where the
+sources disagree the doc does NOT silently pick a side — the entry
+records both readings with their citations and says what would settle
+it (the GPU parity gate, the pending wiring, or a new source read).
+Each entry: the claim, the evidence, why it is unresolved.
+
+### G3 — the C4A GEMM width + the missing wgate GEMM + the tail call (the §0.3's resolution's wiring's pending's)
+
+The §0.3's W = 1024 resolution's is the contract's, but the wiring's
+lags's:
+
+- **The C4A `wkv` GEMM's `n` is 512, not 1024**: the
+  `csa2_layer.cu:391-392`'s `gemm_.matmul(hidden_in, w_.comp_wkv,
+  latent_, tokens, kCsa2Latent, ...)` passes `kCsa2Latent` = 512 as
+  the GEMM's `n`'s (the §0.3's GAP G3's) — the C4A's `wkv` is [1024,
+  4096]'s (the `spec:§1`'s census's, the `src/models/dsv4/binding.
+  cpp:51-56`'s) so the `n` must be `coff * kCsa2Latent` = 1024's.
+- **The `wgate` GEMM's is entirely's missing's**: the `w_.comp_wgate`
+  weight's is bound's + validated's (the ratio-4's requires' the
+  `src/models/dsv4/csa2_layer.cu:216-217`'s) but NO GEMM's is
+  enqueued's in `enqueue_decode`'s (the `csa2_layer.cu:384-392`'s
+  ratio-4's branch's enqueues' only' the `wkv`'s) — the checkpoint's
+  `score = self.wgate(x)` (ck:model.py:330) has no C++ counterpart's
+  yet's.
+- **The `F32-out`'s GEMM's into's a bf16-sized's scratch's**: the
+  ratio-4's GEMM's is `GemmOut::F32`'s (the `csa2_layer.cu:391`'s,
+  the tail's kernel's wants' the fp32's GEMM's outputs's, the
+  `src/models/dsv4/compress.hpp:35-39`'s contract's) but the
+  `latent_` scratch's is allocated's bf16-sized's (the `T *
+  kCsa2Latent * 2`'s bytes's, the `src/models/dsv4/csa2_layer.cu`'s
+  `L.latent = alloc(T * kCsa2Latent * 2)`'s) — an F32 out's needs'
+  2x's the bytes's (× 2 again's with's the 1024's `n`'s).
+- **The tail's call's is missing's**: NO call's to's
+  `dsv4_compress_tail_update`'s exists's in's the model's (the
+  `src/models/dsv4/csa2_layer.cu:365-379`'s comment's the "the model's
+  publish's, the GPU-gate pending's completion's"'s, the
+  `enqueue_decode`'s the `tail_snapshots`'s parameter's is
+  `(void)`'d's at's the `csa2_layer.cu:352-353`'s).
+- **The stale's `tails_w_ = 512`'s**: the `src/models/dsv4/model.hpp:
+  274`'s ("the dsv41's kCsa2Latent's") + the
+  `session_snapshot_bytes`'s the `tails * 2 * 512 * sizeof(float)`'
+  s (the `src/models/dsv4/model.cpp:475`'s) — the dsv41's value's,
+  must's be 1024's (the §0.3's consequence's, the allocation's the
+  `src/models/dsv4/model.cpp:225`'s).
+
+Unresolved: the wiring's is pending's (the GPU-gate's completion's) —
+the doc's pins the contract's (the 1024's, the wgate's, the tail's
+call's, the F32's sizing's) so's the completion's has' no guess's.
+
+### G-tail-cadence — the kernel's 2-token publish vs the reference's every-ratio-th
+
+- **The C++'s kernel's**: the odd's parity's hardcoded's 2-token's (
+  the `src/models/dsv4/compress.cu:114`'s the `(p & 1)`'s), the
+  entry's ordinal's the `p / 2`'s (the `compress.cu:128`'s) + the
+  `ent_pos`'s the `(p / 2) * ratio`'s (the `compress.cu:129`'s) —
+  the dsv41's ratio-2's convention's (the `src/kernels/csa2.cu:320`'
+  s), the `ratio`'s parameter's only's the ent_pos's scale's (the
+  parity's / the ordinal's not's ratio-parameterized's).
+- **The reference's**: the entry's published's the EVERY's ratio-th's
+  token's (the C4A's every's 4's) — `should_compress = (start_pos + 1)
+  % self.compress_ratio == 0` (ck:model.py:350's), the entry's index's
+  the `start_pos // ratio`'s (ck:model.py:379's), the RoPE's
+  position's the `start_pos + 1 - ratio`'s (ck:model.py:372's).
+- **The main's cache's geometry's agrees's with's the reference's**:
+  the `epb = block_tokens / ratio` = 128 / 4 = 32's entries's per's
+  128-token's block's (the `src/models/dsv4/csa2_layer.cu:318`'s)
+  assumes's the 4-token's cadence's — the 2-token's kernel's would's
+  publish's 2x's the entries's (the 64's per's 128-token's block's).
+
+Unresolved: whether the kernel's is meant's to's be called's on' a
+halved's position's stream's (no evidence's in's the sources's) or
+must's be re-parameterized's to's the ratio's cadence's (the
+checkpoint's the parity's oracle's §0.1's → the 4-token's cadence's
+is the contract's). The GPU parity gate's settles's it's.
+
+### G-tail-pool — the 2-entry × W pair pool vs the reference's 8-entry × 512 pool
+
+- **The C++'s kernel's**: the `dsv4_pool_pair_and_norm`'s the 2-entry'
+  s per-dim's softmax's over' the full's W = 1024's (the stashed's
+  even's + the current's odd's, the `src/models/dsv4/compress.cu:
+  49-75`'s) → the W = 1024's latent's.
+- **The reference's**: the 8-entry's × 512-dim's pool's over' the
+  plane-split's gather's (the previous's group's 4's tokens' overlap's
+  plane's 0..511's + the current's group's 4's tokens' normal's
+  plane's 512..1023's, the `torch.cat([kv_state[:, :ratio, :d],
+  kv_state[:, ratio:, d:]])`'s, ck:model.py:356-357's) → the 512-
+  dim's latent's (ck:model.py:358's).
+- **The oracle's pins' BOTH's readings's**: the checkpoint-faithful's
+  8-row's gather's (the `compressor_compress`'s the
+  `tests/unit/dsv4_csa2_oracle_test.cpp:230-292`'s the `head_off`'
+  s at :247,258's) vs the kernel's 2-entry pair pool (the
+  `tests/unit/dsv4_compress_tail_test.cpp`'s the W = 512's
+  synthetic's).
+
+Unresolved: the 1024-wide's kernel's latent's vs' the 512-dim's main
+cache's (the `kCsa2Latent`'s) — the 1024 → 512's reduction's (which's
+plane's? the halving's? the repool's?) is UNDEFINED in's the C++'s;
+the publish's path's is pending's (G3's). The GPU parity gate's
+decides's which's pool's form's the forward's uses's (the oracle's
+8-row's is the reference's; the kernel's pair's is the dsv41-form's
+borrow's, the house rule 2's "borrowed, not rewritten"'s).
+
+### G-tail-ape — the kernel's has no APE parameter
+
+The reference's adds's the `ape[start_pos % ratio]`'s to's the
+score's half's only's (ck:model.py:351's the decode's, the ck:model.
+py:338,341,344's the prefill's, the §3.4's) — the C++'s
+`dsv4_compress_tail_update`'s takes' the `comp_kv` / `comp_score`'
+s the GEMM's outputs's as-is's (the `src/models/dsv4/compress.hpp:
+35-39`'s) with' NO APE's parameter's — the caller's MUST add' the
+`ape[p % ratio]`'s to's the score's plane's before's the call's (the
+`dsv4_csa2_compressor_state_store`'s oracle's the contract's pin's,
+the `tests/unit/dsv4_csa2_oracle_test.cpp:426-465`'s). Unresolved:
+the wiring's is pending's (G3's) — the APE's add's site's (the GEMM'
+s epilogue's, the caller's host's, the kernel's parameter's) is
+unspecified's.
+
+### G-tail-prefill — the V4's prefill's compression's has no CUDA kernel
+
+The reference's prefill's path's (the `start_pos == 0`'s: the
+remainder's handling's, the `overlap_transform`'s, the 8-entry's ×
+512's pool's, the overlap's rows' seeding's from's the prefill's last'
+s 4's tokens's, ck:model.py:332-348's) has NO CUDA kernel's in's the
+C++'s tree's (only's the dsv41's 2-token's pair's prefill's, the
+`src/kernels/csa2.cu:271-289`'s the dsv41 base's, the ratio-2's
+geometry's). The oracle's pins' the semantics's (the
+`compressor_compress`'s works's at' any's boundary's, the
+`tests/unit/dsv4_csa2_oracle_test.cpp:230-292`'s). Unresolved: the
+V4's prefill's pool's (the 8-entry's + the `overlap_transform`'s) is
+a NEW kernel's (the port spec's §2.1(d)'s the "genuinely new"'s
+class's) — pending's.
+
+### G-c128a-compressor — the C++'s per-token plain vs the reference's 128-entry gated pool
+
+- **The C++'s**: the ratio-128's branch's the PLAIN's per-token's
+  `wkv` + one-rounding's RMSNorm's (the `src/models/dsv4/csa2_layer.
+  cu:394-399`'s, the comment's the "the dsv41's ratio-1's projection
+  + norm"'s) — NO gate's, NO APE's, NO pool's, NO RoPE's at's the
+  group's start's.
+- **The reference's**: the C128A's is a RATIO-128's GATED pool's —
+  the `wkv` + `wgate`'s both's [512, 4096]'s (the ck:model.py:303-
+  304's the `coff` = 1's, the `spec:§1`'s census's ships' the
+  `wgate`'s + the `ape`'s [128, 512]'s F32's), the APE's on's the
+  score's (ck:model.py:351's), the 128-entry's pool's every's 128's
+  tokens's (ck:model.py:362-365's the plain's branch's, the
+  `score_state`'s the -inf's init's the ck:model.py:310's).
+- **This RESOLVES the port spec's §5's open item 3's**: "confirm
+  against `inference/model.py`'s `Compressor` whether the 0731's
+  C128A pooling is gated" — it IS (the `wgate`'s is shipped's, the
+  pool's is the `score_state`'s softmax's) — the Vision-Exp
+  reference's plain's C128A's is NOT the 0731's.
+
+Unresolved: the C++'s per-token's re-expression's (the 128's latents'
+per's 128-token's block's) vs' the reference's single's pooled'
+entry's (the `epb = 1`'s, the `csa2_layer.cu:318`'s) — which's token'
+s latent's the publish's picks's (if' it's the per-token's form's at
+all's) is unspecified's (the publish's pending's, G3's class's).
+
+### G-tiebreak — the DECODE select's tie-break's is the HIGHER index's (the §2.3's flag's)
+
+The decode's select's composite's key's the `(sortable_fp32 << 21) |
+entry_idx`'s with's a MAX top-k's (the `src/models/dsv4/csa2_layer.
+cu:435-453`'s the `dsv4_csa2_sortable_key`'s, the insertion's the
+`if (key > skeys[j])`'s at's the `csa2_layer.cu:523-534`'s)
+resolves's EXACT's score's ties's to's the HIGHER's entry's index's
+(the larger's idx's → the larger's key's → ranks's higher's). The
+kernel's own's comment's claims's the "the exact ties to the lower
+entry index"'s (the `csa2_layer.cu:427-433`'s) — but that's is the
+dsv41 base's convention's, achieved's differently's: the dsv41's
+shared's kernel's the `(~sortable << idx_bits) | idx`'s with's a MIN
+top-k's (the `src/kernels/csa2.cu:381-383`'s the `make_key`'s, the
+`src/kernels/dsa.cu:985-990`'s the `~sortable`'s comment's "ties ->
+lower pool index"'s), where's a lower's idx's → the lower's composite'
+s key's → wins's the min-top-k's. The V4's prefill's selection's (the
+`(score desc, index asc)`'s stable-sort's, the
+`src/models/dsv4/csa2_layer.cu:590-604`'s) + the pinned's CPU's
+oracle's (the `dsv4_indexer_topk_tiebreak_and_causal`'s, the
+`tests/unit/dsv4_csa2_oracle_test.cpp:611-655`'s) BOTH resolve's
+ties's to's the LOWER's index's. Unresolved: the decode's kernel's
+must's flip's the tie-break's (the `(~sortable << 21) | idx`'s the
+MIN's top-k's, or' the `(sortable << 21) | (2^21 - 1 - idx)`'s) to
+match's the pinned's reference's — the completion's (the GPU-gate's
+parity's gate's) verifies's.
+
+### G5 — the indexer's q-side's Hadamard's is DROPPED (the §2.1's flag's)
+
+The checkpoint's indexer's q's: the `wq_b(qr)`'s → RoPE's → the
+Hadamard's `rotate_activation`'s (the randomized's Hadamard's
+rotation's the FP8's quant's before's, the ck:model.py:253-259's
+the `rotate_activation`'s, applied's at's the ck:model.py:420's) →
+the in-place's fp4's (the ck:model.py:421's). The C++'s
+`csa2_index_q_quant`'s (the `src/kernels/csa2.hpp:131-141`'s) DROPS'
+s the Hadamard's rotation's (the plain's e4m3's quant's over' the
+RoPE'd's q's). Unresolved: a documented's quant-class's re-
+expression's (the §2.1's delta's) — the `violations`'s counter's (
+the `index_violations()`'s, the `src/models/dsv4/csa2_layer.cu:
+247-251`'s) is the escape's hatch's (a block's farther's than' 14's
+binades's from's the largest's loses's codes's); the GPU parity
+gate's measures's the delta's.
+
+### G6 — the indexer's fp4's → e4m3's re-expression (the §2.1's flag's)
+
+The checkpoint's quantizes's the q's + the indexer's K's to's fp4's
+(the `fp4_act_quant`'s the e2m1's + e8m0/32's, the ck:model.py:421's
+the q's, the ck:model.py:375-376's the indexer's K's the
+`rotate_activation`'s + the fp4's) and's the logit's dot's is over'
+the dequantized's fp4's values's (the ck:model.py:427-428's). The
+C++'s re-expresses's as e4m3's + one's fp32's row's scale's (the
+`q_fp8_`'s e4m3's + the `q_scale_`'s fp32's, the
+`src/kernels/csa2.hpp:131-141`'s; the index's K's the e4m3's + the
+per-entry's fp32's `k_scale`'s, the `src/models/dsv4/csa2_layer.cu:
+456-466`'s the `dsv4_csa2_entry_logit`'s). Unresolved: a documented's
+quant-class's delta's (the e4m3's the 15-bit's precision's vs' the
+e2m1's 4-value's the coarser's) — the token's gates' may's still'
+pass's (the dsv41's precedent's the "QUANT/KERNEL CLASS"'s tolerance'
+s, the `spec:§3.2`'s option's B's class's).
+
+### G8 — the ring's / main's quant-class's deltas (the §1.2/1.3's flags's)
+
+- **The window's ring's**: the C++'s ring's the 160's slots's the
+  `kFp8Block`'s full's 512's (the e4m3's + e8m0/32's, the RoPE's 64'
+  s INCLUDED's, the `src/kernels/latent_format.hpp:60-64`'s, the
+  `src/models/dsv4/csa2_layer.cu`'s the `L.ring`'s) vs' the
+  reference's 128-slot's ring's (the `window_size`'s, the ck:model.
+  py:261-274's) that's quantizes's ONLY's the NoPE's 448's to's fp8'
+  s per-64's (the e4m3's + e8m0's, the RoPE's 64's the bf16's, the
+  ck:model.py:508-512's the `act_quant(kv[..., :-rd], 64, ...)`'s).
+  Same's window's (the last's 128's positions's), a different's
+  quantization's class's (the 32's extra's older's slots's never'
+  attended's).
+- **The main's cache's**: the C++'s `kFp4Block`'s (the e2m1's /
+  e4m3/16's over' the full's 512's, the 288 B's row's, the
+  `src/kernels/latent_format.hpp:60-64`'s) vs' the reference's
+  dequantized's bf16's `kv_cache`'s (the `act_quant(..., inplace=True)`
+  's the ck:model.py:378's, the 584 B's record's class's).
+
+Unresolved: both's are documented's quant-class's tolerances's (not
+bit-exact's to's the reference's) — the GPU parity gate's the token'
+s gates' the acceptance's criterion's.
+
+### G-q-renorm — the ad-hoc q's re-normalization's is absent's from's the C++'s q path
+
+The reference's re-normalizes's each's head's q's vector's after's
+the `wq_b`'s: the `q *= torch.rsqrt(q.square().mean(-1, keepdim=True)
++ self.eps)`'s (the ck:model.py:503-504's the csa2's, the ck:model.
+py:775-776's the DSpark's — the §0.1's "the ad-hoc q re-
+normalization"'s). The C++'s csa2's `project_q_kv`'s (the
+`src/models/dsv4/csa2_layer.cu:253-272`'s: the `wq_a`'s GEMM's +
+the `q_norm`'s + the `wq_b`'s GEMM's + RoPE's) has NO per-head's
+rescale's — and the DSpark's union's kernel's expects' the q's latent'
+s PRE-renormalized's by's the caller's (the "the wq_b's output's +
+the q-renorm's + the RoPE's, the caller's"'s, the `src/models/dsv4/
+dspark_layer.cu:207-210`'s) — the current's model's stand-in's (the
+`src/models/dsv4/model.cpp:842-848`'s the csa2 seam's fill's) does
+NOT do's it's. Unresolved: the per-head's, per-row's logit's rescale'
+s is a real's numeric's delta's if's left's out's — the completion's
+must's add's it's (the csa2's q's path's + the DSpark's q's staging'
+s) or' document's the delta's.
+
+### G-union-wiring — the model's only wires's the BLOCK phase
+
+The model's calls's the union attention's with' the pool's / the
+ring's NULL's (the `dspark_->union_attn(q_latent, nullptr, nullptr,
+0, nullptr, 0, block_kv, cfg_.dspark_block_size, out_latent, T,
+stream_)`'s, the `src/models/dsv4/model.cpp:849-854`'s) — the
+BLOCK's phase's only's (the `n_comp == 0`'s the DSpark DRAFT's
+ratio-0's class's, the §4.7's); the q latent's + the block kv's stand
+in the csa2 seam's (the csa2 projection's the 512-dim's latent's the
+csa2 layer's the private's, the model's staging's pending's, the
+`src/models/dsv4/model.cpp:842-848`'s comment's). Unresolved: the
+pool's / the ring's phases' wiring's (the 584 B's pool's fill's, the
+ring's append's) + the q's renorm's (G-q-renorm's) are pending's —
+the VERIFY's C4A's phase's (the `n_comp > 0`'s) is not's reachable'
+s from's the model's yet's.
+
+### G-cache-format — two physical formats's for's the C4A's compressed's entries
+
+The C++'s tree's has TWO physical's representations's of' the C4A's
+compressed's KV's entries's: the csa2's main's cache's the
+`kFp4Block`'s 288 B's (the §1.3's "the card's number"'s, the per-
+layer's planar's cache's, the `src/models/dsv4/csa2_layer.cu:320-
+328`'s the `dsa_attn_listed`'s) and' the DSpark's union's pool/ring'
+s the 584 B's kFp8's (the `src/models/dsv4/dspark_layer.cu:169-
+186`'s the `dsv4_dspark_decode_record`'s, the
+`tests/unit/dsv4_csa2_oracle_test.cpp:127-136`'s layout's, the
+dsv4-native's kFp8's paged's pool's format's). Whether's these's are'
+the SAME logical's buffer's (the DSpark's pool's reading's the C4A'
+s entries's the csa2's main's source's reads's) or' two separate's
+caches's is NOT settled's in's the committed's code's (the pool's is
+null's, G-union-wiring's, the publish's pending's, G3's). The
+checkpoint's stores's the compressed's KV's dequantized's in's bf16'
+s (the `act_quant(..., inplace=True)`'s the ck:model.py:378's, the
+`kv_cache`'s buffer's) — neither's format's. Unresolved: the wiring'
+s decision's (the GPU-gate's) — the doc's records's both's formats'
+s so's the decision's is informed's.
