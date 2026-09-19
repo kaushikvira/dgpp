@@ -880,6 +880,8 @@ DGPP_TEST(dsv4_csa2_planar_cache_geometry) {
     if (block >= max_blocks)
       throw std::runtime_error("the entry's block's out of the max_blocks' bound's (e " + std::to_string(e) + ")");
   }
+}
+
 // ---- the decode select's tie-break (the dsv4_csa2_sortable_key's + the
 // dsv4_csa2_select_insert's — the real's layer code's, the CPU's
 // qualifiable's, no CUDA initialization) ------------------------------
