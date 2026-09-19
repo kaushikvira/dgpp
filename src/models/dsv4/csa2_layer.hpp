@@ -187,9 +187,12 @@ class Dsv4Csa2Layer {
   // union-attn's q-latent's + the block-kv's wiring's, the 2026-09-18's
   // stand-in's scratch's the csa2 seam's the fill's the replaced's):
   //   q_latent  the wq_b's q latent's (the [tokens, local_heads, 512]'s
-  //                the RoPE'd's, the q-renorm's the G-q-renorm's gap's the
-  //                absent's — the DSpark union attention's q_latent's the
-  //                ready's 512-dim's latent's the caller's contract's).
+  //                the per-head's re-normalized's (the checkpoint's ad-hoc's
+  //                q's rescale's, the G-q-renorm's the project_q_kv's
+  //                closed's) + the RoPE'd's — the DSpark union attention's
+  //                q_latent's the ready's 512-dim's latent's the caller's
+  //                contract's the "the wq_b's output's + the q-renorm's +
+  //                the RoPE's"'s the satisfied's).
   //   block_kv  the wkv's block kv's (the [tokens, 512]'s the in-memory's
   //                unquantized's the window's latent's — the DSpark union
   //                attention's block phase's the in-memory's bf16's the
@@ -205,11 +208,17 @@ class Dsv4Csa2Layer {
   struct Layout;
   static Layout layout(const Dsv4Csa2Config& cfg, int max_tokens, int64_t max_cache_tokens, int max_decode_rows,
                        int decode_n_split, size_t dot_budget);
-  // The projections and the window row of `tokens` rows at `pos` (device).
+  // The projections and the window row of `tokens` rows at `pos` (device):
+  // the wq_a + the q_norm's the qr's, the wq_b's q's the per-head's re-
+  // normalization's (the checkpoint's ad-hoc's q's rescale's the G-q-renorm's)
+  // the RoPE'd's, the wkv's + the kv_norm's + the RoPE'd's the window's
+  // latent's kv's.
   void project_q_kv(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream);
   // The indexer's 64-head query: the wq_b's 64-head projection -> the
-  // tail's rotation -> the fp8 quant -> the folded weights (the 64-head
-  // fold width the spec §2.1(d) flags as NEW).
+  // tail's rotation -> the Hadamard's rotation (the checkpoint's
+  // rotate_activation's, the G5's gap's the closed's) -> the fp8 quant
+  // -> the folded weights (the 64-head fold width the spec §2.1(d) flags
+  // as NEW).
   void indexer_query(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream);
   // The decode window's key-dimension split (the dsv41 kWinDecodeSplit's
   // V4 re-expression): a one-row window is not a single latency-bound

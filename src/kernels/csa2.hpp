@@ -21,6 +21,7 @@
 // RMSNorm (fp32 interior, bf16 out), the complex rotation over adjacent
 // pairs with fp32 angles p * inv_freq[i] and cosf/sinf (no table), the
 // release's quantizers, the sink in the softmax denominator only.
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 
@@ -70,6 +71,73 @@ void csa2_rope_inv_freq_host(int rope_dim, double theta, int64_t original_seq_le
 void csa2_rope_apply(void* x, int64_t row_stride, int64_t head_stride, int heads,
                      int rope_dim, const int64_t* pos, const float* inv_freq,
                      bool inverse, int64_t rows, cudaStream_t stream);
+
+// ---- the per-head q re-normalization (the checkpoint's ad-hoc rescale) ----
+// The reference re-normalizes each head's q AFTER the wq_b and BEFORE the
+// RoPE: `q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)`
+// (the checkpoint's inference/model.py:503-504 the csa2's, :775-776 the
+// DSpark's, docs/dsv4_attention_spec.md §5 G-q-renorm): the mean over the
+// FULL head_dim (the 448 NoPE + the 64 RoPE — the reference's `mean(-1)`
+// over the unflattened head, NOT the RoPE tail only), eps the layer's
+// norm_eps (the 1e-6's). The house norm rounding class (csa2_rmsnorm_bf16's:
+// the fp32 interior, ONE bf16 rounding at the end).
+// The per-head scale (the fp32 interior's the exact formula's — the host's
+// + device's the CPU oracle's driven's parity's pin's): rsqrtf(ss / dim +
+// eps), ss the head's sum-of-squares (the bf16 -> fp32's upcast exact's).
+__host__ __device__ inline float dsv4_q_renorm_scale(float ss, int dim, float eps) {
+  // 1.0f / sqrtf's the IEEE-exact's (the host's + device's the bit-
+  // identical's — the CUDA's sqrtf's the correctly rounded's, the
+  // glibc's the same's, the division's exact's in fp32's), so the CPU
+  // oracle's driven's the host's form's the device's kernel's the
+  // exact's scale's the pin's.
+  return 1.0f / sqrtf(ss / static_cast<float>(dim) + eps);
+}
+// q: bf16 [rows, heads * dim] (the wq_b's out, the UNrotated) -> the
+// per-head re-normalized in place (the (row, head) block's the dim's
+// elements' the fp32 interior's the ONE bf16 rounding's the out's).
+void csa2_q_renorm_bf16(void* q, int rows, int heads, int dim, float eps, cudaStream_t stream);
+
+// ---- the 128-wide Hadamard rotation (the checkpoint's rotate_activation) ---
+// The reference's indexer q rotation (the checkpoint's rotate_activation's,
+// the fast_hadamard_transform's hadamard_transform(x, scale=n^-0.5)'s —
+// the checkpoint's inference/model.py:253-259's, applied at the :420's the
+// indexer's q's the RoPE'd's before's the fp4's quant's, the docs/
+// dsv4_attention_spec.md's §5's G5's): the DETERMINISTIC's Sylvester's
+// fast Walsh-Hadamard's (the unnormalized's H_128's the +1/-1's the FIXED'
+// s matrix's — NO per-head's seed's, NO permutation's, the package's kernel's
+// the standard's butterfly's), over the FULL 128-dim head (the 64 NoPE's +
+// the 64 RoPE's both's — the reference's rotate's the unflattened's head's),
+// the 128's the power-of-two's so the no padding's, scaled by 128^-0.5 (the
+// x.size(-1) ** -0.5's the orthonormal's the rotation's the norm-preserving's,
+// the fp32's), the fp32 interior's the ONE bf16 rounding's at the out's
+// (the bf16 in's the bf16 out's).
+// The 128^-0.5's scale's the fp32's (the reference's x.size(-1) ** -0.5's
+// the double's 0.08838834764831843's the fp32-rounded's the 2^-3.5's).
+inline constexpr float kDsv4Hadamard128Scale = 0.08838834764831843f;
+// The fp32 butterfly's (the 7 stages' the h = 1..64's the (a, b) pair's
+// the a + b's / the a - b's, the kDsv4Hadamard128Scale's at the end's —
+// the host's + device's the CPU oracle's driven's parity's pin's the
+// O(n^2) double matrix's the cross-check's): the Sylvester's H_128's
+// (the H_1's [1]'s the H_2n's the [H_n H_n; H_n -H_n]'s recursion's the
+// the stage's order's 1 -> 64's the H_Sylvester's the x's the product's).
+__host__ __device__ inline void dsv4_hadamard128(const float* in, float* out) {
+  float v[128];
+  for (int i = 0; i < 128; ++i) v[i] = in[i];
+  for (int h = 1; h < 128; h <<= 1)
+    for (int i = 0; i < 128; i += 2 * h)
+      for (int j = i; j < i + h; ++j) {
+        const float a = v[j], b = v[j + h];
+        v[j] = a + b;
+        v[j + h] = a - b;
+      }
+  for (int i = 0; i < 128; ++i) out[i] = v[i] * kDsv4Hadamard128Scale;
+}
+// q: bf16 [rows, heads * 128] (the RoPE'd's, the unquantized's) -> the
+// Hadamard-rotated in place (the (row, head) block's the 128 threads' the
+// 128 dims' the shared fp32's the butterfly's the ONE bf16 rounding's the
+// out's, the smem's staging's the in-place's safe's). `q_out` may alias
+// `q`.
+void csa2_hadamard_rotate_bf16(const void* q, void* q_out, int rows, int heads, cudaStream_t stream);
 
 // ---- positions ------------------------------------------------------------------
 // out[r] = pos[r] < 0 ? -1 : (pos[r] + 1) / ratio - 1: the compressed
@@ -130,13 +198,20 @@ void csa2_window_ring_writeback(const void* scratch, int window, int64_t pos0, i
 
 // ---- the indexer's fp4 e8m0/32 forms in the planar index cache ---------------------
 // The reference quantizes the index q and k to e2m1 with an e8m0 scale per
-// 32 (fp4_act_quant) and dequantizes in place. Stored here as e4m3 codes
+// 32 (fp4_act_quant) and dequantizes in place. The V4 checkpoint's q's
+// the Hadamard-rotated's (the rotate_activation's the
+// csa2_hadamard_rotate_bf16's, the RoPE'd's before's — the checkpoint's
+// wq_b's -> RoPE's -> the rotate_activation's the :420's -> the
+// fp4_act_quant's the :422's the in-place's; the dsv41 base's the
+// unrotated's the plain's the quant's) — the kernel's the quant's the
+// bf16's rows's the caller's the form's the caller's. Stored here as e4m3 codes
 // with one power-of-two row scale S = 2^(k_max - 6) (k_max the row's
 // largest block exponent): every block within 14 binades of the largest
 // is exact in e4m3; a farther block loses codes and is counted in
 // *violations (may be null; one count per row).
-//   q: bf16 [rows, heads, 128] (the tail already rotated) -> q_fp8 [rows *
-//   heads, 128] e4m3, q_scale [rows * heads] fp32.
+//   q: bf16 [rows, heads, 128] (the tail already rotated; the V4's the
+//   Hadamard's rotated's before's the quant's) -> q_fp8 [rows * heads,
+//   128] e4m3, q_scale [rows * heads] fp32.
 void csa2_index_q_quant(const void* q, int rows, int heads, void* q_fp8, float* q_scale,
                         unsigned* violations, cudaStream_t stream);
 //   k: bf16 [n, 128] (normed, the tail rotated) -> the index cache slots of

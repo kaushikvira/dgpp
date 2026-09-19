@@ -235,9 +235,12 @@ extern "C" __global__ void dsv4_dspark_union_attn_kernel(const uint16_t* __restr
   const int dim_chunk = t % 8;  // the 64 dims' the dim_chunk * 64's
   const int dims_per_thread = 64;  // the 512 dims' / 8 threads'
   // The q's the 512-dim latent's (the wq_b's output's + the q-renorm's
-  // + the RoPE's, the caller's). The 8 threads' the 64 dims' each's
-  // (the dim_chunk's the thread's 64 dims' the head's 512 dims'
-  // partition's).
+  // + the RoPE's, the caller's — the csa2 layer's project_q_kv's the
+  // per-head's re-normalization's the G-q-renorm's the closed's, so
+  // the model's q_latent's (the csa2's q_'s the getter's) the
+  // pre-renormalized's the ready's form's). The 8 threads' the 64
+  // dims' each's (the dim_chunk's the thread's 64 dims' the head's
+  // 512 dims' the partition's).
   const uint16_t* q_row = q_latent + int64_t(row) * 64 * 512;
   // The shared online-softmax state's (the running max m + normalizer
   // l + the 64-dim fp32 accumulator's). The sink's (nullable's)

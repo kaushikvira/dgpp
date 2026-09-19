@@ -70,6 +70,70 @@ __global__ void rmsnorm_kernel(const uint16_t* x, int64_t x_stride, const uint16
   }
 }
 
+// ---- the per-head q re-normalization (the checkpoint's ad-hoc rescale) --
+// One block per (row, head): the fp32 sum-of-squares (the bf16 -> fp32's
+// exact upcast's, the __fmaf_rn's the thread's stride's), the block's
+// sum's (the block_sum_256's the fixed order's), the scale's the
+// dsv4_q_renorm_scale's (the host's + device's the CPU oracle's parity's
+// pin's), the ONE bf16 rounding's at the out's (the in-place's — the
+// q's the wq_b's GEMM out's the read's before's the write's the
+// per-element's the smem-free's, the x[i]'s the re-read's the
+// bf16-rounded's pre-rescale's value's the reference's `q *='s the
+// in-place's semantics's).
+__global__ void q_renorm_kernel(uint16_t* q, int dim, float eps) {
+  __shared__ float red[8];
+  const int64_t rh = blockIdx.x;  // (row, head)
+  uint16_t* x = q + rh * dim;
+  float ss = 0.0f;
+  for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+    const float v = bf16_bits_to_float(x[i]);
+    ss = __fmaf_rn(v, v, ss);
+  }
+  const float total = block_sum_256(ss, red);
+  const float rs = dsv4_q_renorm_scale(total, dim, eps);
+  for (int i = threadIdx.x; i < dim; i += blockDim.x)
+    x[i] = float_to_bf16_bits(__fmul_rn(bf16_bits_to_float(x[i]), rs));
+}
+
+// ---- the 128-wide Hadamard rotation (the checkpoint's rotate_activation) --
+// The shared-memory's butterfly's (the dsv4_hadamard128's the host's
+// form's the SAME stage order's the h = 1..64's + the same per-pair's
+// arithmetic's the a + b's / the a - b's — the thread's t < 64's the
+// 64's pairs's the (i0, i0 + h)'s the i0's (p mod h, 2h * (p / h) +
+// (p mod h)'s the 128's elements' the 7 stages' the __syncthreads's
+// between's, the kDsv4Hadamard128Scale's at the store's the SAME point's
+// the host's form's the end's multiply's the bit-identical's the
+// per-element's fp32's).
+__device__ __forceinline__ void hadamard128_smem(float* v) {
+#pragma unroll
+  for (int h = 1; h < 128; h <<= 1) {
+    if (threadIdx.x < 64) {
+      const int p = threadIdx.x;
+      const int i0 = (p & (h - 1)) + (p / h) * (2 * h);
+      const float a = v[i0], b = v[i0 + h];
+      v[i0] = a + b;
+      v[i0 + h] = a - b;
+    }
+    __syncthreads();
+  }
+}
+// One block per (row, head): the bf16 -> fp32's the shared's (the exact's
+// upcast's), the butterfly's, the ONE bf16 rounding's at the out's (the
+// in-place's the smem's round-trip's the safe's — the q's the RoPE'd's
+// idx_q_'s the read's before's the write's the per-element's).
+__global__ void hadamard_rotate_kernel(const uint16_t* q, uint16_t* out) {
+  __shared__ float v[128];
+  const int64_t rh = blockIdx.x;  // (row, head)
+  const uint16_t* x = q + rh * kCsa2IndexDim;
+  uint16_t* y = out + rh * kCsa2IndexDim;
+  for (int i = threadIdx.x; i < kCsa2IndexDim; i += blockDim.x) v[i] = bf16_bits_to_float(x[i]);
+  __syncthreads();
+  hadamard128_smem(v);
+  __syncthreads();
+  for (int i = threadIdx.x; i < kCsa2IndexDim; i += blockDim.x)
+    y[i] = float_to_bf16_bits(v[i] * kDsv4Hadamard128Scale);
+}
+
 // ---- rotation ------------------------------------------------------------------------
 __global__ void rope_apply_kernel(uint16_t* x, int64_t row_stride, int64_t head_stride,
                                   int heads, int half, const int64_t* pos,
@@ -776,6 +840,20 @@ void csa2_rmsnorm_bf16(const void* x, int64_t x_stride, const void* w, void* y, 
   rmsnorm_kernel<<<unsigned(rows), kCsa2Threads, 0, stream>>>(
       static_cast<const uint16_t*>(x), x_stride, static_cast<const uint16_t*>(w),
       static_cast<uint16_t*>(y), y_stride, dim, eps);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
+void csa2_q_renorm_bf16(void* q, int rows, int heads, int dim, float eps, cudaStream_t stream) {
+  if (rows <= 0 || heads <= 0) return;
+  if (dim <= 0 || dim > 8192) throw std::invalid_argument("csa2_q_renorm_bf16: dim must be in [1, 8192]");
+  q_renorm_kernel<<<unsigned(int64_t(rows) * heads), kCsa2Threads, 0, stream>>>(static_cast<uint16_t*>(q), dim, eps);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
+void csa2_hadamard_rotate_bf16(const void* q, void* q_out, int rows, int heads, cudaStream_t stream) {
+  if (rows <= 0 || heads <= 0) return;
+  hadamard_rotate_kernel<<<unsigned(int64_t(rows) * heads), 128, 0, stream>>>(static_cast<const uint16_t*>(q),
+                                                                              static_cast<uint16_t*>(q_out));
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

@@ -882,6 +882,219 @@ DGPP_TEST(dsv4_csa2_planar_cache_geometry) {
   }
 }
 
+// ---- the per-head q re-normalization (the checkpoint's ad-hoc rescale, the
+// G-q-renorm's) — the contract's the CPU's pin's (the device's kernel's
+// csa2_q_renorm_bf16's the GPU's; the host's dsv4_q_renorm_scale's the
+// shared's host's + device's the formula's the driven's, no CUDA
+// initialization) -------------------------------------------------------
+DGPP_TEST(dsv4_q_renorm_contract) {
+  const int dim = dgpp::kCsa2Latent;  // 512 (the full head's: the 448's NoPE's + the 64's RoPE's)
+  const float eps = 1e-6f;  // the layer's norm_eps's (the reference's args.norm_eps's)
+  // A deterministic bf16 head (an O(1)'s magnitude's the LCG's).
+  std::vector<uint16_t> q(static_cast<size_t>(dim));
+  std::uint32_t s = 0x51AC;
+  auto next = [&]() {
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    return s;
+  };
+  double ss_d = 0.0;
+  float ss_f32 = 0.0f;  // the kernel's documented fp32 interior's (the sequential's
+                        // order's; the kernel's strided's + the block's reduction's
+                        // differ by the fp32 epsilon's the documented budget's).
+  for (int d = 0; d < dim; ++d) {
+    const float v = static_cast<float>(next() % 256) / 128.0f - 1.0f;  // -1.0..~0.996
+    q[static_cast<size_t>(d)] = float_to_bf16_bits(v);
+    const double x = bf16_to_d64(q[static_cast<size_t>(d)]);
+    ss_d += x * x;
+    ss_f32 += bf16_bits_to_float(q[static_cast<size_t>(d)]) * bf16_bits_to_float(q[static_cast<size_t>(d)]);
+  }
+  // The independent DOUBLE reference (the reference's formula's the
+  // `q *= rsqrt(mean(q^2) + eps)'s the per-head's the FULL's dim's mean's):
+  // the scale's + the out's.
+  const double scale_d = 1.0 / std::sqrt(ss_d / dim + eps);
+  // The kernel's documented contract (the fp32 interior's the ONE's bf16
+  // rounding's the end's): the scale's the shared's dsv4_q_renorm_scale's
+  // (the host's + device's the same's the formula's), the out's the bf16's
+  // the fp32's product's.
+  const float scale_f32 = dgpp::dsv4_q_renorm_scale(ss_f32, dim, eps);
+  for (int d = 0; d < dim; ++d) {
+    const float v = bf16_bits_to_float(q[static_cast<size_t>(d)]);
+    const uint16_t want_word = float_to_bf16_bits(v * scale_f32);
+    // The double reference's out's bf16-rounded (the reference's ONE's
+    // bf16 rounding's the documented's output's the class's).
+    const double out_d = bf16_to_d64(q[static_cast<size_t>(d)]) * scale_d;
+    const uint16_t want_d_word = float_to_bf16_bits(static_cast<float>(out_d));
+    const double got = bf16_to_d64(want_word);
+    const double want_d = bf16_to_d64(want_d_word);
+    const double mag = std::max({std::fabs(want_d), std::fabs(got), 1e-30});
+    // The fp32 interior's the double's the + the bf16 rounding's the
+    // budget's: a few's the bf16's ulp's (the 2^-9's the mantissa's
+    // the quantum's — the fp32's accumulation's order's the kernel's
+    // strided's the + the block's reduction's the difference's the
+    // documented's class's).
+    if (std::fabs(got - want_d) > mag / 64.0)
+      throw std::runtime_error("q renorm: the bf16 output diverged from the double reference at d=" +
+                               std::to_string(d) + " (want " + std::to_string(want_d) + ", got " + std::to_string(got) +
+                               ")");
+  }
+  // The fp32 scale's the double's within the fp32 budget's (the 512-term's
+  // sum's + the rsqrt's the documented class's).
+  {
+    const double mag = std::max({scale_d, static_cast<double>(scale_f32), 1e-30});
+    if (std::fabs(scale_f32 - scale_d) > mag * 1e-5)
+      throw std::runtime_error("q renorm: the fp32 scale diverged from the double beyond the fp32 budget (want " +
+                               std::to_string(scale_d) + ", got " + std::to_string(scale_f32) + ")");
+  }
+  // The FULL-head-dim's semantics' pin's (the mean's over all 512's, NOT
+  // the RoPE's 64's tail's only — the reference's mean(-1)'s the
+  // unflattened's head's): a head's the NoPE's 448's the 1.0's the RoPE's
+  // 64's the 0.0's -> the mean's 448/512's the scale's rsqrt(448/512 + eps)'s
+  // ≈ 1.069's (a RoPE-tail-only's the mean's 0.0's the scale's rsqrt(eps)'s
+  // 1000's the would's the wrong's).
+  {
+    const double mean_nope = 448.0 / 512.0;
+    const double want_scale = 1.0 / std::sqrt(mean_nope + eps);
+    const float got_scale = dgpp::dsv4_q_renorm_scale(448.0f, dim, eps);
+    if (std::fabs(got_scale - want_scale) > std::fabs(want_scale) * 1e-5)
+      throw std::runtime_error("q renorm: the full-dim mean is not the 512-dim mean (want " +
+                               std::to_string(want_scale) + ", got " + std::to_string(got_scale) + ")");
+  }
+  // The unit-RMS head's the no-op's (the bf16's rounding's): all 1.0's
+  // the mean's 1.0's the scale's rsqrt(1 + eps)'s ≈ 0.9999995's the bf16's
+  // 1.0's (the 0.9999995's within half the bf16's ulp's of 1.0's), so the
+  // renorm's the bit-identical's.
+  {
+    const float scale = dgpp::dsv4_q_renorm_scale(static_cast<float>(dim), dim, eps);  // ss = 512 (the 512's ones's)
+    const uint16_t in_w = float_to_bf16_bits(1.0f);
+    const uint16_t out_w = float_to_bf16_bits(bf16_bits_to_float(in_w) * scale);
+    if (out_w != in_w)
+      throw std::runtime_error("q renorm: the unit-RMS head is not the bit-identical no-op (got " +
+                               std::to_string(bf16_bits_to_float(out_w)) + ")");
+  }
+  // The zero head's edge (the padding's row's the zero's hidden's the
+  // GEMM's zero's out's): the ss's 0.0's the scale's rsqrt(eps)'s
+  // finite's the out's 0 * scale's 0.0's (the no NaN's).
+  {
+    const float scale = dgpp::dsv4_q_renorm_scale(0.0f, dim, eps);
+    if (!(scale > 0.0f) || std::isinf(scale))
+      throw std::runtime_error("q renorm: the zero head's scale is not finite positive (got " + std::to_string(scale) + ")");
+    const float out = bf16_bits_to_float(float_to_bf16_bits(0.0f * scale));
+    if (out != 0.0f)
+      throw std::runtime_error("q renorm: the zero head's output is not 0.0");
+  }
+}
+
+// ---- the 128-wide Hadamard rotation (the checkpoint's rotate_activation,
+// the G5's) — the butterfly's the CPU's pin's (the device's kernel's
+// csa2_hadamard_rotate_bf16's the GPU's; the host's dsv4_hadamard128's the
+// shared's host's + device's the butterfly's the driven's, no CUDA
+// initialization) -------------------------------------------------------
+DGPP_TEST(dsv4_indexer_hadamard_rotate) {
+  // The independent O(n^2) DOUBLE matrix reference (the Sylvester's H_128'
+  // the H_1's [1]'s the H_2n's the [H_n H_n; H_n -H_n]'s recursion's —
+  // a DIFFERENT construction's from the butterfly's the cross-check's).
+  std::vector<double> h(1, 1.0);
+  for (int n = 1; n < 128; n <<= 1) {
+    std::vector<double> h2(static_cast<size_t>(2 * n) * (2 * n));
+    for (int i = 0; i < 2 * n; ++i)
+      for (int j = 0; j < 2 * n; ++j) {
+        const double v = h[static_cast<size_t>(i % n) * n + (j % n)];
+        h2[static_cast<size_t>(i) * (2 * n) + j] = ((i / n) == 1 && (j / n) == 1) ? -v : v;
+      }
+    h.swap(h2);
+  }
+  if (h.size() != 128 * 128) throw std::runtime_error("the Sylvester H_128's matrix is mis-sized");
+  // A deterministic fp32 head (an O(1)'s magnitude's the LCG's).
+  std::vector<float> x(128);
+  std::uint32_t s = 0x0BAD;
+  auto next = [&]() {
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    return s;
+  };
+  for (int i = 0; i < 128; ++i) x[static_cast<size_t>(i)] = static_cast<float>(next() % 4096) / 1024.0f - 2.0f;
+  // The production's fp32 butterfly's (the host's form's the device's
+  // kernel's the smem's the SAME stage order's the same per-pair's
+  // arithmetic's the + the kDsv4Hadamard128Scale's the SAME point's).
+  std::vector<float> y(128);
+  dgpp::dsv4_hadamard128(x.data(), y.data());
+  // The O(n^2) double matrix's the y_d's H @ x * 128^-0.5's (the
+  // reference's hadamard_transform's the scale's the x.size(-1) ** -0.5's
+  // the orthonormal's).
+  const double scale_d = std::pow(128.0, -0.5);
+  double max_abs = 0.0;
+  for (int i = 0; i < 128; ++i) {
+    double acc = 0.0;
+    for (int j = 0; j < 128; ++j) acc += h[static_cast<size_t>(i) * 128 + j] * static_cast<double>(x[static_cast<size_t>(j)]);
+    const double want = acc * scale_d;
+    const double got = y[static_cast<size_t>(i)];
+    max_abs = std::max(max_abs, std::fabs(want));
+    // The fp32 butterfly's the double's within the fp32 budget's (the
+    // 127's additions' the 2^-24's the quantum's the documented's
+    // class's — the 1e-4's relative's the loose's the order-of-stage's
+    // corruption's the would's the O(1)'s the caught's).
+    if (std::fabs(got - want) > max_abs * 1e-4 + 1e-6)
+      throw std::runtime_error("hadamard: the fp32 butterfly diverged from the double matrix at i=" +
+                               std::to_string(i) + " (want " + std::to_string(want) + ", got " + std::to_string(got) +
+                               ")");
+  }
+  // The rotation's property's (the orthonormal's the H's the norm's
+  // preserving's — the reference's "spread information across dims"'s the
+  // norm's invariant's): the ||y||'s the ||x||'s (the independent's
+  // norm's the check's the element-wise's the different's path's).
+  double nx = 0.0, ny = 0.0;
+  for (int i = 0; i < 128; ++i) {
+    nx += static_cast<double>(x[static_cast<size_t>(i)]) * static_cast<double>(x[static_cast<size_t>(i)]);
+    ny += static_cast<double>(y[static_cast<size_t>(i)]) * static_cast<double>(y[static_cast<size_t>(i)]);
+  }
+  if (std::fabs(std::sqrt(ny) - std::sqrt(nx)) > std::sqrt(nx) * 1e-4)
+    throw std::runtime_error("hadamard: the rotation is not norm-preserving (||x|| " + std::to_string(std::sqrt(nx)) +
+                             ", ||y|| " + std::to_string(std::sqrt(ny)) + ")");
+  // The EXACT matrix's pin's (the Sylvester's characters' the
+  // H[i][j] = (-1)^popcount(i & j)'s — an INDEPENDENT closed form's from
+  // the recursion's + the butterfly's): the unit input's e_j's the
+  // rotated's the H's column j's the sign pattern's the / 128^-0.5's.
+  for (const int j : {0, 1, 2, 3, 64, 127}) {
+    std::vector<float> e(128, 0.0f);
+    e[static_cast<size_t>(j)] = 1.0f;
+    std::vector<float> ye(128);
+    dgpp::dsv4_hadamard128(e.data(), ye.data());
+    for (int i = 0; i < 128; i += 17) {  // a stride sample (the pattern's periodic's the 17's stride's the covers's)
+      const int pc = __builtin_popcount(static_cast<unsigned>(i & j));
+      const double want = (pc & 1) ? -scale_d : scale_d;
+      const double got = ye[static_cast<size_t>(i)];
+      // The unit input's the butterfly's the EXACT's in fp32's (the
+      // integer's sums' the 128's bound's the exact's), the ONE's fp32's
+      // rounding's the scale's multiply's — the double's within's the
+      // fp32's ulp's.
+      if (std::fabs(got - want) > std::fabs(want) * 1e-6 + 1e-9)
+        throw std::runtime_error("hadamard: the e_" + std::to_string(j) + "'s column sign pattern is wrong at i=" +
+                                 std::to_string(i) + " (want " + std::to_string(want) + ", got " + std::to_string(got) + ")");
+    }
+  }
+  // The bf16 kernel's contract's (the device's kernel's ONE's bf16
+  // rounding's the out's the float_to_bf16_bits's the v's the scale's
+  // product's — the host's the same's the form's the pin's): the bf16's
+  // word's the y's within's ONE's the bf16's ulp's the double's
+  // reference's (the fp32's interior's the budget's).
+  for (int i = 0; i < 128; i += 37) {
+    double acc = 0.0;
+    for (int j = 0; j < 128; ++j) acc += h[static_cast<size_t>(i) * 128 + j] * static_cast<double>(x[static_cast<size_t>(j)]);
+    const double want_d = acc * scale_d;
+    const uint16_t got_word = float_to_bf16_bits(y[static_cast<size_t>(i)]);
+    const uint16_t want_word = float_to_bf16_bits(static_cast<float>(want_d));
+    const double got = bf16_bits_to_float(got_word);
+    const double want = bf16_bits_to_float(want_word);
+    const double mag = std::max({std::fabs(got), std::fabs(want), 1e-30});
+    if (std::fabs(got - want) > mag / 128.0)
+      throw std::runtime_error("hadamard: the bf16-rounded output diverged from the double reference at i=" +
+                               std::to_string(i) + " (want " + std::to_string(want) + ", got " + std::to_string(got) + ")");
+  }
+}
+
 // ---- the decode select's tie-break (the dsv4_csa2_sortable_key's + the
 // dsv4_csa2_select_insert's — the real's layer code's, the CPU's
 // qualifiable's, no CUDA initialization) ------------------------------

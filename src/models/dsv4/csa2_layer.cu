@@ -305,6 +305,17 @@ void Dsv4Csa2Layer::project_q_kv(const void* hidden_in, int tokens, const int64_
                   tokens, stream);
   launch_scale_gemm_grid_bf16(qr_, size_t(cfg_.q_lora), w_.wq_b.payload, w_.wq_b.scales, q_, tokens, lh * kCsa2Latent,
                               cfg_.q_lora, stream, 0, 7, 7, cfg_.dense_mma);
+  // The per-head q re-normalization (the checkpoint's `q *='s the
+  // torch.rsqrt's the q.square()'s the mean(-1, keepdim)'s the + the
+  // eps's, ck:model.py:503-504 the csa2's the :775-776's the DSpark's —
+  // the G-q-renorm's gap's the closed's): the wq_b's out's (the unrotated's)
+  // the per-(row, head)'s the FULL's 512's dims' the rescale's, BEFORE
+  // the RoPE's (the reference's order's). The DSpark's union attention's
+  // q_latent's (the q_'s the q_latent()'s getter's the model's the
+  // dspark_'s union_attn's the real's input's) the pre-renormalized's
+  // (the union kernel's the caller's contract's, dspark_layer.cu's the
+  // "the wq_b's output's + the q-renorm's + the RoPE's"'s).
+  csa2_q_renorm_bf16(q_, tokens, lh, kCsa2Latent, cfg_.eps, stream);
   csa2_rope_apply(q_ + (kCsa2Latent - kCsa2Rope), int64_t(lh) * kCsa2Latent, kCsa2Latent, lh, kCsa2Rope, pos,
                   w_.inv_freq, false, tokens, stream);
 }
@@ -312,14 +323,23 @@ void Dsv4Csa2Layer::project_q_kv(const void* hidden_in, int tokens, const int64_
 void Dsv4Csa2Layer::indexer_query(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream) {
   const int heads = cfg_.index_heads;  // the V4's 64 (the NEW fold width)
   // The 64-head wq_b projection (the indexer.wq_b [8192, 1024] = 64 x
-  // 128 heads) -> the tail's rotation -> the fp8 quant -> the folded
-  // weights (the 64-head fold width the spec §2.1(d) flags as NEW — the
-  // shared csa2_index_q_quant takes the head count, the v4-owned select
-  // consumes the 64-head q_fp8 / w_folded).
+  // 128 heads) -> the tail's rotation -> the Hadamard's rotation (the
+  // checkpoint's rotate_activation's, the G5's gap's the closed's) ->
+  // the fp8 quant -> the folded weights (the 64-head fold width the spec
+  // §2.1(d) flags as NEW — the shared csa2_index_q_quant takes the head
+  // count, the v4-owned select consumes the 64-head q_fp8 / w_folded).
   launch_scale_gemm_grid_bf16(qr_, size_t(cfg_.q_lora), w_.idx_wq_b.payload, w_.idx_wq_b.scales, idx_q_, tokens,
                               heads * kCsa2IndexDim, cfg_.q_lora, stream, 0, 7, 7, cfg_.dense_mma);
   csa2_rope_apply(idx_q_ + (kCsa2IndexDim - kCsa2Rope), int64_t(heads) * kCsa2IndexDim, kCsa2IndexDim, heads,
                   kCsa2Rope, pos, w_.inv_freq, false, tokens, stream);
+  // The Hadamard rotation (the checkpoint's rotate_activation's, ck:
+  // model.py:420's the RoPE'd's before's the fp4's quant's the :422's —
+  // the G5's gap's the closed's): the FULL's 128's dims' the Sylvester's
+  // FWHT's the 128^-0.5's scale's (the fast_hadamard_transform's the
+  // reference's package's, the deterministic's the fixed's matrix's). The
+  // in-place's on's the idx_q_'s (the smem's staging's), the csa2_index_q_
+  // quant's the read's the rotated's the bf16's.
+  csa2_hadamard_rotate_bf16(idx_q_, idx_q_, tokens, heads, stream);
   csa2_index_q_quant(idx_q_, tokens, heads, q_fp8_, q_scale_, violations_, stream);
   gemm_.matmul(hidden_in, w_.idx_wp, iw_, tokens, heads, cfg_.hidden, DType::BF16, GemmOut::BF16,
                size_t(cfg_.hidden), gemm_ws_, gemm_ws_bytes_, stream);

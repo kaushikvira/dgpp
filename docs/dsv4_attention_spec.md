@@ -329,13 +329,19 @@ heads × 128 dim (`kCsa2IndexDim`), `indexer.wq_b` = `[8192, 1024]` fp8
    the layer's `inv_freq` table (`csa2_rope_apply`, the fp32 angle
    `pos * inv_freq[i]`, `cosf`/`sinf`, ONE bf16 rounding —
    `src/kernels/csa2.hpp:63-70`).
-3. **Quant** to e4m3 with one power-of-two row scale
+3. **Hadamard-rotate** the FULL 128-dim head (the `csa2_hadamard_rotate_bf16`,
+   the Sylvester FWHT + the 128^-0.5 scale — the checkpoint's
+   `rotate_activation`, ck:model.py:253-259, applied at the :420's the
+   RoPE'd's before's the quant's — the G5's gap's the closed's the
+   2026-09-20's q path's task's; the K side's the §5's note's the
+   separate's item's).
+4. **Quant** to e4m3 with one power-of-two row scale
    (`csa2_index_q_quant`, `src/kernels/csa2.hpp:131-141`): `q_fp8_`
    `[tokens * 64, 128]` e4m3 + `q_scale_` `[tokens * 64]` fp32,
    `S = 2^(k_max - 6)` (the row's largest block exponent). A block
    farther than 14 binades from the largest loses codes and is counted
    in `violations_` (read by `index_violations()`).
-4. **Fold the learned weights**: `iw_ = weights_proj(x)` (bf16
+5. **Fold the learned weights**: `iw_ = weights_proj(x)` (bf16
    `[tokens, 64]`, the `idx_wp` GEMM), then `csa2_fold_weights`
    (`src/kernels/csa2.hpp:150-153`):
    `w_folded[i] = (fp32(bf16 w[i]) * (1/64)) * q_scale[i]` — the
@@ -346,10 +352,13 @@ heads × 128 dim (`kCsa2IndexDim`), `indexer.wq_b` = `[8192, 1024]` fp8
 **Reference correspondence + deltas (GAP G5/G6):** the checkpoint's
 indexer q is `wq_b(qr)` → RoPE → **Hadamard `rotate_activation`** →
 in-place fp4 (e2m1 + e8m0/32) (ck:model.py:417-421, the
-`rotate_activation` at ck:model.py:253-259). The C++ drops the Hadamard
-rotation and re-expresses the fp4 as e4m3 + one fp32 row scale (a
-documented quant-class re-expression, the `violations` counter is the
-escape hatch). The reference's `weights` scaling is
+`rotate_activation` at ck:model.py:253-259). The C++ NOW applies the
+Hadamard rotation (the `csa2_hadamard_rotate_bf16`'s the `indexer_query`
+the RoPE'd's before's the quant's — the G5's gap's the closed's the
+2026-09-20's q path's task's) and re-expresses the fp4 as e4m3 + one
+fp32 row scale (a documented quant-class re-expression, the `violations`
+counter is the escape hatch; the G6's the separate's item's). The
+reference's `weights` scaling is
 `softmax_scale * n_heads^-0.5` = `128^-0.5 * 64^-0.5` (ck:model.py:425),
 exactly the 2^-6 the C++ folds in.
 
@@ -1108,21 +1117,56 @@ MIN's top-k's, or' the `(sortable << 21) | (2^21 - 1 - idx)`'s) to
 match's the pinned's reference's — the completion's (the GPU-gate's
 parity's gate's) verifies's.
 
-### G5 — the indexer's q-side's Hadamard's is DROPPED (the §2.1's flag's)
+### G5 — the indexer's q-side's Hadamard's is DROPPED (the §2.1's flag's) — RESOLVED (the 2026-09-20's q path's task's the q side's, the K side's the §5's note's)
 
 The checkpoint's indexer's q's: the `wq_b(qr)`'s → RoPE's → the
 Hadamard's `rotate_activation`'s (the randomized's Hadamard's
 rotation's the FP8's quant's before's, the ck:model.py:253-259's
 the `rotate_activation`'s, applied's at's the ck:model.py:420's) →
 the in-place's fp4's (the ck:model.py:421's). The C++'s
-`csa2_index_q_quant`'s (the `src/kernels/csa2.hpp:131-141`'s) DROPS'
-s the Hadamard's rotation's (the plain's e4m3's quant's over' the
-RoPE'd's q's). Unresolved: a documented's quant-class's re-
-expression's (the §2.1's delta's) — the `violations`'s counter's (
-the `index_violations()`'s, the `src/models/dsv4/csa2_layer.cu:
-247-251`'s) is the escape's hatch's (a block's farther's than' 14's
-binades's from's the largest's loses's codes's); the GPU parity
-gate's measures's the delta's.
+`csa2_index_q_quant`'s (the `src/kernels/csa2.hpp:131-141`'s) had
+DROPPED's the Hadamard's rotation's (the plain's e4m3's quant's over'
+the RoPE'd's q's).
+
+**RESOLVED (the 2026-09-20's q path's task's, the Q side's):** the
+`csa2_hadamard_rotate_bf16` kernel's (the `src/kernels/csa2.cu`'s the
+`hadamard_rotate_kernel`'s the shared's fp32's the `dsv4_hadamard128`
+the host's + device's the butterfly's, the `kernels/csa2.hpp`'s)
+is wired into's the `indexer_query`'s (the `src/models/dsv4/csa2_layer.
+cu`'s) between's the RoPE's and's the `csa2_index_q_quant`'s —
+EXACTLY's the reference's order's (the ck:model.py:419-422's the
+RoPE'd's the :419's the `rotate_activation`'s the :420's the
+`fp4_act_quant`'s the :422's). The rotation's the DETERMINISTIC's
+Sylvester's fast Walsh-Hadamard's (the unnormalized's H_128's the
++1/-1's the fixed's matrix's the 7 stages' the h = 1..64's), the
+checkpoint's `rotate_activation`'s (the `fast_hadamard_transform`'s
+`hadamard_transform(x, scale=x.size(-1) ** -0.5)`'s the ck:model.py:
+253-259's) — the NO per-head's seed's NO permutation's (the package's
+the standard's the butterfly's, the fixed's the matrix's), the 128's
+the power-of-two's the no padding's, the FULL's 128-dim head's (the
+64 NoPE's + the 64 RoPE's both's — the reference's rotate's the
+unflattened's head's, NOT the RoPE's 64's only's), scaled by 128^-0.5
+(the `kDsv4Hadamard128Scale`'s the orthonormal's the norm-preserving's),
+the fp32 interior's the ONE bf16 rounding's the out's. The CPU's
+oracle's the `dsv4_indexer_hadamard_rotate`'s (the `tests/unit/dsv4_csa2_
+oracle_test.cpp`'s) pins's the butterfly's against's the INDEPENDENT'
+s O(n^2) double's Sylvester matrix's + the norm-preserving's property's
++ the exact's sign pattern's the `(-1)^popcount(i & j)`'s the closed
+form's + the bf16 rounding's contract's. The kernel's the graph's
+capturable's (the plain's `<<< >>>`'s launch's, the no host's copy's).
+
+**The K side's (the §5's note's, the separate's item's):** the
+reference's indexer's K's the `Compressor`'s (the `rotate=True`'s the
+128-wide's indexer's compressor's, the ck:model.py:374-376's the
+`rotate_activation`'s + the fp4's) is NOT rotated's in's the C++'s
+`csa2_index_k_append`'s (the publish's path's, the `csa2_layer.cu`'s
+the `publish_entries`'s) — the K-side's Hadamard's is the
+compressor/publish's task's (the G3's class's the locked's out's), NOT
+the q path's. Until's the K side's is rotated's, the exact's
+(unquantized's) index logit's is q·Hk's not's q·k's (the q's the
+rotated's the k's the unrotated's the H's the orthogonal's) — the
+GPU's parity's gate's (the parent's validation's) measures's the
+end-to-end's delta's + settles's the K side's wiring's.
 
 ### G6 — the indexer's fp4's → e4m3's re-expression (the §2.1's flag's)
 
@@ -1164,7 +1208,7 @@ Unresolved: both's are documented's quant-class's tolerances's (not
 bit-exact's to's the reference's) — the GPU parity gate's the token'
 s gates' the acceptance's criterion's.
 
-### G-q-renorm — the ad-hoc q's re-normalization's is absent's from's the C++'s q path
+### G-q-renorm — the ad-hoc q's re-normalization's is absent's from's the C++'s q path — RESOLVED (the 2026-09-20's q path's task's)
 
 The reference's re-normalizes's each's head's q's vector's after's
 the `wq_b`'s: the `q *= torch.rsqrt(q.square().mean(-1, keepdim=True)
@@ -1172,16 +1216,38 @@ the `wq_b`'s: the `q *= torch.rsqrt(q.square().mean(-1, keepdim=True)
 py:775-776's the DSpark's — the §0.1's "the ad-hoc q re-
 normalization"'s). The C++'s csa2's `project_q_kv`'s (the
 `src/models/dsv4/csa2_layer.cu:253-272`'s: the `wq_a`'s GEMM's +
-the `q_norm`'s + the `wq_b`'s GEMM's + RoPE's) has NO per-head's
+the `q_norm`'s + the `wq_b`'s GEMM's + RoPE's) had NO per-head's
 rescale's — and the DSpark's union's kernel's expects' the q's latent'
 s PRE-renormalized's by's the caller's (the "the wq_b's output's +
 the q-renorm's + the RoPE's, the caller's"'s, the `src/models/dsv4/
 dspark_layer.cu:207-210`'s) — the current's model's stand-in's (the
-`src/models/dsv4/model.cpp:842-848`'s the csa2 seam's fill's) does
-NOT do's it's. Unresolved: the per-head's, per-row's logit's rescale'
-s is a real's numeric's delta's if's left's out's — the completion's
-must's add's it's (the csa2's q's path's + the DSpark's q's staging'
-s) or' document's the delta's.
+`src/models/dsv4/model.cpp:842-848`'s the csa2 seam's fill's) did
+NOT do's it's.
+
+**RESOLVED (the 2026-09-20's q path's task's):** the `csa2_q_renorm_bf16`
+kernel's (the `src/kernels/csa2.cu`'s `q_renorm_kernel`'s, the
+`src/kernels/csa2.hpp`'s the declaration's + the `dsv4_q_renorm_scale`
+the host's + device's the shared's formula's) is wired into's the
+`project_q_kv`'s (the `src/models/dsv4/csa2_layer.cu`'s) between's the
+`wq_b`'s GEMM's and's the RoPE's — exactly's where's the reference's
+applies's it's (the ck:model.py:504's the csa2's, the :776's the
+DSpark's). The C++'s DSpark's union attention's consumes's the csa2
+layer's `q_` (the `q_latent()`'s getter's the model's the
+`dspark_->union_attn`'s the real's input's), so the ONE insertion's
+covers BOTH's the csa2's q path's AND the DSpark's q staging's (the
+union kernel's the "pre-renormalized's by's the caller's"'s contract's
+the now's satisfied's). The rounding's the house's norm class's (the
+fp32's interior's the ONE's bf16 rounding's the end's — the
+`csa2_rmsnorm_bf16`'s the documented's class's; the reference's own's
+bf16's intermediate's roundings's the noise's level's, the fp32's
+interior's the higher's precision's). The CPU's oracle's the
+`dsv4_q_renorm_contract`'s (the `tests/unit/dsv4_csa2_oracle_test.
+cpp`'s) pins's the formula's against's the independent's DOUBLE's
+reference's + the full-512-dim's mean's semantics's + the unit-RMS's
+no-op's + the zero-row's edge's. The kernel's the graph's capturable's
+(the plain's `<<< >>>`'s launch's, the no host's copy's). The GPU's
+parity's gate's (the parent's validation's) measures's the
+end-to-end's delta's.
 
 ### G-union-wiring — the pool's / the raw ring's phases' still null's (the
 q / the block's wired's the 2026-09-20's S3's)
@@ -1244,15 +1310,17 @@ reachable's from's the model's yet's.
   item's (the prefill's the not's the required's, the ring's the decode's
   the append's the main walk's the every's token's).
 
-**The q's renorm's (the G-q-renorm's) still pending's:** the csa2's q
-path's + the DSpark's q staging's the ad-hoc's q re-normalization's (the
-`q *= rsqrt(q.square().mean(-1) + eps)`'s the ck:model.py:775-776's)
-the absent's (the csa2's `project_q_kv`'s the `csa2_layer.cu:253-272`'s
-the no per-head's rescale's, the DSpark's union's kernel's the q's the
+**The q's renorm's (the G-q-renorm's) RESOLVED's (the 2026-09-20's q
+path's task's):** the csa2's q path's + the DSpark's q staging's the
+ad-hoc's q re-normalization's (the `q *= rsqrt(q.square().mean(-1) +
+eps)`'s the ck:model.py:775-776's) the now's the `csa2_q_renorm_bf16`
+kernel's (the `src/kernels/csa2.cu`'s) the wired's into's the csa2's
+`project_q_kv`'s (the `csa2_layer.cu`'s) between's the `wq_b`'s GEMM's
++ the RoPE's — the DSpark's union's kernel's the q's the
 pre-renormalized's the caller's the `dspark_layer.cu:207-210`'s
-contract's, the model's the stand-in's the not's the done's the 2026-
-09-20's S3's the q's the csa2 q's the real's pointer's the passed's
-the renorm's the still's the absent's).
+contract's the satisfied's (the model's the csa2 q's the real's
+pointer's the passed's the renorm's the applied's). See the G-q-renorm'
+s entry's the RESOLVED's.
 
 ### G-cache-format — two physical formats's for's the C4A's compressed's entries
 
