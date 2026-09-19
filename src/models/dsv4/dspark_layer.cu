@@ -8,6 +8,7 @@
 
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
+#include "common/log.hpp"
 #include "kernels/latent_format.hpp"
 #include "kernels/scale_gemm.hpp"
 
@@ -89,10 +90,29 @@ bool Dsv4DsparkLayer::prepare(int rows) {
   if (rows <= 0 || rows > max_rows_) throw std::invalid_argument("dsv4 dspark layer: prepare rows out of range");
   // The main projection's GEMM plan (the fp8 grid's, the V4's 128 x 128's
   // F32-decoded e8m0 scales) + the lm head's.
-  bool ok = true;
-  ok &= gemm_.ensure_plan(rows, cfg_.hidden, int64_t(cfg_.num_targets) * cfg_.hidden, DType::BF16, GemmOut::BF16,
-                          size_t(cfg_.hidden));
-  ok &= gemm_.ensure_plan(rows, cfg_.lm_vocab_count, cfg_.hidden, DType::BF16, GemmOut::F32, size_t(cfg_.hidden));
+  const int main_k = int64_t(cfg_.num_targets) * cfg_.hidden;
+  const size_t main_stride = size_t(cfg_.hidden);
+  const bool main_ok = gemm_.ensure_plan(rows, cfg_.hidden, main_k, DType::BF16, GemmOut::BF16, main_stride);
+  const bool lm_ok =
+      gemm_.ensure_plan(rows, cfg_.lm_vocab_count, cfg_.hidden, DType::BF16, GemmOut::F32, size_t(cfg_.hidden));
+  const bool ok = main_ok && lm_ok;
+  // The plan shapes + which call's the false's (the once-per-prepare's —
+  // the no per-token / per-layer noise's): the INFO's the first success's
+  // per row count's (the mask's the dedupe's, the per-step's re-calls's
+  // the cache's hits's), the WARN's every failure's (the throw's the
+  // engine's, so at most a few's the lines's).
+  if (!ok) {
+    DGPP_LOG_WARN("dsv4 dspark prepare: rows={} plans unavailable — main-proj (m={} n={} k={} io=BF16 out=BF16 "
+                  "stride={}) ok={} + lm-head (m={} n={} k={} io=BF16 out=F32 stride={}) ok={}",
+                  rows, rows, cfg_.hidden, main_k, main_stride, main_ok ? "true" : "false", rows,
+                  cfg_.lm_vocab_count, cfg_.hidden, cfg_.hidden, lm_ok ? "true" : "false");
+  } else if (rows < 64 && (prepared_mask_ & (1ull << rows)) == 0) {
+    prepared_mask_ |= 1ull << rows;
+    DGPP_LOG_INFO("dsv4 dspark prepare: rows={} plans ready — main-proj (m={} n={} k={} io=BF16 out=BF16 "
+                  "stride={}) + lm-head (m={} n={} k={} io=BF16 out=F32 stride={})",
+                  rows, rows, cfg_.hidden, main_k, main_stride, rows, cfg_.lm_vocab_count, cfg_.hidden,
+                  cfg_.hidden);
+  }
   return ok;
 }
 

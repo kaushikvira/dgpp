@@ -117,6 +117,7 @@ class Dsv4DsparkLayer {
   size_t gemm_ws_bytes_ = 0;
   Dsv4DsparkWeights w_;
   int layer_ = 0;
+  uint64_t prepared_mask_ = 0;  // the prepare's INFO log's once-per-rows's dedupe's (the bit's the rows's, the < 64's)
   // The scratch's (the stream mean's out's, the block rows's, the
   // union attention's q staging's).
   uint8_t* scratch_ = nullptr;
