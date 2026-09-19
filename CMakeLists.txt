@@ -364,7 +364,8 @@ dgpp_set_common(dgpp_models_dsv4_loader)
 add_library(dgpp_models_dsv4_layers STATIC
   src/models/dsv4/csa2_layer.cu
   src/models/dsv4/dspark_layer.cu
-  src/models/dsv4/hash_layer.cu)
+  src/models/dsv4/hash_layer.cu
+  src/models/dsv4/compress.cu)
 target_include_directories(dgpp_models_dsv4_layers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dgpp_models_dsv4_layers PUBLIC dgpp_models_dsv4 dgpp_kernels dgpp_models_glm CUDA::cudart)
 dgpp_set_common(dgpp_models_dsv4_layers)
@@ -1346,6 +1347,21 @@ endforeach()
 # the real layer code's, the CPU-qualifiable's: the test calls only host
 # functions, no CUDA initialization, so it runs without a GPU).
 target_link_libraries(dsv4_csa2_oracle_test PRIVATE dgpp_models_dsv4_layers)
+
+# DeepSeek-V4-Flash ratio-4 (C4A) overlapping compressor's tail-ring update
+# (2026-09-18, the dsv4 dspark + compressor wiring; docs/dsv4_kernel_port_spec.md
+# §2.1(b)): the host-only, no-GPU naive references that pin the numerics of the
+# per-request fp32 [2, W] tail's update (the dsv41 csa2_compress_decode_update's
+# V4 re-expression, the even-stash / odd-pool, the pair-pooling + the one-
+# rounding RMSNorm, the entries' p / 2's) — the [2, W] layout on a small
+# synthetic shape, so the Phase B v4 forward path (src/models/dsv4/compress.cu's
+# dsv4_compress_tail_update) has a host-side oracle before any GPU consumes the
+# tail (house rule: every adapted op is oracle-qualified on CPU before consumption).
+add_executable(dsv4_compress_tail_test tests/unit/dsv4_compress_tail_test.cpp)
+target_include_directories(dsv4_compress_tail_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+dgpp_set_common(dsv4_compress_tail_test)
+add_test(NAME dsv4_compress_tail_test COMMAND dsv4_compress_tail_test)
+set_tests_properties(dsv4_compress_tail_test PROPERTIES LABELS "host")
 
 # mHC module parity (M4): compute/update/final-mean kernels vs the double
 # oracle; real geometry, edge cases, determinism.

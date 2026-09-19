@@ -10,6 +10,7 @@
 #include "common/log.hpp"
 #include "kernels/csa2.hpp"
 #include "kernels/glm_norm.hpp"
+#include "kernels/glm_spec.hpp"
 #include "kernels/kernels.hpp"
 #include "kernels/scale_gemm.hpp"
 
@@ -214,6 +215,18 @@ Dsv4Model::Dsv4Model(const Dsv4TextConfig& cfg, const std::string& checkpoint_di
       Dsv4Csa2Layer::scratch_bytes(csa2_cfg_, max_tokens_, max_cache_tokens_,
                                   std::min(kDecodeRowsCap, max_tokens_), kDecodeSplit, kDotBudget);
   csa2_scratch_ = dev_alloc<char>(csa2_scratch_bytes_);
+  // The ratio-4 (C4A) overlapping compressor's per-request tails (2026-09-18,
+  // the dsv4 dspark + compressor wiring; docs/dsv4_kernel_port_spec.md
+  // §2.1(b)): fp32 [tails_][max_requests][2][tails_w_] (the pending even's
+  // kv (the first W) + the score (the second W), the dsv41
+  // csa2_compress_decode_update's re-expression) + the spec rows' tails (the
+  // rollback's the table's the spec_rows_').
+  if (tails_ > 0) {
+    const size_t per_req = static_cast<size_t>(tails_) * 2 * static_cast<size_t>(tails_w_);
+    d_tails_ = dev_alloc<float>(per_req * static_cast<size_t>(max_requests));
+    spec_tails_ = dev_alloc<float>(per_req * static_cast<size_t>(max_decode_rows_));
+    log_memory_ledger("dsv4: the compressor's per-request tails");
+  }
   hash_scratch_bytes_ = hash_scratch_bytes(cfg_, tp_world, max_tokens_);
   hash_scratch_ = dev_alloc<char>(hash_scratch_bytes_);
   log_memory_ledger("dsv4: scratch");
@@ -240,6 +253,16 @@ Dsv4Model::Dsv4Model(const Dsv4TextConfig& cfg, const std::string& checkpoint_di
     dspark_cfg_ = dspark_config(cfg_, targets_, lm_vocab_begin_, lm_vocab_count_);
     dspark_scratch_bytes_ = dspark_scratch_bytes(cfg_, lm_vocab_count_, max_decode_rows_);
     dspark_scratch_ = dev_alloc<char>(dspark_scratch_bytes_);
+    // The DSpark union attention's staging (the 512-dim's the dsv4 DSpark's
+    // kHeadDim's): the q latent's [max_decode_rows] + the in-memory block's kv's
+    // [block_size] + the out latent's [max_decode_rows] (the csa2 projection's
+    // outputs' the csa2 seam's the parallel agent's the csa2 partial fills's
+    // until the wiring's complete's).
+    const size_t head_dim = 512;  // the dsv4 DSpark's kHeadDim's (the 448 NoPE + 64 RoPE's)
+    const size_t uq = static_cast<size_t>(head_dim) * static_cast<size_t>(max_decode_rows_);
+    const size_t ub = static_cast<size_t>(head_dim) * static_cast<size_t>(cfg_.dspark_block_size);
+    union_attn_scratch_bytes_ = (uq + ub + uq) * sizeof(uint16_t);
+    union_attn_scratch_ = dev_alloc<char>(union_attn_scratch_bytes_);
     dspark_ = std::make_unique<Dsv4DsparkLayer>(gemm_, dspark_cfg_, max_decode_rows_, dspark_scratch_,
                                                  dspark_scratch_bytes_, gemm_ws_, gemm_ws_bytes_);
   }
@@ -331,6 +354,9 @@ Dsv4Model::~Dsv4Model() {
   cudaFree(csa2_scratch_);
   cudaFree(hash_scratch_);
   cudaFree(dspark_scratch_);
+  cudaFree(union_attn_scratch_);
+  cudaFree(d_tails_);
+  cudaFree(spec_tails_);
   cudaFree(inv_freq_window_);
   cudaFree(inv_freq_compressed_);
   cudaFree(streams_a_);
@@ -436,12 +462,74 @@ Dsv4Model::MemoryPlan Dsv4Model::plan_memory(const Dsv4TextConfig& cfg, int max_
   return plan;
 }
 
-size_t Dsv4Model::session_snapshot_bytes(const Dsv4TextConfig&, int, bool) {
-  // No paged pool, no engram: the snapshots hold no per-request state.
-  return 0;
+size_t Dsv4Model::session_snapshot_bytes(const Dsv4TextConfig& cfg, int, bool) {
+  // The ratio-4 (C4A) overlapping compressor's per-request tails (2026-09-18,
+  // the dsv4 dspark + compressor wiring; the dsv41 csa2_compress_decode_update's
+  // re-expression, the fp32 [2, 512]'s): the pending even's kv (the first 512)
+  // + the score (the second 512). The positional rings (the layer scratch's,
+  // the slot's the position's) need no snapshot (a rejected draft's slot is
+  // never read by a later query), so the tails are the only per-request state.
+  size_t tails = 0;
+  for (int l = 0; l < cfg.num_hidden_layers; ++l)
+    if (cfg.is_index_layer(l)) ++tails;
+  return tails * 2 * 512 * sizeof(float);
 }
 
-size_t Dsv4Model::snapshot_state_bytes() const { return 0; }
+size_t Dsv4Model::snapshot_state_bytes() const {
+  return static_cast<size_t>(tails_) * 2 * static_cast<size_t>(tails_w_) * sizeof(float);
+}
+
+void Dsv4Model::reset_slot_state(int req) {
+  if (d_tails_ == nullptr) return;  // no ratio-4 (C4A) layers: no per-request tails
+  const size_t tail_stride = static_cast<size_t>(max_requests_) * 2 * static_cast<size_t>(tails_w_);
+  const size_t per_req = 2 * static_cast<size_t>(tails_w_);
+  for (int t = 0; t < tails_; ++t)
+    DGPP_CUDA_OK(cudaMemsetAsync(d_tails_ + t * tail_stride + static_cast<size_t>(req) * per_req, 0,
+                                 per_req * sizeof(float), stream_));
+}
+
+GlmSpecSegments Dsv4Model::spec_segments(int req, int snapshot_row0) const {
+  GlmSpecSegments segs;
+  if (d_tails_ == nullptr) return segs;  // no ratio-4 (C4A) layers: no per-request tails
+  const auto add = [&](void* dst, const void* snapshots, size_t row_stride, size_t bytes) {
+    if (segs.count >= kSpecMaxSegments) throw std::logic_error("spec_segments: too many state families");
+    segs.seg[segs.count++] = GlmSpecSegment{dst, snapshots, row_stride, bytes};
+  };
+  const size_t per_req = 2 * static_cast<size_t>(tails_w_);
+  const size_t tail_stride = static_cast<size_t>(max_requests_) * per_req;
+  const size_t spec_tail_stride = static_cast<size_t>(max_decode_rows_) * per_req;
+  for (int t = 0; t < tails_; ++t)
+    add(d_tails_ + t * tail_stride + static_cast<size_t>(req) * per_req,
+        spec_tails_ + t * spec_tail_stride + static_cast<size_t>(snapshot_row0) * per_req, per_req * sizeof(float),
+        per_req * sizeof(float));
+  return segs;
+}
+
+void Dsv4Model::write_state_snapshot(int req, uint8_t* d, int spec_row) {
+  if (d_tails_ == nullptr) return;
+  const bool live = spec_row < 0;
+  const size_t row = live ? 0 : static_cast<size_t>(spec_row);
+  const size_t per_req = 2 * static_cast<size_t>(tails_w_);
+  const size_t tail_stride = static_cast<size_t>(max_requests_) * per_req;
+  const size_t spec_tail_stride = static_cast<size_t>(max_decode_rows_) * per_req;
+  for (int t = 0; t < tails_; ++t) {
+    const float* src = live ? d_tails_ + t * tail_stride + static_cast<size_t>(req) * per_req
+                            : spec_tails_ + t * spec_tail_stride + row * per_req;
+    DGPP_CUDA_OK(cudaMemcpyAsync(d, src, per_req * sizeof(float), cudaMemcpyDeviceToDevice, stream_));
+    d += per_req * sizeof(float);
+  }
+}
+
+void Dsv4Model::read_state_snapshot(int req, const uint8_t* s) {
+  if (d_tails_ == nullptr) return;
+  const size_t per_req = 2 * static_cast<size_t>(tails_w_);
+  const size_t tail_stride = static_cast<size_t>(max_requests_) * per_req;
+  for (int t = 0; t < tails_; ++t) {
+    DGPP_CUDA_OK(cudaMemcpyAsync(d_tails_ + t * tail_stride + static_cast<size_t>(req) * per_req, s,
+                                 per_req * sizeof(float), cudaMemcpyDeviceToDevice, stream_));
+    s += per_req * sizeof(float);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Views and layer objects.
@@ -533,17 +621,14 @@ const Dsv4DraftResident& Dsv4Model::draft_stage(int stage) {
 }
 
 // ---------------------------------------------------------------------------
-// The session core's state hooks (no pool, no engram: the attention's
-// state is positional, so the snapshots hold nothing per request).
+// The session core's state hooks (the ratio-4 (C4A) overlapping compressor's
+// per-request tails' the snapshots' the 2026-09-18's the dsv4 dspark +
+// compressor wiring's): the attention's state is positional (the window ring's
+// the layer scratch's, the slot's the position's, a rejected draft's slot is
+// never read by a later query), so the tails are the only per-request state
+// (the reset_slot_state's zero's, the spec segments' the rollback's the
+// table's, the write / read's the snapshot's the copy's).
 // ---------------------------------------------------------------------------
-void Dsv4Model::reset_slot_state(int) {}
-
-GlmSpecSegments Dsv4Model::spec_segments(int, int) const { return {}; }
-
-void Dsv4Model::write_state_snapshot(int, uint8_t*, int) {}
-
-void Dsv4Model::read_state_snapshot(int, const uint8_t*) {}
-
 void Dsv4Model::graph_prepare() {
   if (loader_.residency() != Dsv4Residency::Resident)
     throw std::logic_error("session_graph_prepare: the decode graph needs a resident stack");
@@ -753,6 +838,22 @@ void Dsv4Model::enqueue_layer(const Dsv4LayerResident& r, int layer, int T, cons
   // index cache's the e4m3 codes' + the fp32 scale's the two arrays's).
   csa2_->enqueue_decode(x_, nullptr, nullptr, nullptr, rows.req_ids, rows.pos, rows.spans, rows.num_requests, T, attn_out,
                        stream_, nullptr);
+  // The DSpark union attention (2026-09-18, the dsv4 dspark + compressor
+  // wiring; the dsv4_dspark_union_attn's the 3-phase's single softmax's over
+  // [compressed | raw ring | block]'s): the draft stages' (43/44/45's)
+  // SWA-only's attention (the no-compressed-phase's, the no-raw-ring's, the
+  // in-memory block's). The q latent's + the block kv's stand in the csa2
+  // seam's (the parallel agent's the csa2 partial fills's) until the wiring's
+  // complete's (the csa2 projection's the 512-dim's latent's the csa2 layer's
+  // the private's, the model's staging's the csa2 seam's the fill's).
+  if (layer >= cfg_.num_hidden_layers && dspark_ != nullptr && union_attn_scratch_ != nullptr) {
+    const size_t head_dim = 512;  // the dsv4 DSpark's kHeadDim's (the 448 NoPE + 64 RoPE's)
+    uint16_t* q_latent = static_cast<uint16_t*>(union_attn_scratch_);
+    uint16_t* block_kv = q_latent + head_dim * max_decode_rows_;
+    uint16_t* out_latent = block_kv + head_dim * cfg_.dspark_block_size;
+    dspark_->union_attn(q_latent, nullptr, nullptr, 0, nullptr, 0, block_kv, cfg_.dspark_block_size, out_latent, T,
+                        stream_);
+  }
   fold(attn_out, T, H, rows.capture);  // block boundary 1: wo_b's partial
   stream_update(attn_out, T);
   // ---- the MoE site ------------------------------------------------------------
