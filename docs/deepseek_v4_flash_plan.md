@@ -261,3 +261,47 @@ either fixed or explicitly justified before the parity gate can pass:
 - Open-by-design (no code owed yet, needed only if the model must serve them):
   `G-tail-cadence`, `G-tail-pool`, `G-tail-ape`, `G-tail-prefill`,
   `G-c128a-compressor`, `G3`, `G-cache-format`.
+
+## The 2026-09-19 GPU window: two blockers, both now diagnosed
+
+The seam work landed and the merged tree is green (25 CPU tests across six
+suites), but the window found that **dsv4 does not serve yet**. Two distinct,
+reproducible blockers, with the evidence:
+
+1. **The direct/smoke shape streams the model off disk inside prefill.**
+   `scripts/dsv4_gates.sh smoke` launches world 1 / kv 8192; the log shows
+   `model constructed in 6.6s (streaming, ...)` and NO resident-image line,
+   because the resident image is keyed to the world-2 / kv-262144 shape
+   (`~/.cache/dgpp/resident/5c67fe8d85a3cf87.img`, 83 GB — the one the Sept-18
+   run used: `46/46 layers present, direct I/O`, `constructed in 13.9s
+   (resident, ...)`). Without the image, the loader pulls MoE layers off disk
+   from `prefill_chunk`, so a 7-token prompt produced ZERO tokens in 10
+   minutes and the gate's curl gave up (`HTTP 000`). Confirmed by a stack dump
+   of the hung process: `load_mxfp4_rows` <- `build_moe` <- `run_rows` <-
+   `prefill_chunk` <- `admit` (it was streaming, not deadlocked). Not a
+   numerics finding — the smoke gate's launch shape is wrong.
+2. **The world-2 / MTP shape fails at the DSpark draft.** With the real
+   deployment shape (`config/dgpp-dsv4-w2.json`, world 2, kv 262144, MTP on)
+   the boot gets all the way through the resident load, the fabric and the
+   graph engine, then dies: `ERROR serve: mtp_run_rows: DSpark plans
+   unavailable` (`src/models/dsv4/model.cpp:805`) — i.e.
+   `Dsv4DsparkLayer::prepare(rows)` returned false, which means one of its two
+   `gemm_.ensure_plan` calls (`dspark_layer.cu:88-97`) has no plan for the
+   shape. Rank 0 never became ready. This path was never exercised before (the
+   Sept-18 run died earlier, at the csa2 OOB), so it is a pre-existing gap that
+   the seam work merely reached.
+
+Two toolkit defects found and one fixed in the same window:
+- **FIXED** (`5b8e98b`): `gpu_quiet()` used `pgrep -f 'dgpp-serve'`, which
+  matched any unrelated shell whose command line merely mentioned the binary
+  (an `ls build/dgpp-serve` was enough) — the smoke/parity/tps gates could
+  refuse to run with a false "GPU is NOT quiet".
+- **OPEN**: the runner's `fabric` smoke mode calls `dgpp-cluster up` with no
+  `--bin`, so it launches whatever the config/site pins — the master release,
+  which contains no dsv4 model at all. A dsv4-fabric gate must be handed the
+  dsv4-flash binary explicitly (that is what the manual window run did).
+
+Next window, in order: (a) give the smoke gate a resident-image-matching shape
+(or promote the shape into the image key), (b) diagnose the missing DSpark
+`ensure_plan` shapes, (c) only then the parity/sanitizer/tps/reference gates —
+the reference gate's degraded path still has not run end to end.
