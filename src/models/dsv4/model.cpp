@@ -619,6 +619,11 @@ size_t Dsv4Model::snapshot_state_bytes() const {
   return bytes;
 }
 
+void Dsv4Model::init_layer_dump() {
+  dump_ = Dsv4LayerDump::from_env(tp_rank(), world_, cfg_.num_hidden_layers, cfg_.hidden_size, lm_vocab_begin_,
+                                  lm_vocab_count_);
+}
+
 void Dsv4Model::reset_slot_state(int req) {
   if (d_tails_ == nullptr) return;  // no compressing layers: no per-request tails
   // The reference's init (the kv_state's zero's + the score_state's the
@@ -1129,9 +1134,28 @@ Dsv4Model::Outputs Dsv4Model::run_rows(const RowRun& run) {
   rows.pos0 = run.pos0;
   rows.decode = run.decode;
   rows.capture = run.capture;
+  // The debug per-layer dump (DGPP_DSV4_DUMP_LAYERS; the doc's
+  // layer_dump.hpp's): the prefill pass that ends the prompt (the
+  // last_chunk's) dumps the layer-exit mHC collapse (the exact quantity
+  // the next layer's attention site / the final norm consumes — the
+  // head's collapse's the same call's) after every layer, and the
+  // final logits' top-20's at the head's. The collapse's the
+  // post-fold's streams' + the replicated's mHC coefficients' (the
+  // boundary's output's), so the dumped's vector's the full's
+  // post-collective's hidden's (bitwise's every rank's, read rank 0's;
+  // the logits' slice's per rank's the sharded's head's). Never the
+  // capture's (the D2H's copies' must stay out of the graph's — the
+  // serve app's the decode_graph's the refuse's) nor the decode's rows's.
+  const bool dump_pass = dump_.active() && !rows.capture && !rows.decode && run.last_chunk;
+  if (dump_pass) dump_.begin_pass(run.ids, T, run.pos0);
   for (int layer = 0; layer < cfg_.num_hidden_layers; ++layer) {
     const Dsv4LayerResident& r = loader_.load_layer(layer);
     enqueue_layer(r, layer, T, rows);
+    if (dump_pass) {
+      launch_mhc_collapse_normed(cur_, pre_cur_, nullptr, cfg_.rms_norm_eps, collapsed_, nullptr, mhc_cfg_, T,
+                                 stream_);
+      dump_.write_layer(layer, collapsed_ + static_cast<size_t>(T - 1) * H, stream_);
+    }
   }
   // The head: the weighted collapse with the last site's pre, the final
   // norm, the lm head on every walked row.
@@ -1139,6 +1163,10 @@ Dsv4Model::Outputs Dsv4Model::run_rows(const RowRun& run) {
   csa2_rmsnorm_bf16(collapsed_, H, globals_.final_norm, h_, H, T, H, cfg_.rms_norm_eps, stream_);
   gemm_.matmul(h_, globals_.lm_head, logits_, T, lm_vocab_count_, H, DType::BF16, GemmOut::F32,
                static_cast<size_t>(H), gemm_ws_, gemm_ws_bytes_, stream_);
+  if (dump_pass) {
+    dump_.write_logits_top(logits_ + static_cast<size_t>(T - 1) * lm_vocab_count_, stream_);
+    dump_.write_meta();
+  }
   // DSpark: the last rows' target hidden into the slots' windows by
   // position (the draft gathers its accepted rows' from there); a
   // prefill's walked rows are the draft's rows (mtp_run_rows).

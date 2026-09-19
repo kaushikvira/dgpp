@@ -681,6 +681,21 @@ struct Dsv4Family final : ServeFamily {
         fabric ? dgpp::Dsv4Residency::Resident : dgpp::Dsv4Residency::Streaming, reducer, fabric ? rank : 0,
         fabric ? world_ : 1, slots, fabric && mtp, decode_rows);
   }
+  // The debug per-layer dump (DGPP_DSV4_DUMP_LAYERS; the doc's
+  // models/dsv4/layer_dump.hpp's): its device->host copies must never
+  // land inside a captured decode graph, so the decode_graph's on's
+  // refuses to activate's (the clear's WARN's the doc's the docstring's).
+  void apply_layer_dump(bool decode_graph) {
+    if (decode_graph) {
+      if (std::getenv("DGPP_DSV4_DUMP_LAYERS") != nullptr)
+        DGPP_LOG_WARN(
+            "dsv4 layer dump: DGPP_DSV4_DUMP_LAYERS is set but decode_graph is on — the dump's "
+            "device->host copies must stay out of the captured decode graph; refusing to activate "
+            "(run with decode_graph: false to enable the dump)");
+      return;
+    }
+    model->init_layer_dump();
+  }
   void destroy_model() override { model.reset(); }
   size_t model_snapshot_bytes() const override { return model ? model->session_snapshot_bytes() : 0; }
   std::unique_ptr<ServeGraphEngine> make_graph_engine(
@@ -1918,6 +1933,11 @@ int main(int argc, char** argv) {
         dgpp::log_memory_ledger(std::format("rank {} after the bus", rank));
         family->build_model(model_reducer, rank, world, /*fabric=*/true, forward_rows, pool_tokens,
                             max_concurrency, mtp, decode_rows);
+        // The dsv4 debug per-layer dump (DGPP_DSV4_DUMP_LAYERS): its
+        // device->host copies must stay out of the captured decode graph,
+        // so the decode_graph's on's refuses to activate's (the WARN's).
+        if (std::string(family->name()) == "deepseek_v4")
+          static_cast<Dsv4Family*>(family.get())->apply_layer_dump(decode_graph);
         dgpp::log_memory_ledger(std::format("rank {} after the model", rank));
         DGPP_LOG_INFO(
             "rank {}: model constructed in {:.1f}s (resident, {} request "
@@ -2120,6 +2140,10 @@ int main(int argc, char** argv) {
     const auto t_model = std::chrono::steady_clock::now();
     family->build_model(/*reducer=*/nullptr, /*rank=*/0, /*world=*/1, /*fabric=*/false, forward_rows,
                         pool_tokens, max_concurrency, /*mtp=*/false, decode_rows);
+    // The dsv4 debug per-layer dump (DGPP_DSV4_DUMP_LAYERS): the same
+    // decode_graph's the refuse's gate's the fabric's path's.
+    if (std::string(family->name()) == "deepseek_v4")
+      static_cast<Dsv4Family*>(family.get())->apply_layer_dump(decode_graph);
     DGPP_LOG_INFO(
         "serve: model constructed in {:.1f}s (streaming, {} request slots, "
         "{}-token pool in {}, {}-row forwards)",
