@@ -362,8 +362,8 @@ std::string text_completion_body(const std::string& id, int64_t created,
 // The model object, with the served surfaces as extensions: the sampling
 // defaults (what an omitted field becomes), whether stochastic requests
 // are executable on this engine at all, and the tool/reasoning surface.
-std::string model_object(const std::string& model_id, int64_t created,
-                         bool sampling_available,
+std::string model_object(const ServiceConfig& scfg, const std::string& model_id,
+                         int64_t created, bool sampling_available,
                          const sample::Params& d, bool tools_available,
                          bool constraints_available,
                          bool reasoning_in_content, const ModelFrontend& frontend, bool images_available) {
@@ -413,7 +413,60 @@ std::string model_object(const std::string& model_id, int64_t created,
   out += '}';
   out.append("},\"input_modalities\":[\"text\"");
   if (images_available) out.append(",\"image\"");
-  out.append("]}");
+  out.append("]");
+  // The rope ramp in force, under the names the deployment JSON uses, so
+  // what an operator set is what a client reads, plus the three values the
+  // ramp derives (the attention scale, the correction band, the ceiling it
+  // reaches). Absent when the knob is off — the plain rope needs no
+  // advertising, and a client that reads it must treat it as off.
+  if (scfg.rope_scaling) {
+    const dgpp::RopeScaling& rs = *scfg.rope_scaling;
+    out.append(",\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":");
+    append_json_float(&out, rs.factor);
+    out.append(",\"original_max_position_embeddings\":");
+    append_json_int(&out, rs.original_max_position_embeddings);
+    out.append(",\"beta_fast\":");
+    append_json_float(&out, rs.beta_fast);
+    out.append(",\"beta_slow\":");
+    append_json_float(&out, rs.beta_slow);
+    out.append(",\"attn_factor\":");
+    append_json_float(&out, rs.attn_factor);
+    out.append(",\"mrope_cache_factor\":");
+    append_json_float(&out, rs.mrope_cache_factor);
+    out.append(",\"mscale\":");
+    append_json_float(&out, rs.mscale());
+    out.append(",\"correction_max_position_embeddings\":");
+    append_json_int(&out, rs.correction_max_position());
+    out.append(",\"scaled_max_position_embeddings\":");
+    append_json_int(&out, rs.context_limit());
+    out.push_back('}');
+  }
+  // The effective request context limit (review item 7): the MINIMUM of the
+  // positional ceiling and the K/V pool, with both bounds beside it. A pool
+  // past the ceiling seats concurrency, not a longer request, and a ceiling
+  // past the pool asks for tokens the process never allocated — the two
+  // numbers together are the honest answer, which is why all three ride the
+  // response (docs/qwen_yarn_release_check.md reads them first).
+  if (scfg.position_ceiling > 0 || scfg.kv_pool_tokens > 0) {
+    const int64_t limit = scfg.position_ceiling > 0 && scfg.kv_pool_tokens > 0
+                              ? std::min(scfg.position_ceiling, scfg.kv_pool_tokens)
+                              : std::max(scfg.position_ceiling, scfg.kv_pool_tokens);
+    out.append(",\"context\":{\"request_limit_tokens\":");
+    append_json_int(&out, limit);
+    out.append(",\"position_ceiling_tokens\":");
+    if (scfg.position_ceiling > 0) append_json_int(&out, scfg.position_ceiling);
+    else out.append("null");  // the family states no ceiling of its own
+    out.append(",\"kv_pool_tokens\":");
+    if (scfg.kv_pool_tokens > 0) append_json_int(&out, scfg.kv_pool_tokens);
+    else out.append("null");
+    out.append(",\"limited_by\":");
+    append_json_string(
+        &out, scfg.position_ceiling > 0 && scfg.kv_pool_tokens > 0
+                  ? (scfg.position_ceiling <= scfg.kv_pool_tokens ? "position-ceiling" : "kv-pool")
+                  : (scfg.position_ceiling > 0 ? "position-ceiling" : "kv-pool"));
+    out.push_back('}');
+  }
+  out.push_back('}');
   return out;
 }
 
@@ -1569,6 +1622,8 @@ void GenerationService::handle(const HttpRequest& req,
 }
 
 void GenerationService::route_health(HttpResponseWriter& w) const {
+  // /health keeps the checkpoint id (as do the completion records); only
+  // /v1/models reports the display alias (served_model_name, when set).
   std::string failure;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1717,10 +1772,10 @@ void GenerationService::route_chat_completions(const HttpRequest& req,
                   "invalid_request_error", "model");
     return;
   }
-  if (model->as_string() != cfg_.model_id) {
+  if (!cfg_.model_matches(model->as_string())) {
     respond_error(w, 404, "the model '" + std::string(model->as_string()) +
                               "' does not exist on this server (serving '" +
-                              cfg_.model_id + "')",
+                              cfg_.display_model_id() + "')",
                   "invalid_request_error", "model", "model_not_found");
     return;
   }
@@ -1877,6 +1932,8 @@ void GenerationService::route_chat_completions(const HttpRequest& req,
     record->choice = choice;
     record->group = group;
     record->call_seed = tag ^ (static_cast<uint64_t>(choice) << 48);
+    // The record keeps the checkpoint id (as does /health); /v1/models
+    // reports the display alias (served_model_name, when set).
     record->model = cfg_.model_id;
     record->created_unix = created;
     record->chat = true;
@@ -1903,7 +1960,7 @@ void GenerationService::route_chat_completions(const HttpRequest& req,
     SchedulerRequest sr;
     sr.id = record->sched_id;
     sr.boundaries = boundaries;
-    sr.no_cache = !prefix_cache || !images.empty();
+    sr.no_cache = !prefix_cache;
     sr.images = images;
     sr.prompt = prompt;
     sr.max_steps = steps;
@@ -1945,9 +2002,10 @@ void GenerationService::route_completions(const HttpRequest& req,
                   "invalid_request_error", "model");
     return;
   }
-  if (model->as_string() != cfg_.model_id) {
+  if (!cfg_.model_matches(model->as_string())) {
     respond_error(w, 404, "the model '" + std::string(model->as_string()) +
-                              "' does not exist on this server",
+                              "' does not exist on this server (serving '" +
+                              cfg_.display_model_id() + "')",
                   "invalid_request_error", "model", "model_not_found");
     return;
   }
@@ -2051,6 +2109,8 @@ void GenerationService::route_completions(const HttpRequest& req,
   record->group->choices.resize(1);
   record->call_seed = record->tag;
   record->stop.stops = stops;
+  // The record keeps the checkpoint id (as does /health); /v1/models
+  // reports the display alias (served_model_name, when set).
   record->model = cfg_.model_id;
   record->created_unix = std::time(nullptr);
   record->chat = false;
@@ -2086,7 +2146,7 @@ void GenerationService::route_models(const HttpRequest& req,
   if (req.path == "/v1/models") {
     w.respond(200, "application/json",
               "{\"object\":\"list\",\"data\":[" +
-                  model_object(cfg_.model_id, created, sampling_available_,
+                  model_object(cfg_, cfg_.display_model_id(), created, sampling_available_,
                                cfg_.sampling_defaults, tool_calls_available(),
                                constraints_available(),
                                cfg_.reasoning_in_content, *frontend_, frontend_->supports_images() && engine_->supports_images()) +
@@ -2094,9 +2154,9 @@ void GenerationService::route_models(const HttpRequest& req,
     return;
   }
   const std::string id = req.path.substr(std::string("/v1/models/").size());
-  if (id == cfg_.model_id) {
+  if (cfg_.model_matches(id)) {
     w.respond(200, "application/json",
-              model_object(id, created, sampling_available_,
+              model_object(cfg_, cfg_.display_model_id(), created, sampling_available_,
                            cfg_.sampling_defaults, tool_calls_available(),
                            constraints_available(), cfg_.reasoning_in_content, *frontend_, frontend_->supports_images() && engine_->supports_images()));
     return;
@@ -2251,6 +2311,10 @@ void GenerationService::route_metrics(HttpResponseWriter& w) {
   append_json_int(&out, m.prefix_skipped_no_block);
   out.append(",\"skipped_no_slot\":");
   append_json_int(&out, m.prefix_skipped);
+  out.append(",\"skipped_image_bytes\":");
+  append_json_int(&out, m.prefix_skipped_image_bytes);
+  out.append(",\"image_bytes\":");
+  append_json_int(&out, m.prefix_image_bytes);
   out.append(",\"blocks_pinned\":");
   append_json_int(&out, m.prefix_blocks_pinned);
   out.append(",\"snapshot_bytes\":");

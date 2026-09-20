@@ -172,10 +172,12 @@ automatically. `/v1/models` reports `input_modalities: ["text", "image"]`.
 Send PNG/JPEG data URIs in user `image_url` content parts; the
 [image input guide](vision.md) gives a complete request and limits.
 
-The startup plan reserves 1.05 GiB of vision weights and 0.34 GiB of workspace
+The startup plan reserves 1.05 GiB of vision weights and 0.33 GiB of workspace
 per rank, including for text traffic. Account for this when sizing KV capacity.
-Image requests bypass prefix caching and grouped/continuation prefill; decode
-graphs and MTP remain supported. Before changing a serving deployment, run
+Image requests reuse prefixes with matching processed pixels and geometry,
+including generated continuations. With a configured prefill budget, the GLM
+graph engine yields between image-prefill chunks so active decodes continue.
+Image requests bypass grouped prefill. Before changing a serving deployment, run
 `python3 scripts/vision_api_check.py --url http://127.0.0.1:18080` on idle test
 hardware, then compare rank operation streams after shutdown.
 For numerical validation, stop the serving world before running the CUDA
@@ -303,7 +305,9 @@ node, available context also depends on draft weights, request slots,
 cache format and arena size. Use the startup plan for the configured limit.
 
 **Budgeted prefill** (`engine.prefill_budget_tokens`, `--prefill-budget-tokens`)
-is opt-in on the Qwen graph engine. Zero preserves full-prompt admission.
+is supported on Qwen and GLM-5.3-Flash graph engines, including GLM image
+requests. Zero preserves full-prompt admission. The four-rank GLM-5.3-Flash
+deployment enables 256-token busy and 2,048-token idle budgets.
 A positive budget executes one aligned prefill chunk per tick, followed by
 a decode pass for active requests. Try 256 or 512 tokens; the budget must
 be a multiple of the snapshot alignment and fit the prefill scratch limit.
@@ -660,3 +664,14 @@ the prompts. Its artifacts land under `build-ci/fabric-runs/failure_drill_*`.
 | peer binary, config and logs | `<stage_dir>/dgpp-serve`, `<stage_dir>/cluster.json`, `<stage_dir>/serve_r<rank>.log`, `<stage_dir>/serve_rank<rank>.ops` (fetched into the log dir by `down`) |
 | rank 0 log, pid and op stream | `<log_dir>/serve_r0.log`, `<log_dir>/r0.pid`, `<log_dir>/serve_rank0.ops`, written as the run records it (flushed at every retire) |
 | exit statuses | 0 orderly stop; 1 a startup or contract error (a configuration that differs from rank 0's included); 2 rank 0 after an engine failure; 3 a peer released by its in-tick watch |
+
+### Qwen 64-row decode
+
+Qwen supports `max_concurrency: 16` with `engine.mtp_depth: 3` (MTP enabled),
+using 64 verification rows. Smaller graph families are selected to cover
+the occupied slots. Request capacity remains 16 even at lower MTP depths.
+Qwen prefill uses 1024-token chunks. Wider graphs increase working and
+capture memory; validate the startup memory plan on your deployment.
+Upgrade all ranks together because the internal picker layout changed.
+See the [implementation and validation record](../benchmarks/results/2026-09-17-qwen-spark-decode/README.md)
+for tests, numerical caveats and measurement limits.

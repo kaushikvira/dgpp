@@ -86,6 +86,7 @@ class FakeEngine : public SchedulerEngine {
   std::atomic<bool> images_available{false};
   std::atomic<int> image_prefills{0};
   bool supports_images() const override { return images_available; }
+  bool supports_image_prefix_cache() const override { return images_available; }
   int32_t prefill_images(int req, const std::vector<int64_t>& prompt, const std::vector<dgpp::ImageInput>& images) override {
     require(!images.empty() && images[0].rgb.size() == 112 * 112 * 3, "decoded image reaches the engine");
     ++image_prefills;
@@ -192,6 +193,11 @@ class FakeEngine : public SchedulerEngine {
   }
   int32_t prefill_cached(int req, const std::vector<int64_t>& prompt,
                          dgpp::sched::SchedulerEngine::PrefixPrefill* plan) override {
+    if (plan->images && !plan->images->empty()) {
+      require(images_available && plan->images->front().rgb.size() == 112 * 112 * 3,
+              "image payload survives cached admission");
+      ++image_prefills;
+    }
     if (plan->attach_slot >= 0) {
       std::lock_guard<std::mutex> lock(armed_mu_);
       prefix_ops_.push_back("X:" + std::to_string(req) + ":" +
@@ -605,12 +611,22 @@ struct ServiceRig {
                       bool reasoning_in_content = false,
                       dgpp::sched::AdmissionPolicy admission = {},
                       int prefix_slots = 0,
-                      dgpp::serve::FileInputConfig file_inputs = {})
+                      dgpp::serve::FileInputConfig file_inputs = {},
+                      // The request-context surface (review item 7): the rig's
+                      // rope ramp and its two bounds, advertised on /v1/models.
+                      std::optional<dgpp::RopeScaling> rope_scaling = std::nullopt,
+                      int64_t position_ceiling = 0, int64_t kv_pool_tokens = 0,
+                      // The served-model alias (the cluster config's
+                      // engine.served_model_name): when set, /v1/models
+                      // reports it and requests may name it (or the
+                      // checkpoint id). Empty: the checkpoint id alone.
+                      std::string served_model_name = "")
       : engine(kSlots, /*total_blocks=*/100, /*block_tokens=*/4, can_sample),
         frontend(with_markers),
         cfg([&] {
           ServiceConfig c;
           c.model_id = "glm-5.3-flash-fp8";
+          c.served_model_name = served_model_name;
           c.default_max_tokens = 8;
           c.queue_limit = queue_limit;
           c.sampling_defaults = sampling_defaults;
@@ -618,6 +634,9 @@ struct ServiceRig {
           c.reasoning_in_content = reasoning_in_content;
           c.admission = admission;
           c.vocab_size = 512;  // the fake's ids are bytes and markers
+          c.rope_scaling = rope_scaling;
+          c.position_ceiling = position_ceiling;
+          c.kv_pool_tokens = kv_pool_tokens;
           c.file_inputs = std::move(file_inputs);
           return c;
         }()),
@@ -3299,4 +3318,154 @@ DGPP_TEST(serve_images_capability_validation_and_streaming) {
   response = post_chat(rig, body("data:image/png;base64,AAAA", false), "invalid_image");
   require(response.find("messages[0].content[1].image_url.url") != std::string::npos,
           "invalid image names the precise field");
+}
+
+DGPP_TEST(serve_models_reports_the_active_rope_and_the_effective_limit) {
+  // The request-context surface (review item 7, 2026-09-18): what ramp is in
+  // force, and what one request may actually reach. Both fields are additive —
+  // a build with the knob off, or a rig that names neither bound, sends
+  // exactly the model object it sent before.
+  {
+    ServiceRig rig;
+    Client models(rig.port());
+    models.send_all("GET /v1/models HTTP/1.1\r\nHost: t\r\n\r\n");
+    const std::string ml = models.read_available(800);
+    require(ml.find("\"rope_scaling\"") == std::string::npos &&
+                ml.find("\"context\"") == std::string::npos,
+            "nothing advertised when nothing is set: " + ml.substr(0, 600));
+  }
+  // The 512K recipe: YaRN x2 over 262 144 positions, in a 1 048 576-token
+  // pool. The ramp rides the deployment's own field names with the values it
+  // derives, and the limit is the MINIMUM of the two bounds — the ceiling
+  // here, because the pool clears it.
+  {
+    ServiceRig rig(8, dgpp::sample::greedy_params(), false, std::nullopt, false, false, {}, 0, {},
+                   dgpp::RopeScaling{2.0, 262144, 32.0, 1.0, 1.0, 4.0}, 524288, 1048576);
+    Client models(rig.port());
+    models.send_all("GET /v1/models HTTP/1.1\r\nHost: t\r\n\r\n");
+    const std::string ml = models.read_available(800);
+    require(ml.find("\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2") != std::string::npos &&
+                ml.find("\"original_max_position_embeddings\":262144") != std::string::npos &&
+                ml.find("\"scaled_max_position_embeddings\":524288") != std::string::npos,
+            "the active ramp: " + ml);
+    require(ml.find("\"context\":{\"request_limit_tokens\":524288,"
+                    "\"position_ceiling_tokens\":524288,\"kv_pool_tokens\":1048576,"
+                    "\"limited_by\":\"position-ceiling\"}") != std::string::npos,
+            "the ceiling is the smaller bound: " + ml);
+  }
+  // The other half of the sentence: a pool SHORTER than the ceiling (an
+  // engine.kv_capacity below the YaRN limit) is what bounds the request, and
+  // the response says so — and with the knob unset the ramp stays off the
+  // wire, so a client can never read a YaRN it is not getting.
+  {
+    ServiceRig rig(8, dgpp::sample::greedy_params(), false, std::nullopt, false, false, {}, 0, {},
+                   std::nullopt, 524288, 262144);
+    Client models(rig.port());
+    models.send_all("GET /v1/models HTTP/1.1\r\nHost: t\r\n\r\n");
+    const std::string ml = models.read_available(800);
+    require(ml.find("\"rope_scaling\"") == std::string::npos, "plain rope: " + ml);
+    require(ml.find("\"request_limit_tokens\":262144") != std::string::npos &&
+                ml.find("\"limited_by\":\"kv-pool\"") != std::string::npos,
+            "the pool is the smaller bound: " + ml);
+  }
+}
+
+DGPP_TEST(serve_images_prefix_cache_defaults_on_and_respects_opt_out) {
+  ServiceRig rig(8, dgpp::sample::greedy_params(), false, std::nullopt, false, false, {}, 4);
+  rig.frontend.images_available = true;
+  rig.engine.images_available = true;
+  const std::string body =
+      R"({"model":"glm-5.3-flash-fp8","max_tokens":1,"messages":[{"role":"user","content":[)"
+      R"({"type":"text","text":"ab|cd|ef"},{"type":"image_url","image_url":{"url":)"
+      R"("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a0ioAAAAASUVORK5CYII="}}]}]})";
+  const auto first = post_chat(rig, body, "usage");
+  const auto second = post_chat(rig, body, "usage");
+  require(first.find("200 OK") != std::string::npos && second.find("\"cached_tokens\":4") != std::string::npos,
+          "image request uses its available prefix by default: " + second);
+  const auto operations = rig.engine.prefix_ops();
+  const auto disabled = body.substr(0, body.size() - 1) + ",\"prefix_cache\":false}";
+  const auto uncached = post_chat(rig, disabled, "usage");
+  require(uncached.find("\"cached_tokens\":0") != std::string::npos &&
+              rig.engine.prefix_ops() == operations && rig.engine.image_prefills == 3,
+          "explicit opt-out still performs image prefill without cache operations");
+
+}
+
+DGPP_TEST(serve_servedModelName_aliasServesBesideTheCheckpointId) {
+  // GIVEN a service that serves the checkpoint under a stable alias (the
+  // cluster config's served_model_name: the A/B lanes' gateway name),
+  ServiceRig rig(8, dgpp::sample::greedy_params(), false, std::nullopt, false, false, {}, 0, {},
+                 std::nullopt, 0, 0, "stable-alias");
+
+  // WHEN a client names the alias, the checkpoint id, or an unknown model,
+  // THEN the alias and the checkpoint id are both served, and the unknown
+  // model is 404 with the error naming the alias (the name actually served).
+  const std::string alias_body =
+      "{\"model\":\"stable-alias\",\"messages\":[{\"role\":\"user\","
+      "\"content\":\"abcd\"}],\"max_tokens\":2}";
+  const std::string alias_resp = post_until_usage(rig, alias_body);
+  require(alias_resp.find("200 OK") != std::string::npos,
+          "the alias is served: " + alias_resp.substr(0, 200));
+  const std::string ckpt_resp = post_until_usage(rig, chat_body("abcd", 2));
+  require(ckpt_resp.find("200 OK") != std::string::npos,
+          "the checkpoint id is still served beside the alias: " + ckpt_resp.substr(0, 200));
+  const std::string wrong_body =
+      "{\"model\":\"nope\",\"messages\":[{\"role\":\"user\","
+      "\"content\":\"abcd\"}],\"max_tokens\":2}";
+  const std::string wrong_resp = post_chat(rig, wrong_body);
+  require(wrong_resp.find("404 Not Found") != std::string::npos &&
+              wrong_resp.find("\"code\":\"model_not_found\"") != std::string::npos &&
+              wrong_resp.find("(serving 'stable-alias')") != std::string::npos,
+          "the unknown model is 404 naming the alias: " + wrong_resp.substr(0, 300));
+
+  // The legacy prompt API accepts the alias too.
+  Client legacy(rig.port());
+  const std::string legacy_body =
+      "{\"model\":\"stable-alias\",\"prompt\":\"hello\",\"max_tokens\":2}";
+  legacy.send_all("POST /v1/completions HTTP/1.1\r\nHost: t\r\n"
+                  "Content-Type: application/json\r\nContent-Length: " +
+                  std::to_string(legacy_body.size()) + "\r\n\r\n" + legacy_body);
+  const std::string legacy_resp = legacy.read_until("usage", 5000);
+  require(legacy_resp.find("200 OK") != std::string::npos &&
+              legacy_resp.find("\"object\":\"text_completion\"") != std::string::npos,
+          "the legacy API serves the alias: " + legacy_resp.substr(0, 200));
+
+  // /v1/models reports the alias as the id (and never the checkpoint id),
+  // /v1/models/<id> accepts the alias or the checkpoint id, and an unknown
+  // id is 404.
+  Client models(rig.port());
+  models.send_all("GET /v1/models HTTP/1.1\r\nHost: t\r\n\r\n");
+  const std::string ml = models.read_available(800);
+  require(ml.find("\"id\":\"stable-alias\"") != std::string::npos &&
+              ml.find(kModel) == std::string::npos,
+          "the list reports the alias as the id: " + ml.substr(0, 300));
+  models.send_all("GET /v1/models/stable-alias HTTP/1.1\r\nHost: t\r\n\r\n");
+  const std::string alias_get = models.read_available(800);
+  require(alias_get.find("200 OK") != std::string::npos &&
+              alias_get.find("\"id\":\"stable-alias\"") != std::string::npos,
+          "/v1/models/<alias> is served: " + alias_get.substr(0, 300));
+  models.send_all("GET /v1/models/" + kModel + " HTTP/1.1\r\nHost: t\r\n\r\n");
+  const std::string ckpt_get = models.read_available(800);
+  require(ckpt_get.find("200 OK") != std::string::npos &&
+              ckpt_get.find("\"id\":\"stable-alias\"") != std::string::npos,
+          "/v1/models/<checkpoint id> is served too: " + ckpt_get.substr(0, 300));
+  models.send_all("GET /v1/models/nope HTTP/1.1\r\nHost: t\r\n\r\n");
+  const std::string none_get = models.read_available(800);
+  require(none_get.find("404 Not Found") != std::string::npos &&
+              none_get.find("\"code\":\"model_not_found\"") != std::string::npos,
+          "/v1/models/<unknown> is 404: " + none_get.substr(0, 300));
+
+  // The non-regression half: without an alias, the checkpoint id alone is
+  // served and reported — exactly today's behavior.
+  ServiceRig plain;
+  Client plain_models(plain.port());
+  plain_models.send_all("GET /v1/models HTTP/1.1\r\nHost: t\r\n\r\n");
+  const std::string plain_ml = plain_models.read_available(800);
+  require(plain_ml.find("\"id\":\"" + kModel + "\"") != std::string::npos &&
+              plain_ml.find("stable-alias") == std::string::npos,
+          "absent alias: the checkpoint id is reported: " + plain_ml.substr(0, 300));
+  const std::string plain_wrong = post_chat(plain, wrong_body);
+  require(plain_wrong.find("404 Not Found") != std::string::npos &&
+              plain_wrong.find("\"code\":\"model_not_found\"") != std::string::npos,
+          "absent alias: the unknown model is 404: " + plain_wrong.substr(0, 300));
 }

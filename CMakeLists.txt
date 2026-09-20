@@ -429,6 +429,13 @@ set_tests_properties(qwen_forward_smoke PROPERTIES DEPENDS qwen_forward_fixture)
 add_test(NAME qwen_forward_smoke_yarn
   COMMAND qwen_forward_test --smoke ${QWEN_FORWARD_FIXTURE} --rope-scaling 2.0:4096)
 set_tests_properties(qwen_forward_smoke_yarn PROPERTIES DEPENDS qwen_forward_fixture)
+# The YaRN ceiling actually crossed (the 2026-09-18 review): a synthetic
+# native limit of 8 under the factor-2 knob (the extended 16) — both
+# forward modes over the final valid position, the session's refusal of
+# work past the extended limit, and a pool below the ceiling.
+add_test(NAME qwen_forward_cross_limit
+  COMMAND qwen_forward_test --cross-limit ${QWEN_FORWARD_FIXTURE})
+set_tests_properties(qwen_forward_cross_limit PROPERTIES DEPENDS qwen_forward_fixture)
 add_test(NAME qwen_forward_generate
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/qwen_reference_dump.py
           gen-pure --checkpoint-dir ${QWEN_FORWARD_FIXTURE}
@@ -702,6 +709,23 @@ target_compile_definitions(unit_tests PRIVATE DGPP_SOURCE_DIR="${CMAKE_CURRENT_S
 dgpp_set_common(unit_tests)
 add_test(NAME unit_tests COMMAND unit_tests)
 target_sources(unit_tests PRIVATE tests/unit/site_options_test.cpp)
+
+# The vLLM YaRN oracle, offline (2026-09-19): tests/python/qwen_yarn_oracle.py
+# --emit records the recipe's rope goldens — the YaRN table, the attention
+# mscale, the bf16 cos/sin cache rows and rotated Q/K at several positions,
+# for the recipe and four non-default parameter combinations — under the
+# digest of the container that produced them, and this gate compares the
+# engine's own table builder, mscale and rotation against that file. No vLLM,
+# no container, no GPU; refresh the fixture in the container when vLLM's yarn
+# code or the recipe changes (tests/unit/qwen_yarn_fixture_test.cpp).
+add_executable(qwen_yarn_fixture_test tests/unit/qwen_yarn_fixture_test.cpp)
+target_include_directories(qwen_yarn_fixture_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(qwen_yarn_fixture_test PRIVATE dgpp_loaders dgpp_models_qwen
+                                        dgpp_rope_scaling Threads::Threads)
+target_compile_definitions(qwen_yarn_fixture_test PRIVATE DGPP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+dgpp_set_common(qwen_yarn_fixture_test)
+add_test(NAME qwen_yarn_fixture_test
+  COMMAND qwen_yarn_fixture_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/qwen_yarn_oracle.json)
 
 # M6 Stage 3: the tokenizer differential gate (host). Skips with rc 2 when
 # the model cache is absent (same discipline as the real-checkpoint gates).
@@ -1257,6 +1281,27 @@ add_test(NAME qwen_engine_row_independent
           $<TARGET_FILE:qwen_engine_test>)
 set_tests_properties(qwen_engine_test qwen_engine_row_independent PROPERTIES RESOURCE_LOCK qwen_engine_world)
 set_tests_properties(qwen_engine_row_independent PROPERTIES LABELS "gpu;rdma")
+add_test(NAME qwen_engine_fp8_wide
+  COMMAND ${CMAKE_COMMAND} -E env DGPP_DENSE_GEMV_ROWS=4 DGPP_TEST_DENSE_FP8=1 DGPP_TEST_FILTER=wide
+          $<TARGET_FILE:qwen_engine_test>)
+set_tests_properties(qwen_engine_fp8_wide PROPERTIES RESOURCE_LOCK qwen_engine_world LABELS "gpu;rdma")
+add_test(NAME qwen_engine_fp8_mtp3_rows32
+  COMMAND ${CMAKE_COMMAND} -E env DGPP_DENSE_GEMV_ROWS=4 DGPP_TEST_DENSE_FP8=1
+          DGPP_TEST_QWEN_ROWS32=1 DGPP_TEST_FILTER=wide $<TARGET_FILE:qwen_engine_test>)
+add_test(NAME qwen_engine_mtp3_rows32_row_independent
+  COMMAND ${CMAKE_COMMAND} -E env DGPP_DENSE_GEMV_ROWS=256 DGPP_TEST_DENSE_FP8=1
+          DGPP_TEST_QWEN_ROWS32=1 DGPP_TEST_FILTER=wide $<TARGET_FILE:qwen_engine_test>)
+set_tests_properties(qwen_engine_fp8_mtp3_rows32 qwen_engine_mtp3_rows32_row_independent
+  PROPERTIES RESOURCE_LOCK qwen_engine_world LABELS "gpu;rdma")
+
+add_test(NAME qwen_engine_fp8_mtp3_rows64
+  COMMAND ${CMAKE_COMMAND} -E env DGPP_DENSE_GEMV_ROWS=4 DGPP_TEST_DENSE_FP8=1
+          DGPP_TEST_QWEN_ROWS64=1 DGPP_TEST_FILTER=wide $<TARGET_FILE:qwen_engine_test>)
+add_test(NAME qwen_engine_mtp3_rows64_row_independent
+  COMMAND ${CMAKE_COMMAND} -E env DGPP_DENSE_GEMV_ROWS=256 DGPP_TEST_DENSE_FP8=1
+          DGPP_TEST_QWEN_ROWS64=1 DGPP_TEST_FILTER=wide $<TARGET_FILE:qwen_engine_test>)
+set_tests_properties(qwen_engine_fp8_mtp3_rows64 qwen_engine_mtp3_rows64_row_independent
+  PROPERTIES RESOURCE_LOCK qwen_engine_world LABELS "gpu;rdma")
 endif()
 
 if(DGPP_ENABLE_IBV)
@@ -1585,7 +1630,7 @@ foreach(_test IN LISTS DGPP_ALL_TESTS)
   set_tests_properties(${_test} PROPERTIES LABELS "gpu")
 endforeach()
 set_tests_properties(unit unit_tests http_server_test serve_test fabric_serve_test scheduler_test
-  PROPERTIES LABELS "host")
+  qwen_yarn_fixture_test PROPERTIES LABELS "host")
 set_tests_properties(checkpoint_audit_test route_trace_test sampling_profile_test
   site_env_test script_reports_test portability_test setup_tools_test launcher_test PROPERTIES LABELS "host;python")
 set_tests_properties(tokenizer_test qwen_tokenizer_test glm4_tokenizer_test dsv41_tokenizer_test
@@ -1615,6 +1660,12 @@ target_link_libraries(glm_vision_test PRIVATE dgpp_kernels CUDA::cudart)
 dgpp_set_common(glm_vision_test)
 add_test(NAME glm_vision_test COMMAND glm_vision_test)
 set_tests_properties(glm_vision_test PROPERTIES LABELS "gpu" SKIP_RETURN_CODE 2)
+
+add_executable(glm_vision_stream_test tests/cuda/glm_vision_stream_test.cpp)
+target_link_libraries(glm_vision_stream_test PRIVATE dgpp_models_glm_loader CUDA::cudart)
+dgpp_set_common(glm_vision_stream_test)
+add_test(NAME glm_vision_stream_test COMMAND glm_vision_stream_test)
+set_tests_properties(glm_vision_stream_test PROPERTIES LABELS "gpu;checkpoint" SKIP_RETURN_CODE 2 RUN_SERIAL TRUE)
 
 add_executable(glm_vision_frontend_test tests/host/glm_vision_frontend_test.cpp)
 target_link_libraries(glm_vision_frontend_test PRIVATE dgpp_serve)
