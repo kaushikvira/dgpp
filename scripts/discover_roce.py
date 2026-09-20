@@ -34,12 +34,8 @@ def selection(inventory, env):
             "gid_indices": indices or None}
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=config_argument, help="inspect the first world_size nodes; run on rank 0")
-    parser.add_argument("--json", action="store_true", help="print inventories, selections and per-node errors as JSON")
-    args = parser.parse_args(argv)
-    cfg = resolve_config(args.config) if args.config else None
+def inspect_cluster(cfg=None):
+    """Collect inventories independently of CLI formatting or config writes."""
     if cfg:
         cluster_doctor.require_head(cfg["nodes"][0])
     nodes = cfg["nodes"] if cfg else ["localhost"]
@@ -64,9 +60,11 @@ def main(argv=None):
                 selections[host] = {"mode": "not needed (single node)", "devices": [], "gid_indices": None}
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             errors[host] = str(error)
-    if args.json:
-        print(json.dumps({"inventories": inventories, "selections": selections, "errors": errors}, indent=2))
-        return 1 if errors else 0
+    return {"inventories": inventories, "selections": selections, "errors": errors}
+
+
+def print_report(report, nodes):
+    inventories, selections, errors = (report[key] for key in ("inventories", "selections", "errors"))
     overrides = {}
     for rank, host in enumerate(nodes):
         if host in errors:
@@ -102,6 +100,19 @@ def main(argv=None):
     if errors:
         print("Some nodes could not be inspected. Fix SSH access from rank 0; omit --config to inspect only this host.")
     return 1 if errors else 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=config_argument, help="inspect the first world_size nodes; run on rank 0")
+    parser.add_argument("--json", action="store_true", help="print inventories, selections and per-node errors as JSON")
+    args = parser.parse_args(argv)
+    cfg = resolve_config(args.config) if args.config else None
+    report = inspect_cluster(cfg)
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return 1 if report["errors"] else 0
+    return print_report(report, cfg["nodes"] if cfg else ["localhost"])
 
 
 if __name__ == "__main__":

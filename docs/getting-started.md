@@ -1,10 +1,114 @@
 # Getting started
 
-Run these steps on the first Spark in your cluster (rank 0).
+Run setup on the first Spark in your cluster (rank 0).
 A supported deployment uses one GB10 per node
 on Linux/aarch64; choose a model and node count from the
 [supported configurations](../README.md#supported-models-and-configurations).
 For the abbreviated command sequence, see the [quickstart](../README.md#quickstart).
+
+## Guided setup
+
+From a source checkout, run:
+
+```bash
+./scripts/setup.sh
+```
+
+The wizard requires Python 3.10+ and uses only its standard library. It offers
+the shipped deployment templates by node count, asks for SSH/control addresses,
+SSH login, checkpoint and resident-cache directories and HTTP port, and saves
+the selected deployment in `DGPP_CLUSTER_CONFIG` in `.env`.
+The addresses can be management IPs, fabric IPs, or a mixture. A separate
+management network is optional: rank 0 can have a separate management IP while
+peers are addressed solely through their fabric IPs. Choose a rank-0 address
+the peers can reach; this can be its fabric IP even when you logged in through
+its management IP. See [network layouts](networking.md#ssh-and-control-addresses)
+for an example. Single-node deployments need no RoCE settings.
+For multiple nodes, it inventories verbs devices, interface addresses, MTUs and
+GIDs and asks you to choose corresponding lanes by subnet on each host. The same
+interfaces can carry SSH/control traffic and RDMA. Existing
+per-node cache overrides are retained. Cabling, switch configuration and actual
+RDMA reachability still need your site's knowledge.
+
+Setup checks the compiler, CMake, CUDA toolkit, Python, runtime libraries,
+transfer tools, GPU visibility, node addresses, ports, writable cache paths and
+free space. Build tools are needed only on rank 0. On Ubuntu/DGX OS it can
+install standard packages on all nodes when requested; it never installs a
+driver or CUDA toolkit. Use `--install-system-deps` to request package installation
+up front. Peers need working SSH access from rank 0 and permission to use `sudo`.
+Unattended installation requires passwordless `sudo`; interactive installation
+can prompt for its password. SSH host fingerprints and public keys must already
+be configured as described in [step 3](#3-set-your-node-addresses-and-ssh-user).
+Missing packages and failed checks include recovery instructions.
+
+After prerequisites pass, setup builds the release server with four parallel
+jobs, creates/reuses `.venv` and installs the downloader requirements if needed,
+downloads the checkpoint on rank 0, syncs peers sequentially, and runs the full
+serving preflight. `--jobs N` adjusts build parallelism. If a complete checkpoint
+already exists on the head, the default `--model-action auto` reuses and syncs
+it without contacting Hugging Face. For gated models, authenticate on the head
+with `.venv/bin/hf auth login` or an exported `HF_TOKEN`, then rerun. Site-file
+credentials are preserved but are never loaded or copied to peers by setup.
+
+No service starts unless you pass `--start`. Setup prints complete `up`, `status`
+and `down` commands, including a custom site-file path when used. The final
+preflight checks software-visible readiness; startup still validates memory
+capacity and actually establishes the fabric. Keep HTTP on localhost unless
+you have arranged an authenticated proxy or tunnel.
+
+Rerun the same command after fixing a failure: setup preserves existing local
+deployment JSONs, unrelated `.env` content and completed downloads/build work.
+It updates only selected site settings. An existing deployment's `http.port`
+takes precedence over the site default and must be edited in that deployment.
+Exported site variables still take precedence; setup asks you to unset one if
+it conflicts with a requested change. Use `--env-file FILE` for a separate site
+file. Stop deployments using a checkpoint before updating or syncing it.
+
+Common alternatives:
+
+```bash
+# See all supported model/node combinations.
+./scripts/setup.sh --list-templates
+
+# One Spark, no questions; uses an existing local copy if present.
+./scripts/setup.sh --non-interactive \
+  --template cluster_qwen-3.8-flash-next_nvfp4_w1.example.json \
+  --nodes 127.0.0.1
+
+# Configure a four-node deployment now, without SSH/build/download operations.
+./scripts/setup.sh --non-interactive --configure-only \
+  --template cluster_glm-5.3-flash_nvfp4-fp8_w4.example.json \
+  --nodes "192.0.2.11 192.0.2.12 192.0.2.13 192.0.2.14" --ssh-user USER
+
+# Read-only prerequisite check using the saved selection. No build or weights needed.
+./scripts/setup.sh --check
+
+# Offline model preparation: sync an already complete head cache, no Hub/pip calls.
+./scripts/setup.sh --non-interactive --model-action sync
+
+# Reuse an existing binary and verify existing checkpoint copies on all nodes.
+./scripts/setup.sh --non-interactive --skip-build --model-action verify
+```
+
+`--check` also accepts `--template`, `--nodes` and `--config` to inspect a planned
+deployment without creating files. It checks prerequisites, not the final server
+and checkpoint; use `dgpp-cluster doctor` for that. `--configure-only` similarly
+does not claim readiness. Neither mode installs packages or starts services.
+Without a terminal, setup never prompts: supply flags or saved settings.
+Multi-node unattended runs use existing RoCE settings, or the engine's automatic
+selection when unset; inspect the printed inventory and set explicit site/per-node
+overrides on hosts with multiple fabrics. Setup does not infer cable topology.
+
+`sync` and `verify` avoid Hugging Face, but an offline build also needs system
+packages and PCRE2 already available. Use
+`--cmake-arg=-DFETCHCONTENT_SOURCE_DIR_PCRE2=/path/to/pcre2-10.45` for prefetched
+PCRE2, or `--skip-build` with an existing server. `CUDACXX`, `CUDAToolkit_ROOT`
+and `DGPP_BUILD_DIR` are respected. After changing a cached compiler selection,
+pass `--cmake-arg=--fresh`. See [offline preparation](#offline-preparation) for
+provisioning a fully disconnected head.
+
+The numbered steps below document the same workflow for manual preparation
+and troubleshooting.
 
 ## 1. Install the dependencies
 
@@ -120,8 +224,13 @@ reproduce every retired variant.
 
 2. Open `.env`. For **one Spark**, set `DGPP_NODES="127.0.0.1"`.
    For **multiple Sparks**, replace the example addresses with your machines'
-   addresses, separated by spaces. Put the machine running these commands
-   first. Every node must be able to reach the first address.
+   SSH/control addresses, separated by spaces. Management IPs, fabric IPs and
+   mixtures are supported, including a separate management IP only on rank 0
+   and fabric-only addresses on the peers. Put the machine running these
+   commands first. Rank 0 must reach each peer over SSH, and every peer must be
+   able to reach the first address for TCP coordination. If peers cannot reach
+   rank 0's management IP, use its fabric IP as the first entry. The address you
+   use to log into rank 0 can remain its separate management IP.
 3. Set `DGPP_SSH_USER` to the login used on the other nodes. That account needs
    write access to its cache and staging directories.
 4. From **rank 0**, connect to each peer with `ssh USER@PEER_ADDRESS hostname`.

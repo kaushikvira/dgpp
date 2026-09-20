@@ -304,6 +304,8 @@ bool ToolCallParser::parse_qwen_block(const std::string& text) {
       if (key_end == std::string::npos || key_end == i) return false;
       const std::string key = text.substr(i, key_end - i);
       if (key.find('\n') != std::string::npos || key.find('<') != std::string::npos) return false;
+      for (const auto& seen : args_)
+        if (seen.first == key) return false;  // a duplicate parameter
       i = key_end + 1;
       if (i < text.size() && text[i] == '\n') ++i;
       const size_t close = text.find("</parameter>", i);

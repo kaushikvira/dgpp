@@ -388,6 +388,37 @@ DGPP_TEST(tool_parser_qwen_format_malformed_blocks_fall_back_to_content) {
   require(run.calls.size() == 1 && run.calls[0].arguments == "{\"city\": \"Oslo\"}", "the restarted block parses");
 }
 
+DGPP_TEST(tool_parser_rejects_aRepeatedParameterName) {
+  // A repeated <parameter=NAME> is how the XML format writes the same
+  // argument twice, and a duplicate key is never a valid object
+  // (tool_grammar.hpp). The block is rejected — as the DSML path already
+  // rejects one — and its text stands as content instead.
+  ToolCallParser::Options plain;
+  plain.start_in_reasoning = false;
+  const std::string dup =
+      "<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n</parameter>\n"
+      "<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>";
+  const Run qwen = drive_qwen(dup, plain);
+  require(qwen.calls.empty(), "a repeated parameter is not a call");
+  require(qwen.content == dup, "the block stands as content: " + qwen.content);
+  // Distinct names over the same schema still parse.
+  const Run ok = drive_qwen(
+      "<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n</parameter>\n"
+      "<parameter=days>\n2\n</parameter>\n</function>\n</tool_call>",
+      plain);
+  require(ok.calls.size() == 1 && ok.calls[0].arguments == "{\"city\": \"Rome\", \"days\": 2}",
+          "distinct names parse: " + ok.calls[0].arguments);
+  // The DSML format's ledger, for parity: a repeat is content there too.
+  const std::string dsml_dup =
+      "ok\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n"
+      "<｜DSML｜ parameter name=\"city\" string=\"true\">Rome</｜DSML｜ parameter>\n"
+      "<｜DSML｜ parameter name=\"city\" string=\"true\">Oslo</｜DSML｜ parameter>\n"
+      "</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+  const Run dsml = drive_dsml(dsml_dup, plain);
+  require(dsml.calls.empty() && dsml.content == dsml_dup,
+          "a repeated DSML parameter is content: " + dsml.content);
+}
+
 DGPP_TEST(tool_parser_splitsReasoningFromContentExactly) {
   // The prompt opened <think>; the ids before </think> are reasoning, the
   // rest content, both streamed as exact deltas; a repeated <think> in the

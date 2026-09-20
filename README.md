@@ -25,7 +25,7 @@ over RoCE. Each quant links to its specific Hugging Face model card.
 
 | Model | Quant / Hugging Face model card | World sizes | Example configuration |
 |---|---|---|---|
-| GLM-5.3-Flash | [unsloth/GLM-5.3-Flash-FP8](https://huggingface.co/unsloth/GLM-5.3-Flash-FP8) | 4 | Copy the [base template](deploy/cluster_glm-5.3-flash_nvfp4-fp8_w4.example.json) to `cluster_glm-5.3-flash_fp8_w4.json` and set `model` to the linked FP8 repository |
+| GLM-5.3-Flash | [unsloth/GLM-5.3-Flash-FP8](https://huggingface.co/unsloth/GLM-5.3-Flash-FP8) | 4 | Copy the [base template](deploy/cluster_glm-5.3-flash_nvfp4-fp8_w4.example.json) to `cluster_glm-5.3-flash_fp8_w4.json`, set `model` to the linked FP8 repository and lower `engine.kv_capacity` to 393216 (the FP8 experts are 31 GiB larger per rank; the startup memory plan refuses the base template's context) |
 | GLM-5.3-Flash (hybrid) | [HawkBearPig/GLM-5.3-Flash-NVFP4-FP8](https://huggingface.co/HawkBearPig/GLM-5.3-Flash-NVFP4-FP8) | 2, 4 | [Two nodes](deploy/cluster_glm-5.3-flash_nvfp4-fp8_w2.example.json), [four nodes](deploy/cluster_glm-5.3-flash_nvfp4-fp8_w4.example.json) |
 | Qwen3.8-Flash-Next | [Qwen/Qwen3.8-Flash-Next-FP8](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) | 2, 4 | [Two nodes](deploy/cluster_qwen-3.8-flash-next_fp8_w2.example.json), [four nodes](deploy/cluster_qwen-3.8-flash-next_fp8_w4.example.json) |
 | Qwen3.8-Flash-Next | [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) | 1, 2 | [One node](deploy/cluster_qwen-3.8-flash-next_nvfp4_w1.example.json), [two nodes](deploy/cluster_qwen-3.8-flash-next_nvfp4_w2.example.json) (mapped n-gram table, dense projections FP8 at load) |
@@ -73,6 +73,14 @@ record the modes measured for each deployment.
 - **Row-aware tensor-core execution and grouped prefill**: dense kernels select
   their lowering from the active row count, and queued cold prompts can share a
   forward pass while retaining request-local attention and state.
+- **Lossless 12-bit BF16 weights (`engine.bf16_weights`)**: the BF16 matrices
+  a decode step streams are kept in a 12-bit form — the sign and mantissa
+  byte plus a 4-bit exponent code per weight, exact side tables for the rare
+  outliers — and the kernels rebuild the exact BF16 bits in registers. Outputs
+  are bit-identical (greedy transcripts do not change) from 25% fewer bytes:
+  +6–12% single-stream decode on GLM-5.3-Flash, GLM-4.7, the full GLM-5.3 and
+  Qwen3.8-Flash-Next-FP8. The 12-bit form can also be the only resident one,
+  which puts the model below its checkpoint's footprint.
 - **Model-specific prefill paths**: packed int4/int8 tensor-core prefill for
   full GLM-5.3, tiled QSA prefill for Qwen, and bounded grouped prefill for
   DeepSeek-V4.1-Flash. Qwen can optionally yield between prefill chunks so
@@ -110,29 +118,27 @@ per-class results, measurement scopes and reproduction commands.
 
 | configuration | single-request engine decode | loaded request-wall decode | cold service prefill at ~2K / 8K / 32K |
 |---|---:|---:|---:|
-| GLM-5.3-Flash-FP8, 4 Sparks | 42.2–48.7 tok/s | 62.2–67.5 tok/s at C4 | Rerun pending |
-| GLM-5.3-Flash NVFP4/FP8, 4 Sparks | 50.6–57.8 tok/s | 96.4–104.0 tok/s at C4 | **1.465 / 6.005 / 27.753 s** |
-| GLM-5.3-Flash NVFP4/FP8, 2 Sparks | 22.7–33.0 tok/s | 38.9–47.3 tok/s at C4 | Rerun pending |
-| Qwen3.8-Flash-Next-FP8, 4 Sparks | 63.2–77.7 tok/s by class | 142.1–167.3 tok/s at C4 | — |
-| Qwen3.8-Flash-Next-FP8, 2 Sparks | 41.7–49.6 tok/s by class | 69.3–83.2 tok/s at C4 | 1.299 / 5.108 / 21.168 s |
-| Qwen3.8-Flash-Next-NVFP4, 2 Sparks, mapped n-gram | **62.1–74.9 tok/s by class** | **119.0–136.9 tok/s at C4** | **1.241 / 4.870 / 20.286 s** |
+| GLM-5.3-Flash-FP8, 4 Sparks | 41.5–51.3 tok/s | 66.1–72.2 tok/s at C4 | 1.484 / 5.938 / 35.391 s |
+| GLM-5.3-Flash NVFP4/FP8, 4 Sparks | 55.0–62.8 tok/s | 102.0–115.1 tok/s at C4 | 1.283 / 5.287 / 24.600 s |
+| GLM-5.3-Flash NVFP4/FP8, 2 Sparks | 31.7–36.5 tok/s | 55.2–58.2 tok/s at C4 | 2.084 / 8.429 / 36.937 s |
+| Qwen3.8-Flash-Next-FP8, 4 Sparks | 68.1–84.6 tok/s by class | 142.3–162.6 tok/s at C4 | 1.038 / 3.945 / 16.258 s |
+| Qwen3.8-Flash-Next-FP8, 2 Sparks | 45.6–55.7 tok/s by class | 85.5–98.0 tok/s at C4 | 1.299 / 5.108 / 21.168 s |
+| Qwen3.8-Flash-Next-NVFP4, 2 Sparks, mapped n-gram | 62.1–74.9 tok/s by class | 119.0–136.9 tok/s at C4 | 1.241 / 4.870 / 20.286 s |
 | Qwen3.8-Flash-Next-NVFP4, 1 Spark | 42.6–50.3 tok/s by class | 69.4–83.7 tok/s at C4 | — |
-| GLM-4.7-NVFP4, 4 Sparks | 29.5–33.3 tok/s by class | 62.7–68.7 tok/s at C4 | 2.809 / 16.865 / — |
-| full GLM-5.3 int4/int8, 4 Sparks | 25.4–29.2 tok/s by class | 42.3–47.0 tok/s at C4 | Rerun pending |
+| GLM-4.7-NVFP4, 4 Sparks | 33.5–37.7 tok/s by class | 62.8–68.2 tok/s at C4 | 2.386 / 14.912 / 157.414 s |
+| full GLM-5.3 int4/int8, 4 Sparks | 27.3–31.1 tok/s by class | 44.2–45.9 tok/s at C4 | 4.185 / 21.282 / 149.684 s |
 | DeepSeek-V4.1-Flash MXFP4/FP8, 4 Sparks | 49.64 aggregate tok/s | 108.49 aggregate tok/s at C6 | 1,383 prompt tok/s on its 2,950-token cold prompt |
 
 Except for DeepSeek, decode ranges are the five prompt classes and prefill is
 the cold HTTP service path. The single-request column uses the server's retired
-decode work, while the loaded column includes full request wall time. Qwen's
-newest cold-service campaigns were run at two
-Sparks; the four-Spark and single-Spark service prefills have not been re-run
-on the current path. DeepSeek uses the vLLM DGX Spark recipe's client and
-prompt set, with different aggregate and per-stream timing scopes, so compare
+decode work, while the loaded column includes full request wall time. Every
+row runs its shipped template. Qwen's single-Spark service prefill has not
+been measured on the current path. DeepSeek uses the vLLM DGX Spark recipe's
+client and prompt set, with different aggregate and per-stream timing scopes, so compare
 its row within that workload. Dates, actual prompt lengths, quality gates and
 reproduction commands are in [the benchmark tables](docs/benchmarks.md).
 DSA prefill now sizes query tiles for the current context within its existing
-workspace. The four-Spark Flash hybrid has been remeasured; other DSA
-configurations need fresh prefill measurements.
+workspace; every DSA configuration above has been remeasured on that path.
 
 ## Status
 
@@ -165,74 +171,39 @@ git clone https://github.com/HawkBearPig/dgpp.git
 cd dgpp
 ```
 
-Run the remaining commands in this same shell, after installing the
-[dependencies on each node](docs/getting-started.md#1-install-the-dependencies).
-This example serves GLM-5.3-Flash on four Sparks; choose a different
-[deployment template](deploy/README.md) for another model or node count.
-See [Getting started](docs/getting-started.md) for the full walkthrough and troubleshooting guidance.
-
-### 1. Configure your deployment
-
-Copy the model template and create your site file, preserving existing files.
-Edit `.env` to set `DGPP_NODES` (rank 0 first) and `DGPP_SSH_USER`, then
-[verify SSH-key access from rank 0 to each peer](docs/getting-started.md#3-set-your-node-addresses-and-ssh-user).
+Run the guided setup on rank 0:
 
 ```bash
-CONFIG=deploy/cluster_glm-5.3-flash_nvfp4-fp8_w4.json
-test -f "$CONFIG" || cp "${CONFIG%.json}.example.json" "$CONFIG"
-test -f .env || cp .env.example .env
+./scripts/setup.sh
 ```
 
-Set `CONFIG` again if you open a new shell; it is the deployment filename, not a persistent setting.
+The wizard helps you choose a supported model and node count, saves your site
+settings, checks SSH and software dependencies on every node, and walks through
+RoCE lane selection for multi-node deployments. It then builds the release
+server, prepares the downloader, downloads the checkpoint once and syncs peers,
+and runs the serving preflight. Existing deployment tuning and unrelated `.env`
+entries are preserved. Reruns reuse the build and complete cached checkpoints.
 
-### 2. Select the RoCE lanes (multiple nodes only)
+Python 3.10+ is needed to run setup. On Ubuntu/DGX OS, the wizard can install
+standard system packages with `sudo`; `--install-system-deps` requests this
+up front. NVIDIA drivers/CUDA and physical network setup remain site prerequisites.
+Expect substantial checkpoint storage and download time on a fresh machine.
+The wizard reports each node's free cache space and explains the lane choices;
+it cannot verify cabling or end-to-end RDMA connectivity.
 
-Discover the interfaces, then copy the appropriate device names and GID indices
-into `.env`, matching lane subnet order across nodes; discovery does not test RDMA connectivity.
+Setup prints the commands to start, inspect and stop the selected deployment.
+Add `--start` to launch after all checks pass:
 
 ```bash
-python3 scripts/discover_roce.py --config "$CONFIG"
+./scripts/setup.sh --start
 ```
 
-### 3. Build
+The API defaults to localhost and has no authentication or TLS. Wait for `READY`
+before sending requests. For unattended setup, read-only checks, offline cache
+sync and the manual walkthrough, see [Getting started](docs/getting-started.md).
+Use `./scripts/setup.sh --help` for all options.
 
-Build the server on rank 0; the launcher stages the executable on peers.
-If CUDA is not found, see [compiler setup](docs/getting-started.md#5-build-the-server-on-rank-0).
-
-```bash
-cmake --preset release
-cmake --build --preset release -j 4
-```
-
-The release preset produces `build-release/dgpp-serve` with `-O3` optimization
-and no debug symbols. Testing uses the separate `ci` preset and `build-ci/`
-directory, with debug symbols retained; see [testing](docs/testing.md).
-
-### 4. Download the checkpoint
-
-Download once into rank 0's standard Hugging Face cache, then sync peers sequentially.
-Add `--sync-only` if rank 0 already has the checkpoint.
-For this example, allow roughly **250 GiB per node** for the checkpoint and
-one resident cache; check [storage and offline options](docs/getting-started.md#6-download-once-and-sync-to-peers) first.
-
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -r requirements-download.txt
-python scripts/download_model.py --config "$CONFIG"
-```
-
-### 5. Check and start
-
-Fix any failed preflight checks, then start the deployment and wait for `READY`.
-The API stays on localhost; it has no authentication or TLS.
-
-```bash
-python3 scripts/dgpp-cluster doctor --config "$CONFIG"
-python3 scripts/dgpp-cluster up --config "$CONFIG"
-```
-
-### 6. Send a request
+### Send a request
 
 Ask the running model a question. This short example requests low reasoning
 effort because reasoning tokens also count toward `max_tokens`:
@@ -248,7 +219,7 @@ jq -n --arg model "$MODEL" \
 Stop it when finished, using the same config:
 
 ```bash
-python3 scripts/dgpp-cluster down --config "$CONFIG"
+python3 scripts/dgpp-cluster down --config /path/to/the/selected/deployment.json
 ```
 
 ## Release and install
@@ -257,6 +228,7 @@ A release is a versioned tarball installed once per node. Starting an
 installed release stages the configuration and uses the installed binary.
 
 ```bash
+CONFIG=/path/to/the/selected/deployment.json        # use the path printed by setup
 scripts/release.sh                                 # build the release preset, stage, verify, pack
 scripts/dgpp-cluster install dist/dgpp-VERSION.tar.zst --config "$CONFIG"
 scripts/dgpp-cluster up --release VERSION --config "$CONFIG"
@@ -301,8 +273,9 @@ scripts' environment and generated server config.
 
 | `.env` key | purpose | default |
 |---|---|---|
-| `DGPP_NODES` | Space-separated hostnames/IPv4 addresses in rank order. The first is rank 0, where launch/download commands run. A deployment uses its first `world_size` nodes. These are host addresses, not RDMA device names. | required |
+| `DGPP_NODES` | Space-separated SSH/control hostnames or IPv4 addresses in rank order, using management IPs, fabric IPs, or a mixture. Rank 0 runs locally, must reach peers over SSH, and must be reachable by peers at its listed address. A deployment uses the first `world_size` entries. See [network layouts](docs/networking.md#ssh-and-control-addresses). | required |
 | `DGPP_SSH_USER` | Peer login for binary staging, process control, diagnostics and checkpoint sync. Needs SSH-key access and write access to the configured directories. | current login when empty or absent |
+| `DGPP_CLUSTER_CONFIG` | Default deployment filename, saved by guided setup. An explicit `--config` takes precedence. | legacy four-node Flash hybrid filename |
 | `DGPP_HTTP_PORT` | Default client-facing API TCP port on rank 0; deployment `http.port` overrides it. | 18080 |
 | `DGPP_HTTP_BIND` | Default IPv4 listening address on rank 0; deployment `http.bind_host` overrides it. Keep localhost unless you have arranged access protection. | `127.0.0.1` |
 | `DGPP_FABRIC_PORT` | Rank-0 TCP rendezvous listener used to establish the inter-node transport. Peers must reach it; clients do not use it. Keep it private to the cluster. | 29970 |

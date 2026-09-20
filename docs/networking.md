@@ -1,8 +1,39 @@
 # Network and cache configuration
 
-`DGPP_NODES` identifies hosts in rank order; it is separate from RDMA device
-selection. Rank 0 runs locally. Peers must resolve and reach its address,
-and SSH must use the selected `DGPP_SSH_USER` without an interactive prompt.
+## SSH and control addresses
+
+`DGPP_NODES` identifies hosts for SSH and TCP coordination, in rank order.
+These addresses may be management IPs, fabric IPs, or a mixture. SSH/control
+traffic and RDMA can share the same interfaces; a separate management network
+is optional. The address list and RoCE device/GID selection configure those
+roles independently.
+
+Rank 0 runs locally and must reach every peer's listed address over SSH using
+`DGPP_SSH_USER` without an interactive prompt. Peers must resolve and reach
+rank 0's listed address for TCP coordination. The addresses can be on different
+subnets when routing provides that connectivity.
+
+A supported layout has a separate management IP only on rank 0, with nodes
+1, 2 and 3 addressed solely by their fabric IPs. For example, suppose rank 0's
+operator-facing management IP is `192.0.2.10` and the four nodes' fabric IPs
+are `198.51.100.11` through `198.51.100.14` (illustrative addresses):
+
+```dotenv
+DGPP_NODES="198.51.100.11 198.51.100.12 198.51.100.13 198.51.100.14"
+```
+
+You can log into rank 0 at `192.0.2.10` and run setup there. Peers use its
+fabric address, `198.51.100.11`, for coordination; rank 0 uses each peer's
+fabric address for SSH, discovery, binary staging and checkpoint transfers.
+Rank 0's separate management connection can provide internet access for
+downloads; peers receive their checkpoints from rank 0.
+
+Alternatively, put rank 0's management address first if every peer can reach
+it, while keeping the peers' fabric addresses in the remaining entries.
+Setup accepts either layout. The choice depends on actual routing, not on
+whether an address is labelled management or fabric. Select RoCE devices and
+GIDs afterward, including the interfaces carrying these addresses when desired.
+
 Keep fabric/journal TCP ports restricted to cluster members. The defaults
 are 29970 and 29971; set them in `.env`. These internal protocols have no
 authentication and must not be exposed to an untrusted network.

@@ -19,8 +19,8 @@
 //   NAME     := one of the request's tool names (a byte automaton over the
 //               vocabulary's token texts, so any tokenization of the name
 //               is accepted and nothing else)
-//   KEY      := a property name of that tool's schema when the schema
-//               closes its keys, else free text
+//   KEY      := a property name of that tool's schema when it declares
+//               properties, else free text
 //   VALUE    := typed by the property's schema (M6 6i): a JSON text under
 //               the 6h machine for a JSON-typed property, one of the enum
 //               texts for an enum string, free text otherwise; the closing
@@ -39,10 +39,13 @@
 // distribution restricted to the mask and renormalized, exactly.
 //
 // Keys and required properties: keys are constrained to the schema's
-// property names when it closes them (additionalProperties false), and a
-// closed key is offered at most once per call (a duplicate key is never a
-// valid object); under `strict: true` the call cannot close while a
-// required key is missing (OpenAI's strict guarantee — every required
+// property names whenever it declares properties and does not opt out with
+// an explicit `additionalProperties: true` (JSON Schema's open default is a
+// validation semantic; as a decoding grammar an open name slot invites an
+// undeclared or a repeated name), and a declared key is offered at most
+// once per call (a duplicate key is never a valid object); under
+// `strict: true` the call cannot close while a required key is missing
+// (OpenAI's strict guarantee — every required
 // property present, each typed by its schema). A non-strict tool's
 // required keys and its free-text values stay the parser's schema typing
 // and the client's validation, as with OpenAI's non-strict tools.
@@ -84,7 +87,7 @@ struct GrammarArg {
 // its typed arguments.
 struct GrammarTool {
   std::string name;
-  bool constrain_keys = false;     // the schema closes its properties
+  bool constrain_keys = false;     // the declared property names are the keys
   std::vector<std::string> keys;   // the property names, when closed
   std::vector<GrammarArg> args;    // the declared properties' value constraints
   // `parameters.required` (the names among the declared properties) and
@@ -96,10 +99,12 @@ struct GrammarTool {
 
 // Derives a tool's grammar entry from its OpenAI function definition
 // ({name, parameters, strict?} — the `function` object, or the flat form):
-// the key set closes under `additionalProperties: false`, and every
-// declared property gets its GrammarArg. Under `strict: true` every
-// property's schema must lie inside the constrained subset, else
-// std::invalid_argument whose message starts with the offending path
+// the key set closes to the declared property names unless the schema opts
+// out with an explicit `additionalProperties: true` (a note; the names are
+// then free text), and every declared property gets its GrammarArg. Under
+// `strict: true` every property's schema must lie inside the constrained
+// subset, else std::invalid_argument whose message starts with the
+// offending path
 // ("parameters.properties.city.pattern: ..."). Otherwise a
 // JSON-typed property keeps its type under the keywords that merely narrow
 // a value (minimum, maxLength, pattern, format, ...) — each is a line in

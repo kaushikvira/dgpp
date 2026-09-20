@@ -1875,12 +1875,15 @@ DGPP_TEST(serve_toolChoice_armsTheGrammarNotThePrompt) {
   require(g[4].mode == Mode::kRequired && !g[4].parallel, "required + single");
   require(g[5].mode == Mode::kAuto && g[5].parallel && g[5].tools.size() == 2,
           "auto: calls at will, every call well-formed");
-  // An open schema (no additionalProperties: false) leaves the keys free.
+  // A schema that omits additionalProperties closes its declared keys: the
+  // key slot is free text otherwise, which is what lets the model write an
+  // undeclared or repeated name (2026-09-19).
   (void)post_until_usage(
       rig, chat_body("abcd", 64, kWeatherTools + ",\"tool_choice\":\"required\""));
   const std::vector<dgpp::text::GrammarSpec> g2 = rig.engine.grammars();
-  require(g2.size() == 7 && !g2[6].tools[0].constrain_keys,
-          "JSON Schema's default is open: keys unconstrained");
+  require(g2.size() == 7 && g2[6].tools[0].constrain_keys &&
+              g2[6].tools[0].keys == std::vector<std::string>{"city", "days"},
+          "an omitted additionalProperties: the declared keys are closed");
   // A strict function whose schema leaves the enforceable subset is a 400
   // naming the keyword path; the same schema without strict is served
   // with that value typed and the narrowing unenforced, and a

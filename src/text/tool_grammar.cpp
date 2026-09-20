@@ -171,11 +171,21 @@ GrammarTool grammar_tool_from_function(const minijson::Value& def,
   }
   const minijson::Value* props = params->find("properties");
   const minijson::Value* extra = params->find("additionalProperties");
-  const bool closed = extra != nullptr && extra->is_bool() && !extra->as_bool(true);
   if (props == nullptr || !props->is_object()) return tool;
-  // Keys close only when the schema says so (additionalProperties false —
-  // JSON Schema's default is open) and declares properties.
-  if (closed) {
+  // The keys close whenever the schema declares properties and does not
+  // opt out with an explicit `additionalProperties: true`. JSON Schema's
+  // default is open, but that is a validation semantic: as a decoding
+  // grammar an open key set makes the name slot free text, and the model
+  // then writes names from its own prior — an undeclared one, or the same
+  // one twice — which no client can tell from a model fault. Any other
+  // value (false, or a subschema this grammar cannot type per name)
+  // closes the set too; the opt-out is noted.
+  const bool open_keys = extra != nullptr && extra->is_bool() && extra->as_bool();
+  if (open_keys) {
+    if (notes != nullptr)
+      notes->push_back("additionalProperties: true on '" + tool.name +
+                       "': the keys are free text, not the declared properties");
+  } else {
     tool.constrain_keys = true;
     for (const minijson::Member& pm : props->members()) tool.keys.push_back(pm.key);
   }

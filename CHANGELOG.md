@@ -107,6 +107,19 @@ The history by milestone. The dated engineering record in
   us per collective, results bitwise. `scripts/bus_window_skew.py` reports the
   gaps; `benchmarks/micro/uar_probe.cpp` records that the GB10 maps an mlx5
   doorbell page for device access.
+- **Guided source setup** (2026-09-19): add `scripts/setup.sh` for deployment
+  selection, site and RoCE configuration, dependency checks on every node,
+  optional system-package installation, release build, checkpoint download/sync
+  and final serving preflight. Preserve local tuning and credentials on reruns;
+  support unattended setup, read-only prerequisite checks and offline cache reuse.
+  `setup.py` turns an interpreter older than 3.10 away itself, before its
+  project imports (the wrapper holds no inline Python, per the scripts' lint);
+  the SSH reachability probes never read the terminal, so type-ahead and piped
+  answers reach the prompts; and the preflight that `dgpp-cluster up` runs
+  requires write access to the checkpoint cache only while preparing — a
+  read-only model store still starts. Validated on the four-node cluster in
+  read-only, configure-only, unattended (with and without the build) and
+  interactive modes, against throwaway site files.
 - **Streaming images and GLM prefill scheduling** (2026-09-19): remove
   history-wide image count/token caps. Stage visual embeddings through fixed
   single-image and chunk buffers, including MTP lookahead and cached suffixes.

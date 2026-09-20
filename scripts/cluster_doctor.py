@@ -183,9 +183,17 @@ def probe(spec):
     env.update({key: os.path.expanduser(value) for key, value in spec["env"].items()})
     record("platform", "ok" if platform.system() == "Linux" and platform.machine() == "aarch64" else "fail",
            f"{platform.system()} {platform.machine()}; supported target is Linux/aarch64 GB10")
+    record("Python", "ok" if sys.version_info >= (3, 10) else "fail",
+           f"{platform.python_version()}; Python 3.10+ is required")
     required = ["python3", "timeout", "ldd"]
     if spec["rank"] == 0:
         required += ["ssh", "scp", "curl", "jq"]
+    if spec.get("preparing"):
+        required += ["ip"]
+        if len(spec["nodes"]) > 1:
+            required += ["rsync"]
+        if spec["rank"] == 0:
+            required += ["pdftotext"]
     missing = [name for name in required if not shutil.which(name)]
     record("commands", "fail" if missing else "ok", "missing: " + ", ".join(missing) if missing else ", ".join(required))
     try:
@@ -201,21 +209,27 @@ def probe(spec):
                gpu.stdout.strip() or gpu.stderr.strip())
     except (OSError, subprocess.TimeoutExpired) as error:
         record("GPU", "fail", str(error))
-    for name, path in spec["paths"].items():
+    for name, path in {**spec["paths"], "model cache": str(cache_root(env))}.items():
         if not path:
             continue
         parent = ancestor(path)
-        writable = os.access(parent, os.W_OK | os.X_OK)
+        # Serving only READS the checkpoint cache (a read-only model store is a
+        # legitimate site layout, and `up` runs this preflight); preparation
+        # downloads and syncs into it. Every other path here is written at run time.
+        writes = name != "model cache" or bool(spec.get("preparing"))
+        usable = os.access(parent, (os.W_OK if writes else os.R_OK) | os.X_OK)
         free = shutil.disk_usage(parent).free
-        record(name, "ok" if writable else "fail", f"{path}: parent {parent}, {free / 2**30:.1f} GiB free" + ("" if writable else "; not writable"))
-    try:
-        snapshot = cached_snapshot(spec["model"], cache_root(env))
-        size = checkpoint_size(snapshot)
-        record("checkpoint", "ok", f"{snapshot}: {size / 2**30:.1f} GiB; all indexed shards have consistent lengths (not a content hash check)")
-    except (OSError, ValueError, KeyError, TypeError) as error:
-        record("checkpoint", "fail", f"checkpoint missing, incomplete or ambiguous: {error}; "
-               "on rank 0 run python3 scripts/download_model.py --config FILE "
-               "with this deployment's filename; add --sync-only if rank 0 already has the complete checkpoint")
+        record(name, "ok" if usable else "fail", f"{path}: parent {parent}, {free / 2**30:.1f} GiB free" +
+               ("" if usable else "; not writable" if writes else "; not readable"))
+    if not spec.get("preparing"):
+        try:
+            snapshot = cached_snapshot(spec["model"], cache_root(env))
+            size = checkpoint_size(snapshot)
+            record("checkpoint", "ok", f"{snapshot}: {size / 2**30:.1f} GiB; all indexed shards have consistent lengths (not a content hash check)")
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            record("checkpoint", "fail", f"checkpoint missing, incomplete or ambiguous: {error}; "
+                   "on rank 0 run python3 scripts/download_model.py --config FILE "
+                   "with this deployment's filename; add --sync-only if rank 0 already has the complete checkpoint")
     try:
         memory = next(line for line in Path("/proc/meminfo").read_text().splitlines() if line.startswith("MemAvailable:"))
         record("available memory", "ok", f"{int(memory.split()[1]) / 2**20:.1f} GiB; startup enforces the exact model memory plan")
@@ -285,14 +299,16 @@ def probe(spec):
             libraries = command(["ldconfig", "-p"])
             needed = ["libibverbs.so", "libcudart.so.13", "libcublasLt.so.13", "libstdc++.so"]
             absent = [name for name in needed if name not in libraries.stdout]
-            record("peer runtime libraries", "fail" if absent else "ok", "missing: " + ", ".join(absent) if absent else ", ".join(needed))
-            record("peer binary", "warn", "development binary will be staged; verify identical OS/compiler runtime compatibility")
+            record("runtime libraries" if spec["rank"] == 0 else "peer runtime libraries",
+                   "fail" if absent else "ok", "missing: " + ", ".join(absent) if absent else ", ".join(needed))
+            if not spec.get("preparing"):
+                record("peer binary", "warn", "development binary will be staged; verify identical OS/compiler runtime compatibility")
         except (OSError, subprocess.TimeoutExpired) as error:
             record("peer runtime libraries", "fail", str(error))
     return {"rank": spec["rank"], "checks": checks, "devices": devices}
 
 
-def check_cluster(cfg, binary, log_dir, stage_dir, user, peer_binary=None, *, local_only=False):
+def check_cluster(cfg, binary, log_dir, stage_dir, user, peer_binary=None, *, local_only=False, preparing=False):
     reports = []
     for rank, host in enumerate(cfg["nodes"]):
         if local_only and rank:
@@ -300,6 +316,7 @@ def check_cluster(cfg, binary, log_dir, stage_dir, user, peer_binary=None, *, lo
         spec = {"rank": rank, "nodes": cfg["nodes"], "model": cfg["model"],
                 "ports": cfg["ports"], "http_bind": cfg["http"]["bind_host"],
                 "env": cfg["node_env"][rank], "binary": binary if rank == 0 else peer_binary,
+                "preparing": preparing,
                 "paths": {"logs/staging": log_dir if rank == 0 else stage_dir,
                           "resident cache": cfg["node_env"][rank].get("DGPP_RESIDENT_CACHE_DIR") or
                                             cfg["paths"].get("resident_cache") or "~/.cache/dgpp/resident"}}

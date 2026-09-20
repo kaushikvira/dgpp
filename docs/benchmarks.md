@@ -655,6 +655,29 @@ this table. Every four-rank operation stream matched at shutdown. The current
 stream-ordered fold is the default; `DGPP_DSV41_EAGER_FOLD=1` selects the
 superseded host-driven diagnostic path.
 
+### The README's headline rows, all templates as shipped (2026-09-19)
+
+One day's campaign over every GLM and Qwen FP8 template on the current code
+(release `0.1.0+g27c661e`; the four-Spark Flash hybrid's prefill on the
+previous commit the same day — its prefill path did not change), MTP depth
+one, greedy, 256 output tokens, the five prompt classes; `timed_load.py --concurrency 1,4 --classes all --repeat 2` (three
+repeats on the four-Spark Flash hybrid) and `serve_prefill_probe.py 2048 8192
+32768 --repeat 2` on a fresh world. Single-request is the engine's decode
+tok/s, the C4 column request-wall tok/s, each a range over the classes'
+means; prefill is the cold service path's median.
+
+| template | single request | four live requests (wall) | cold prefill ~2K / 8K / 32K |
+|---|---:|---:|---:|
+| GLM-5.3-Flash-FP8, 4 Sparks (at `kv_capacity` 393216: the FP8 experts do not fit the base template's context) | 41.5–51.3 | 66.1–72.2 | 1.484 / 5.938 / 35.391 s |
+| GLM-5.3-Flash NVFP4/FP8, 4 Sparks | 55.0–62.8 | 102.0–115.1 | 1.283 / 5.287 / 24.600 s |
+| GLM-5.3-Flash NVFP4/FP8, 2 Sparks | 31.7–36.5 | 55.2–58.2 | 2.084 / 8.429 / 36.937 s |
+| Qwen3.8-Flash-Next-FP8, 4 Sparks | 68.1–84.6 | 142.3–162.6 | 1.038 / 3.945 / 16.258 s |
+| Qwen3.8-Flash-Next-FP8, 2 Sparks (one repeat; prefill not re-run) | 45.6–55.7 | 85.5–98.0 | — |
+| GLM-4.7-NVFP4, 4 Sparks | 33.5–37.7 | 62.8–68.2 | 2.386 / 14.912 / 157.414 s |
+| full GLM-5.3 int4/int8, 4 Sparks | 27.3–31.1 | 44.2–45.9 | 4.185 / 21.282 / 149.684 s |
+
+Raw: `benchmarks/results/2026-09-19-glm-flash-line-rate/raw/round5-headline-summary.json`.
+
 ## 6. Prefill and time to first token
 
 The headline figures use `serve_prefill_probe.py`: a fresh prompt with a
