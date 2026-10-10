@@ -8,6 +8,13 @@ out of scope:** `QwenFullAttnLayer` (`full_attn_decode` / `full_attn_prefill`,
 same-shaped `k_cache`/`v_cache` but rides a *different* pool struct
 (`layers.hpp:325`) and is Qwen3.5-only — do not "fix" it as part of this work.
 
+**Status (2026-10-10): Phase A is implemented and verified.** Commits on
+`feat/qwen-fp8-kv-cache`: `95e08f66` (fp8 pool + config wiring), `a57d99d0`
+(append quantize-on-write), `b96ac756` (in-kernel fp8 dequant for all three
+attention kernels + the real-path test). The bf16 path is bitwise-unchanged
+(`qsa_test` 12/12); `engine.kv_dtype: fp8` now boots the Qwen lane. **Phase B
+(native FP8-MMA attention, no dequant) is not started.**
+
 ## 0. Goal
 
 Add an `engine.kv_dtype` knob to the Qwen lane so the QSA paged K/V cache can be
@@ -133,6 +140,21 @@ Reading: p99 (0.0553) is under the 2⁻⁴ mantissa bound; the only "max 1.0" is
 The attention output's `l2_rel` is **0.0368 (3.7 %)** — well under the 2⁻⁴
 necessary-condition bound, confirming the √N averaging in the score. **Pre-
 registered Phase A band: attention `l2_rel` ≤ 0.0625; expect ~0.03–0.04.**
+
+### Measured on the REAL path (2026-10-10, after Phase A)
+
+The `qwen_fp8_kv_real_path_matches_bf16` test exercises the actual fp8 pool
+(`qsa_kv_append` quantizes on write; the attention kernels dequant in-kernel)
+against the bf16 pool, for all three attention kernels:
+
+```
+[fp8-kv] REAL PATH (append-quantize + in-kernel dequant) vs bf16: l2_rel 0.0360  max_abs 0.02441
+[fp8-kv] REAL PATH prefill kernel vs bf16:                        l2_rel 0.0360  max_abs 0.02441
+[fp8-kv] REAL PATH warp prefill kernel vs bf16:                   l2_rel 0.0360  max_abs 0.02974
+```
+
+All three within the pre-registered band, and matching the host-round-trip
+prediction (0.0368) — the quantizer is the only divergence source, as designed.
 
 ## 1. Phases
 
