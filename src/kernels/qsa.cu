@@ -494,6 +494,8 @@ template <int D, int kHpw>
 __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_row_stride,
                                     const uint16_t* __restrict__ k_cache,
                                     const uint16_t* __restrict__ v_cache,
+                                    const float* __restrict__ k_scale,
+                                    const float* __restrict__ v_scale,
                                     const int32_t* __restrict__ req_ids,
                                     const int32_t* __restrict__ topk, int topk_stride,
                                     const int32_t* __restrict__ counts, int n_split,
@@ -694,7 +696,32 @@ __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_ro
     }
   };
 
-  if (async_gather) {
+  if (k_scale != nullptr) {
+    // fp8 cache: serial gather of the e4m3 codes + the per-(row, kv-head)
+    // scale, dequantized to bf16 in the smem tiles; the scores / PV phases
+    // below are unchanged (they read bf16 from kt / vt). The bf16 path is
+    // untouched (k_scale null).
+    const uint8_t* k8 = reinterpret_cast<const uint8_t*>(k_cache);
+    const uint8_t* v8 = reinterpret_cast<const uint8_t*>(v_cache);
+    for (int t0 = t_begin; t0 < t_end; t0 += kQsaTile) {
+      const int n = min(kQsaTile, t_end - t0);
+      resolve(t0, n, phys_rows);
+      __syncthreads();
+      for (int idx = static_cast<int>(threadIdx.x); idx < n * D; idx += static_cast<int>(blockDim.x)) {
+        const int tt = idx / D;
+        const int e = idx - tt * D;
+        const int64_t phys = phys_rows[tt];
+        const int64_t cbase = phys * width + kvh * D + e;
+        kt[tt * kRowStride + e] = latent_fp8_decode_bf16(k8[cbase], k_scale[phys * kv_heads + kvh]);
+        vt[tt * kRowStride + e] = latent_fp8_decode_bf16(v8[cbase], v_scale[phys * kv_heads + kvh]);
+      }
+      __syncthreads();
+      scores_phase(n);
+      __syncthreads();
+      pv_phase(n);
+      __syncthreads();
+    }
+  } else if (async_gather) {
     int n = min(kQsaTile, t_end - t_begin);
     int64_t* phys_cur = phys_rows;
     int64_t* phys_nxt = phys_next;
@@ -907,10 +934,12 @@ void qsa_attn_partial(const uint16_t* q, int64_t q_row_stride, const uint16_t* k
                       int topk_stride, const int32_t* counts, int rows, int n_split,
                       int local_heads, int kv_heads, int dim, int block_tokens,
                       const int32_t* block_tables, int blocks_per_request, float scale,
-                      float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream) {
+                      float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream,
+                      const float* k_scale, const float* v_scale) {
   qsa_attn_partial_gather(q, q_row_stride, k_cache, v_cache, req_ids, topk, topk_stride, counts, rows,
                           n_split, local_heads, kv_heads, dim, block_tokens, block_tables,
-                          blocks_per_request, scale, m_ws, l_ws, c_ws, stream, -1, 0, 0);
+                          blocks_per_request, scale, m_ws, l_ws, c_ws, stream, -1, 0, 0, k_scale,
+                          v_scale);
 }
 
 void qsa_attn_partial_gather(const uint16_t* q, int64_t q_row_stride, const uint16_t* k_cache,
@@ -919,7 +948,8 @@ void qsa_attn_partial_gather(const uint16_t* q, int64_t q_row_stride, const uint
                              int local_heads, int kv_heads, int dim, int block_tokens,
                              const int32_t* block_tables, int blocks_per_request, float scale,
                              float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream,
-                             int async_gather, int heads_per_block, int heads_per_warp) {
+                             int async_gather, int heads_per_block, int heads_per_warp,
+                             const float* k_scale, const float* v_scale) {
   if (rows <= 0) return;
   if (!q || !k_cache || !v_cache || !req_ids || !topk || !counts || !block_tables || !m_ws ||
       !l_ws || !c_ws)
@@ -960,8 +990,9 @@ void qsa_attn_partial_gather(const uint16_t* q, int64_t q_row_stride, const uint
     constexpr int D = decltype(dim_tag)::value;
     constexpr int H = decltype(hpw_tag)::value;
     attn_partial_kernel<D, H><<<grid, threads, smem, stream>>>(
-        q, q_row_stride, k_cache, v_cache, req_ids, topk, topk_stride, counts, n_split, local_heads,
-        kv_heads, block_tokens, block_tables, blocks_per_request, scale, m_ws, l_ws, c_ws, async_gather);
+        q, q_row_stride, k_cache, v_cache, k_scale, v_scale, req_ids, topk, topk_stride, counts,
+        n_split, local_heads, kv_heads, block_tokens, block_tables, blocks_per_request, scale, m_ws,
+        l_ws, c_ws, async_gather);
   };
   const auto by_hpw = [&](auto dim_tag) {
     switch (hpw) {

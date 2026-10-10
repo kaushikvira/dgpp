@@ -135,7 +135,8 @@ void qsa_attn_partial(const uint16_t* q, int64_t q_row_stride, const uint16_t* k
                       int topk_stride, const int32_t* counts, int rows, int n_split,
                       int local_heads, int kv_heads, int dim, int block_tokens,
                       const int32_t* block_tables, int blocks_per_request, float scale,
-                      float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream);
+                      float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream,
+                      const float* k_scale = nullptr, const float* v_scale = nullptr);
 // The same with the tile gather pinned: 1 = the cp.async phases (the
 // default; DGPP_QSA_ASYNC=0 turns the default to the serial gather),
 // 0 = serial, -1 = the default; heads_per_block (a divisor of the heads per
@@ -147,7 +148,8 @@ void qsa_attn_partial_gather(const uint16_t* q, int64_t q_row_stride, const uint
                       int local_heads, int kv_heads, int dim, int block_tokens,
                       const int32_t* block_tables, int blocks_per_request, float scale,
                       float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream,
-                      int async_gather, int heads_per_block, int heads_per_warp);
+                      int async_gather, int heads_per_block, int heads_per_warp,
+                      const float* k_scale = nullptr, const float* v_scale = nullptr);
 
 // Prefill variant with wider KV sharing and cooperative warp softmax at dim=256;
 // other dimensions use qsa_attn_partial. Identical split/tile arithmetic and
@@ -157,7 +159,8 @@ void qsa_attn_prefill_partial(const uint16_t* q, int64_t q_row_stride, const uin
                       int topk_stride, const int32_t* counts, int rows, int n_split,
                       int local_heads, int kv_heads, int dim, int block_tokens,
                       const int32_t* block_tables, int blocks_per_request, float scale,
-                      float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream);
+                      float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream,
+                      const float* k_scale = nullptr, const float* v_scale = nullptr);
 
 // One warp per (query, KV group) on the tensor cores (qsa_warp.cu): the
 // prefill attention over each row's listed tokens, written normalized as fp32
@@ -169,7 +172,8 @@ void qsa_attn_prefill_warp(const uint16_t* q, int64_t q_row_stride, const uint16
                            const uint16_t* v_cache, const int32_t* req_ids, const int32_t* topk, int topk_stride,
                            const int32_t* counts, int rows, int local_heads, int kv_heads, int block_tokens,
                            const int32_t* block_tables, int blocks_per_request, float scale, float* out,
-                           cudaStream_t stream);
+                           cudaStream_t stream, const float* k_scale = nullptr,
+                           const float* v_scale = nullptr);
 
 // out[r, h * dim + d] = bf16(bf16(c[r, h, d]) x bf16(sigmoid(gate))) with
 // the gate of head h at gate + r * gate_row_stride + h * gate_head_stride.

@@ -27,6 +27,7 @@
 
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
+#include "kernels/latent_format.hpp"
 
 namespace dgpp {
 namespace {
@@ -68,7 +69,8 @@ __device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
 
 __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
     const uint16_t* __restrict__ q, int64_t q_row_stride, const uint16_t* __restrict__ k_cache,
-    const uint16_t* __restrict__ v_cache, const int32_t* __restrict__ req_ids, const int32_t* __restrict__ topk,
+    const uint16_t* __restrict__ v_cache, const float* __restrict__ k_scale,
+    const float* __restrict__ v_scale, const int32_t* __restrict__ req_ids, const int32_t* __restrict__ topk,
     int topk_stride, const int32_t* __restrict__ counts, int local_heads, int kv_heads, int block_tokens,
     const int32_t* __restrict__ block_tables, int blocks_per_request, float scale, float* __restrict__ out) {
   extern __shared__ __align__(16) uint16_t sm[];
@@ -106,11 +108,33 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
     const int base = tile * kTileTok;
     // Lanes 0..15 resolve the tile's 16 physical rows in one round of loads
     // (a serial token -> block-table chain per issue step starved the copies).
-    int64_t my_off = 0;
+    int64_t my_off = 0, my_phys = 0;
     if (lane < kTileTok && base + lane < cnt) {
       const int tok = toks[base + lane];
       const int64_t phys = static_cast<int64_t>(bt[tok / block_tokens]) * block_tokens + tok % block_tokens;
+      my_phys = phys;
       my_off = phys * width + static_cast<int64_t>(kvh) * kD;
+    }
+    if (k_scale != nullptr) {
+      // fp8 cache: serial dequant-gather into the smem tiles as bf16; the
+      // ldmatrix / mma below are unchanged (they read bf16). k_cache / v_cache
+      // are the e4m3 code planes (1 B/elem; `off` is an element index).
+      const uint8_t* k8 = reinterpret_cast<const uint8_t*>(k_cache);
+      const uint8_t* v8 = reinterpret_cast<const uint8_t*>(v_cache);
+#pragma unroll
+      for (int i = 0; i < 16; ++i) {
+        const int64_t p = __shfl_sync(0xffffffffu, my_phys, i);
+        const int64_t off = __shfl_sync(0xffffffffu, my_off, i) + lane * 8;
+        const bool valid = base + i < cnt;
+        const float ks = k_scale[p * kv_heads + kvh];
+        const float vs = v_scale[p * kv_heads + kvh];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          kt[i * kRow + lane * 8 + j] = valid ? latent_fp8_decode_bf16(k8[off + j], ks) : uint16_t(0);
+          vt[i * kRow + lane * 8 + j] = valid ? latent_fp8_decode_bf16(v8[off + j], vs) : uint16_t(0);
+        }
+      }
+      return;
     }
 #pragma unroll
     for (int i = 0; i < 16; ++i) {            // token i, lane = its 16-byte chunk
@@ -232,7 +256,7 @@ void qsa_attn_prefill_warp(const uint16_t* q, int64_t q_row_stride, const uint16
                            const uint16_t* v_cache, const int32_t* req_ids, const int32_t* topk, int topk_stride,
                            const int32_t* counts, int rows, int local_heads, int kv_heads, int block_tokens,
                            const int32_t* block_tables, int blocks_per_request, float scale, float* out,
-                           cudaStream_t stream) {
+                           cudaStream_t stream, const float* k_scale, const float* v_scale) {
   if (rows <= 0) return;
   if (!qsa_warp_supported(kD, local_heads, kv_heads))
     throw std::invalid_argument("qsa_attn_prefill_warp: dim 256, <= 16 query heads per KV head");
@@ -246,7 +270,8 @@ void qsa_attn_prefill_warp(const uint16_t* q, int64_t q_row_stride, const uint16
   }();
   (void)opted;
   const dim3 grid(static_cast<unsigned>(rows), static_cast<unsigned>(kv_heads));
-  qsa_attn_prefill_warp_kernel<<<grid, 32, kSmem, stream>>>(q, q_row_stride, k_cache, v_cache, req_ids, topk,
+  qsa_attn_prefill_warp_kernel<<<grid, 32, kSmem, stream>>>(q, q_row_stride, k_cache, v_cache, k_scale,
+                                                              v_scale, req_ids, topk,
                                                               topk_stride, counts, local_heads, kv_heads,
                                                               block_tokens, block_tables, blocks_per_request,
                                                               scale, out);

@@ -428,15 +428,13 @@ struct QwenFamily final : ServeFamily {
         ckpt(checkpoint),
         fp8_head_mma(head_mma),
         kv_format(kv_fmt) {
-    // The Qwen KV-cache format (engine.kv_dtype). Only bf16 is served today;
-    // a non-bf16 value is rejected here (not silently ignored) so a user who
-    // sets kv_dtype: fp8 gets a clear error, not a bf16 pool that reports
-    // bf16. Relaxed to accept kFp8 once the fp8 KV path (docs/qwen_fp8_kv_plan.md)
-    // lands.
-    if (kv_format != dgpp::LatentFormat::kBf16)
+    // The Qwen KV-cache format (engine.kv_dtype): bf16 or fp8 (e4m3 rows with
+    // one scale per (slot, kv-head); the QSA attention dequants in-kernel).
+    // fp4 is rejected here (not implemented). See docs/qwen_fp8_kv_plan.md.
+    if (kv_format != dgpp::LatentFormat::kBf16 && kv_format != dgpp::LatentFormat::kFp8)
       throw std::invalid_argument(std::string("engine.kv_dtype ") +
                                   dgpp::latent_format_name(kv_format) +
-                                  " is not supported for Qwen (bf16 only)");
+                                  " is not supported for Qwen (bf16 or fp8)");
     // The fused BF16 MTP expert format is a process-wide flag (set from the
     // engine config or CLI before the family is built); it must be on the
     // config before the binding table and the loader see it.

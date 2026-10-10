@@ -101,17 +101,24 @@ void fill_cache(const std::vector<uint16_t>& k, const std::vector<uint16_t>& v, 
 std::vector<uint16_t> run_attn(const uint16_t* qonly, const uint16_t* qgate, const uint16_t* kc,
                                const uint16_t* vc, const int32_t* dreq, const int32_t* dtopk,
                                const int32_t* dcounts, const int32_t* dtable, const Fp8Geo& g,
-                               int n_split, cudaStream_t st) {
+                               int n_split, cudaStream_t st, const float* k_scale = nullptr,
+                               const float* v_scale = nullptr, bool prefill = false) {
   const int width = g.width();
   const size_t part = static_cast<size_t>(g.rows) * n_split * g.local_heads;
   DevBuf m_ws(part * 4), l_ws(part * 4), c_ws(part * g.dim * 4),
       c_out(static_cast<size_t>(g.rows) * g.local_heads * g.dim * 4),
       out(static_cast<size_t>(g.rows) * g.local_heads * g.dim * 2);
   const int64_t q_row_stride = g.local_heads * g.dim, q_head_stride = 2 * g.dim;
-  dgpp::qsa_attn_partial(qonly, q_row_stride, kc, vc, dreq, dtopk, g.seq, dcounts,
-                         g.rows, n_split, g.local_heads, g.kv_heads, g.dim, g.block_tokens, dtable,
-                         g.blocks_per_request(), 1.0f / 16.0f, mptr<float>(m_ws), mptr<float>(l_ws),
-                         mptr<float>(c_ws), st);
+  if (prefill)
+    dgpp::qsa_attn_prefill_partial(qonly, q_row_stride, kc, vc, dreq, dtopk, g.seq, dcounts,
+                                   g.rows, n_split, g.local_heads, g.kv_heads, g.dim, g.block_tokens,
+                                   dtable, g.blocks_per_request(), 1.0f / 16.0f, mptr<float>(m_ws),
+                                   mptr<float>(l_ws), mptr<float>(c_ws), st, k_scale, v_scale);
+  else
+    dgpp::qsa_attn_partial(qonly, q_row_stride, kc, vc, dreq, dtopk, g.seq, dcounts,
+                           g.rows, n_split, g.local_heads, g.kv_heads, g.dim, g.block_tokens, dtable,
+                           g.blocks_per_request(), 1.0f / 16.0f, mptr<float>(m_ws), mptr<float>(l_ws),
+                           mptr<float>(c_ws), st, k_scale, v_scale);
   dgpp::dsa_attn_combine(ptr<float>(m_ws), ptr<float>(l_ws), ptr<float>(c_ws), g.rows, n_split,
                          g.local_heads, g.dim, mptr<float>(c_out), st);
   dgpp::qsa_gate_out(ptr<float>(c_out), qgate + g.dim, q_row_stride, q_head_stride,
@@ -244,6 +251,123 @@ DGPP_TEST(qwen_fp8_kv_attention_sample_match) {
   // within 2^-4 relative, so the output's l2_rel cannot exceed 2^-4.
   require(s.l2_rel <= 0.0625,
           "fp8 attention output l2_rel exceeds the 2^-4 necessary-condition bound");
+}
+
+// The REAL Phase A path (not the host round-trip): qsa_kv_append quantizes the
+// K/V to e4m3 + per-(slot, kv-head) scales, and qsa_attn_partial dequants
+// in-kernel. Compared against the bf16 pool over the same queries. This is the
+// acceptance test for the fp8 storage + dequant kernels.
+DGPP_TEST(qwen_fp8_kv_real_path_matches_bf16) {
+  Fp8Geo g;
+  cudaStream_t st = test_stream();
+  const int width = g.width();
+  const int slots = g.slots();
+
+  std::vector<int32_t> table(static_cast<size_t>(g.blocks_per_request()));
+  for (int b = 0; b < g.blocks_per_request(); ++b) table[static_cast<size_t>(b)] = b;
+  DevBuf dtable = up(table);
+
+  const auto k = random_bf16_normal(41, static_cast<int64_t>(g.seq) * width, 1.0f);
+  const auto v = random_bf16_normal(42, static_cast<int64_t>(g.seq) * width, 1.0f);
+
+  DevBuf kc(static_cast<size_t>(slots) * width * 2), vc(static_cast<size_t>(slots) * width * 2);
+  fill_cache(k, v, g, ptr<int32_t>(dtable), mptr<uint16_t>(kc), mptr<uint16_t>(vc), st);
+
+  // fp8 pool: 1 B/elem codes + [slots, kv_heads] fp32 scales.
+  DevBuf kc8(static_cast<size_t>(slots) * width), vc8(static_cast<size_t>(slots) * width);
+  DevBuf ks(static_cast<size_t>(slots) * g.kv_heads * 4), vs(static_cast<size_t>(slots) * g.kv_heads * 4);
+  {
+    std::vector<int32_t> req_ids(static_cast<size_t>(g.seq), 0);
+    std::vector<int64_t> pos(static_cast<size_t>(g.seq));
+    for (int i = 0; i < g.seq; ++i) pos[static_cast<size_t>(i)] = i;
+    DevBuf dk = up(k), dv = up(v), dreq = up(req_ids), dpos = up(pos);
+    dgpp::qsa_kv_append(ptr<uint16_t>(dk), width, ptr<uint16_t>(dv), width, ptr<int32_t>(dreq),
+                        ptr<int64_t>(dpos), g.seq, ptr<int32_t>(dtable), g.blocks_per_request(),
+                        g.block_tokens, g.kv_heads, g.dim,
+                        reinterpret_cast<uint16_t*>(mptr<uint8_t>(kc8)),
+                        reinterpret_cast<uint16_t*>(mptr<uint8_t>(vc8)), mptr<float>(ks),
+                        mptr<float>(vs), st);
+  }
+
+  const int64_t q_row_stride = g.local_heads * (2 * g.dim);
+  const auto qg = random_bf16_normal(43, static_cast<int64_t>(g.rows) * q_row_stride, 1.0f);
+  std::vector<uint16_t> qonly(static_cast<size_t>(g.rows) * g.local_heads * g.dim);
+  for (int r = 0; r < g.rows; ++r)
+    for (int h = 0; h < g.local_heads; ++h)
+      std::copy(qg.begin() + (r * q_row_stride + h * 2 * g.dim),
+                qg.begin() + (r * q_row_stride + h * 2 * g.dim + g.dim),
+                qonly.begin() + (static_cast<size_t>(r) * g.local_heads + h) * g.dim);
+  std::vector<int32_t> req_ids(static_cast<size_t>(g.rows), 0);
+  std::vector<int32_t> topk(static_cast<size_t>(g.rows) * g.seq);
+  for (int r = 0; r < g.rows; ++r)
+    for (int i = 0; i < g.seq; ++i) topk[static_cast<size_t>(r) * g.seq + i] = i;
+  std::vector<int32_t> counts(static_cast<size_t>(g.rows), g.seq);
+  DevBuf dqg = up(qg), dqonly = up(qonly), dreq = up(req_ids), dtopk = up(topk), dcounts = up(counts);
+
+  const auto ref = run_attn(ptr<uint16_t>(dqonly), ptr<uint16_t>(dqg), mptr<uint16_t>(kc),
+                            mptr<uint16_t>(vc), ptr<int32_t>(dreq), ptr<int32_t>(dtopk),
+                            ptr<int32_t>(dcounts), ptr<int32_t>(dtable), g, 1, st);
+  const auto got = run_attn(ptr<uint16_t>(dqonly), ptr<uint16_t>(dqg),
+                            reinterpret_cast<uint16_t*>(mptr<uint8_t>(kc8)),
+                            reinterpret_cast<uint16_t*>(mptr<uint8_t>(vc8)), ptr<int32_t>(dreq),
+                            ptr<int32_t>(dtopk), ptr<int32_t>(dcounts), ptr<int32_t>(dtable), g, 1, st,
+                            mptr<float>(ks), mptr<float>(vs));
+
+  const long n = static_cast<long>(ref.size());
+  std::vector<float> gf(n), wf(n);
+  for (long i = 0; i < n; ++i) {
+    gf[static_cast<size_t>(i)] = dgpp::bf16_bits_to_float(got[static_cast<size_t>(i)]);
+    wf[static_cast<size_t>(i)] = dgpp::bf16_bits_to_float(ref[static_cast<size_t>(i)]);
+  }
+  const Stats s = compare_abs_rel(gf.data(), wf.data(), n, 0.0);
+  std::printf("[fp8-kv] REAL PATH (append-quantize + in-kernel dequant) vs bf16: "
+              "l2_rel %.4f  max_abs %.4g\n", s.l2_rel, s.max_abs);
+  require(s.l2_rel <= 0.0625, "fp8 real-path attention l2_rel exceeds the 2^-4 bound");
+
+  // The prefill kernel (the `attend` function pointer's long-prefill branch)
+  // over the same fp8 pool.
+  const auto ref_pf = run_attn(ptr<uint16_t>(dqonly), ptr<uint16_t>(dqg), mptr<uint16_t>(kc),
+                               mptr<uint16_t>(vc), ptr<int32_t>(dreq), ptr<int32_t>(dtopk),
+                               ptr<int32_t>(dcounts), ptr<int32_t>(dtable), g, 1, st, nullptr, nullptr,
+                               /*prefill=*/true);
+  const auto got_pf = run_attn(ptr<uint16_t>(dqonly), ptr<uint16_t>(dqg),
+                               reinterpret_cast<uint16_t*>(mptr<uint8_t>(kc8)),
+                               reinterpret_cast<uint16_t*>(mptr<uint8_t>(vc8)), ptr<int32_t>(dreq),
+                               ptr<int32_t>(dtopk), ptr<int32_t>(dcounts), ptr<int32_t>(dtable), g, 1, st,
+                               mptr<float>(ks), mptr<float>(vs), /*prefill=*/true);
+  std::vector<float> gpf(n), wpf(n);
+  for (long i = 0; i < n; ++i) {
+    gpf[static_cast<size_t>(i)] = dgpp::bf16_bits_to_float(got_pf[static_cast<size_t>(i)]);
+    wpf[static_cast<size_t>(i)] = dgpp::bf16_bits_to_float(ref_pf[static_cast<size_t>(i)]);
+  }
+  const Stats sp = compare_abs_rel(gpf.data(), wpf.data(), n, 0.0);
+  std::printf("[fp8-kv] REAL PATH prefill kernel vs bf16: l2_rel %.4f  max_abs %.4g\n", sp.l2_rel,
+              sp.max_abs);
+  require(sp.l2_rel <= 0.0625, "fp8 real-path prefill l2_rel exceeds the 2^-4 bound");
+
+  // The tensor-core warp prefill kernel (the serving default for long prefill).
+  if (dgpp::qsa_warp_supported(g.dim, g.local_heads, g.kv_heads)) {
+    const int64_t qrs = static_cast<int64_t>(g.local_heads) * g.dim;
+    DevBuf ref_w(static_cast<size_t>(n) * 4), got_w(static_cast<size_t>(n) * 4);
+    dgpp::qsa_attn_prefill_warp(ptr<uint16_t>(dqonly), qrs, mptr<uint16_t>(kc), mptr<uint16_t>(vc),
+                                ptr<int32_t>(dreq), ptr<int32_t>(dtopk), g.seq, ptr<int32_t>(dcounts),
+                                g.rows, g.local_heads, g.kv_heads, g.block_tokens, ptr<int32_t>(dtable),
+                                g.blocks_per_request(), 1.0f / 16.0f, mptr<float>(ref_w), st, nullptr,
+                                nullptr);
+    dgpp::qsa_attn_prefill_warp(ptr<uint16_t>(dqonly), qrs,
+                                reinterpret_cast<uint16_t*>(mptr<uint8_t>(kc8)),
+                                reinterpret_cast<uint16_t*>(mptr<uint8_t>(vc8)), ptr<int32_t>(dreq),
+                                ptr<int32_t>(dtopk), g.seq, ptr<int32_t>(dcounts), g.rows, g.local_heads,
+                                g.kv_heads, g.block_tokens, ptr<int32_t>(dtable), g.blocks_per_request(),
+                                1.0f / 16.0f, mptr<float>(got_w), st, mptr<float>(ks), mptr<float>(vs));
+    DGPP_CUDA_OK(cudaStreamSynchronize(st));
+    const auto rwf = down<float>(ref_w, static_cast<size_t>(n));
+    const auto gwf = down<float>(got_w, static_cast<size_t>(n));
+    const Stats sw = compare_abs_rel(gwf.data(), rwf.data(), n, 0.0);
+    std::printf("[fp8-kv] REAL PATH warp prefill kernel vs bf16: l2_rel %.4f  max_abs %.4g\n",
+                sw.l2_rel, sw.max_abs);
+    require(sw.l2_rel <= 0.0625, "fp8 real-path warp prefill l2_rel exceeds the 2^-4 bound");
+  }
 }
 
 int main() { return dgpp::test::run_all(); }
