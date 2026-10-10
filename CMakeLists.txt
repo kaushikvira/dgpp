@@ -1111,6 +1111,15 @@ target_link_libraries(qwen_fp8_mma_attn_test PRIVATE dgpp_models_qwen dgpp_kerne
 dgpp_set_common(qwen_fp8_mma_attn_test)
 add_test(NAME qwen_fp8_mma_attn_test COMMAND qwen_fp8_mma_attn_test)
 
+# C.1a error attribution study (host-only, NO GPU): the per-factor l2_rel
+# split of the E4M3 attention path (Q/K/P/V x row/block scales x Hadamard)
+# over the unit-normal / heavy-tailed / sink distributions. Plain C++ over
+# the header-only codecs (latent_format.hpp); runs anywhere.
+add_executable(qwen_fp8_error_attribution tests/cuda/qwen_fp8_error_attribution.cpp)
+target_include_directories(qwen_fp8_error_attribution PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+dgpp_set_common(qwen_fp8_error_attribution)
+add_test(NAME qwen_fp8_error_attribution COMMAND qwen_fp8_error_attribution)
+
 # C.1a (d): the prefix-cache block copy carries the MXFP8 block-scale plane.
 # A .cpp test (QwenKvPool's header chain does not compile under nvcc).
 add_executable(qwen_fp8_block_copy_test tests/cuda/qwen_fp8_block_copy_test.cpp)
