@@ -11,10 +11,13 @@
 >   unit-normal, ~0.057 with realistic outlier dims; dequant path is the reference at
 >   0.0360) → `DGPP_QSA_FP8_MX` implemented, correct, **left default OFF**; C.1b (block-scale
 >   V) and C.2 (Hadamard) NO-GO; C.3b (decode mma) NO-GO stands.
-> * **Real-data validation (2026-10-11, §3.2): the NO-GO flips.** A live forward pass's
->   post-RoPE Q/K (layer 23, 12.5k prefill, `DGPP_DUMP_QK`) is milder than every synthetic
->   stress regime (no >10×-rms outliers, dr p99 4.37–7.83), and on it the tensor-core path
->   reaches **0.0265 (seq=128) / 0.0145 (seq=4096) < 0.035** — the bar IS reachable; the
+> * **Real-data validation (2026-10-11, §3.2): the NO-GO flips — and generalises.** A live
+>   forward pass's post-RoPE Q/K (`DGPP_DUMP_QK`) is 3× cleaner than the synthetic unit-normal
+>   case; the gap is **structural** (the i.i.d.-rows / random-V synthetic sampling model is the
+>   mismatch — the unit-normal case is *not* outlier-heavy, and the synthetic `l2_rel` is flat in
+>   seq), not about the stress regimes. Across 5 captures (3 prompts × layers 7/23/47) the **best
+>   tensor-core path meets 0.035 in every cell** (worst 0.0329), but the **deployed default**
+>   (row scales) runs 0.0152–**0.0512** and misses the bar on the filler cold-start case; the
 >   block-scale/Hadamard levers still do not clearly earn their keep (wash / ≤1.31×).
 > * Records: `dgpp-gateway/docs/NIGHT-20261010.md`,
 >   `dgpp-gateway/results/ab-night-20261010-summary.md`,
@@ -291,30 +294,84 @@ heavier-tailed (kurtosis 0.27–1.30, dr p99 up to 7.83 on Q) but with **no
 
 At the apples-to-apples seq=128 slice the real tensor-core base is **0.0314**
 (vs 0.0518 unit-normal) and the best tensor-core path **0.0265 < 0.035** — the
-§3.1 "unreachable" verdict does not hold on real data. The deciding feature:
-the real rows' within-row dynamic range (dr p99 4.37–7.83, zero >10×-rms
-outliers) is far below the stress regimes (10.4–15.9, 0.2–0.4 % outliers), so
-the e4m3 codes carry the rows with ~2× less relative error; the sharp real
-softmax at long seq dilutes the residual per-token error further (seq=4096
-numbers).
+§3.1 "unreachable" verdict does not hold on real data.
+
+**Why the real data is 3× cleaner than the synthetic — the gap is structural,
+not about the stress regimes.** The first explanation to rule out is "the real
+rows are milder than the stress regimes": that is true of the *stress* regimes
+but does **not** explain the gap against the plain **unit-normal** case, whose
+row statistics are *milder* than the real ones (unit-normal K: kurt −0.03,
+zero >10×-rms outliers — lighter-tailed than the real K's kurt 0.27). Two
+experiments settle it (host-only, `--synth-seq` sweep + score/V statistics on
+both sides):
+
+* **The seq/sharpness dependence does NOT explain it.** The synthetic
+  unit-normal `l2_rel` is *flat* in seq — base 0.0518 (128) → 0.0533 (512) →
+  0.0526 (1024) → 0.0533 (2048) → 0.0534 (4096); best-tc 0.0501 → 0.0529 — while
+  the real data *collapses* (base 0.0314 @128 → 0.0163 @4096). If long-seq
+  sharpness were the driver, the synthetic would collapse too; it does not.
+* **The synthetic *sampling model* is the mismatch.** The distinguishing
+  quantities, real vs synthetic unit-normal (seq=4096 slice):
+
+  | feature | real | synthetic unit-normal |
+  |---|---|---|
+  | V row norm p50/p99 | 7.12 / 10.87 | 15.98 / 17.65 (~2.3× larger) |
+  | score max−mean p50 | 5.74 | 3.60 |
+  | softmax entropy p50 (nats, flat 8.32) | 7.02 | 7.82 |
+
+  The real Q/K are *correlated* (a real head attends to real content), so the
+  scores are sharper and the PV product concentrates on a few dominant, cleaner
+  V rows; the synthetic draws Q/K i.i.d. (→ diffuse Gaussian scores) and V
+  i.i.d. unit-normal (→ ~2.3× larger V norm). **Verdict: the whole synthetic
+  model of attention inputs was unrealistic, not just the stress regimes** —
+  the i.i.d.-rows / random-V sampling is what the §3.1 NO-GO rested on.
+
+**Does the flip generalise? (5 captures, 3 prompts × layers 7/23/47).**
+Re-captured with the same instrument on three genuinely different long inputs
+— a repetitive-filler control, a diverse prose/code/mixed technical text, and a
+math/logic-heavy prompt (each nonce-prefixed, `cache_n=0`) — at the early (7),
+middle (23) and late (47) QSA layers. `l2_rel` at the seq=4096 slice, with the
+deployed default (Q row, K row, P e4m3, V row — `DGPP_QSA_FP8_MX` off) added to
+the grid:
+
+| prompt × layer | base | best tensor-core | **deployed default** | dequant | bar 0.035 (best-tc) |
+|---|---|---|---|---|---|
+| filler × L23 | 0.0360 | 0.0329 | **0.0512** | 0.0490 | yes |
+| diverse × L23 | 0.0163 | 0.0156 | 0.0203 | 0.0175 | yes |
+| diverse × L7 | 0.0336 | 0.0280 | 0.0322 | 0.0253 | yes |
+| diverse × L47 | 0.0265 | 0.0220 | 0.0336 | 0.0283 | yes |
+| math × L23 | 0.0125 | 0.0119 | 0.0152 | 0.0125 | yes |
+
+The **best tensor-core path meets 0.035 in every cell** (worst 0.0329,
+filler × L23), so the "reachable" verdict generalises across prompts and
+layers. But the **deployed default does not** in the worst case: its `l2_rel`
+runs 0.0152 (math) → **0.0512 (filler × L23)**, the last above the 0.035 bar.
+The filler × L23 cell is the outlier — it samples the *first* 4096 tokens of a
+fresh 8k prompt (the cold-start region, stride 1), a degenerate low-diversity
+distribution, and is the one capture where even base (0.0360) and dequant
+(0.0490) sit above the bar. **The number the owner cares about — the deployed
+default's `l2_rel` — is 0.0152–0.0512 across captures, and it clears 0.035 on
+4 of 5 but not the filler cold-start case.**
 
 **What this does and does not reopen.** The *bar* is reachable on the
-tensor-core path, so the two-mode story (MMA=1 speed / MMA=0 accuracy) is no
-longer forced — the speed mode already meets 0.035 on this data. The
-*individual levers* still do not clearly earn their keep: block scales are a
-wash (K-blk −0.0013 vs K-row at seq=128; V-blk +0.0049 at seq=128 but
-−0.0015 at seq=4096) and Hadamard is ≤1.31× (H+deq 0.0131→0.0100 at seq=4096,
-0.97× at seq=128) — at, not above, the 1.3× gate. C.1a stays as shipped
-(worst-element bound, default OFF); C.1b/C.2 remain NO-GO *as levers*, but
-the "0.035 unreachable" premise behind them is falsified.
+tensor-core path (best-tc, every cell), so the two-mode story (MMA=1 speed /
+MMA=0 accuracy) is no longer forced. The *individual levers* still do not
+clearly earn their keep: block scales are a wash and Hadamard is ≤1.31× — at,
+not above, the 1.3× gate. C.1a stays as shipped (worst-element bound, default
+OFF); C.1b/C.2 remain NO-GO *as levers*, but the "0.035 unreachable" premise
+behind them is falsified. The open question the multi-capture table raises:
+the **deployed default** (row scales, not the best-tc block/Hadamard combo)
+misses the bar on the hardest (cold-start, low-diversity) input — whether that
+warrants a default change is a separate decision from the bar's reachability.
 
-**Caveats (one capture, read before generalising):** one prompt (a
-repetitive-filler 12.4k prefill — a degenerate, low-diversity distribution;
-real agentic prompts may be heavier-tailed), one layer (23), one rank's head
-group, one seed. The l2_rel at seq=4096 is not directly comparable to the
-seq=128 synthetic numbers (softmax sharpness differs). A follow-up capture on
-a diverse real prompt (and 2–3 more layers) is the honest next step before
-re-opening any C.x work item.
+**Caveats (read before generalising):** five captures, one rank's head group
+(12 q + 1 kv head of the TP=2 split), one seed each; the filler × L23 cell is a
+cold-start sample and the single hardest case. Dumps total ~386 MB (none
+truncated; the 300 MiB per-file cap was not hit), under
+`results/qk-real2-20261011/` in the gateway repo (the `qk-*.bin` captures +
+`study-*-seq4096.txt` outputs + `prompts.py`/`send.py`). The seq=4096 `l2_rel`
+is not directly comparable to the seq=128 synthetic numbers (softmax sharpness
+differs).
 
 ## 4. C.2 — Incoherent processing (Hadamard) before the fp8 quant
 

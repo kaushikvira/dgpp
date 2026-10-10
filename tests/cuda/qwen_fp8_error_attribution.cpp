@@ -349,6 +349,10 @@ const Cfg kConfigs[] = {
     // The C.1a baseline (Q blk, K blk, P e4m3 pow2-gamma, V row) + the
     // single-factor deltas + the Hadamard (C.2) columns + the best combos.
     {QF::BLK, QF::BLK, QF::ROW, PF::E4M3, false, "base   Q blk  K blk  P e4m3 V row "},
+    // The DEPLOYED DEFAULT (DGPP_QSA_FP8_MX off: row scales on Q and K, the
+    // P e4m3 pow2-gamma, V row) -- the config that actually ships, so its
+    // bar status is the one that matters.
+    {QF::ROW, QF::ROW, QF::ROW, PF::E4M3, false, "depdef Q row  K row  P e4m3 V row "},
     {QF::ROW, QF::BLK, QF::ROW, PF::E4M3, false, "q_row  Q row  K blk  P e4m3 V row "},
     {QF::BF16, QF::BLK, QF::ROW, PF::E4M3, false, "q_bf16 Q bf16 K blk  P e4m3 V row "},
     {QF::BLK, QF::ROW, QF::ROW, PF::E4M3, false, "k_row  Q blk  K row  P e4m3 V row "},
@@ -508,6 +512,69 @@ void print_row_stats(const char* label, const RowStats& s) {
       label, s.rows, s.norm_p50, s.norm_p99, s.dr_p50, s.dr_p99, s.kurt, s.outlier_frac);
 }
 
+// Score-spread statistics: the per-(row, head) pre-softmax score vector (the
+// bf16 reference's math, the unquantized q.k/16), the softmax sharpness the
+// PV error dilution depends on. spread = max - mean of the row's scores;
+// ent = the softmax entropy in nats (log(seq) is the flat maximum). This is
+// the feature that distinguishes "the seq/sharpness dependence explains the
+// real-vs-synthetic gap" from "the synthetic sampling model (i.i.d. rows /
+// random V, uncorrelated Q/K) is the mismatch": a sharp real softmax
+// (low entropy, high spread) that the i.i.d. synthetic does not reproduce is
+// the structural mismatch.
+struct ScoreStats {
+  size_t n = 0;
+  double spread_p50 = 0, spread_p99 = 0;
+  double ent_p50 = 0, ent_p99 = 0;
+};
+
+ScoreStats score_stats(const Data& d) {
+  const float s = 1.0f / 16.0f;
+  const int grp = d.H / d.KV;
+  std::vector<double> spreads, ents;
+  for (int r = 0; r < d.rows; ++r)
+    for (int h = 0; h < d.H; ++h) {
+      const int hkv = h / grp;
+      const float* qr = d.q.data() + (static_cast<size_t>(r) * d.H + h) * d.D;
+      std::vector<float> sc(static_cast<size_t>(d.seq));
+      float M = -INFINITY;
+      for (int n = 0; n < d.seq; ++n) {
+        const float* kr = d.k.data() + (static_cast<size_t>(n) * d.KV + hkv) * d.D;
+        float dot = 0.f;
+        for (int j = 0; j < d.D; ++j) dot += qr[j] * kr[j];
+        sc[static_cast<size_t>(n)] = s * dot;
+        M = std::max(M, sc[static_cast<size_t>(n)]);
+      }
+      double mn = 0;
+      for (float x : sc) mn += x;
+      mn /= d.seq;
+      spreads.push_back(*std::max_element(sc.begin(), sc.end()) - mn);
+      double l = 0;
+      for (float x : sc) l += exp(x - M);
+      double H = 0;
+      for (float x : sc) {
+        const double p = exp(x - M) / l;
+        if (p > 0) H -= p * std::log(p);
+      }
+      ents.push_back(H);
+    }
+  ScoreStats st;
+  st.n = spreads.size();
+  std::sort(spreads.begin(), spreads.end());
+  std::sort(ents.begin(), ents.end());
+  st.spread_p50 = spreads[spreads.size() / 2];
+  st.spread_p99 = spreads[static_cast<size_t>(spreads.size() * 0.99 + 0.5)];
+  st.ent_p50 = ents[ents.size() / 2];
+  st.ent_p99 = ents[static_cast<size_t>(ents.size() * 0.99 + 0.5)];
+  return st;
+}
+
+void print_score_stats(const char* label, const ScoreStats& st, int seq) {
+  std::printf("  %-30s %-6zu rows x heads  score max-mean p50/p99 %8.2f/%8.2f  "
+              "softmax entropy p50/p99 %7.3f/%7.3f nats (flat %.3f)\n",
+              label, st.n, st.spread_p50, st.spread_p99, st.ent_p50, st.ent_p99,
+              std::log(static_cast<double>(seq)));
+}
+
 // ---- the grid runner (shared by the synthetic and real-data modes) ---------
 struct Row {
   const Cfg* cfg;
@@ -595,17 +662,22 @@ int main(int argc, char** argv) {
   }
   const int seeds = 3;
   // Argument scan: --real <dump> arms the real-data mode, --seq <n> overrides
-  // the real mode's K-token count (the synthetic grids keep seq=128, the
-  // test's standard slice), a bare number is the seed offset (re-draw every
-  // distribution for a seed-to-seed stability check of the key numbers).
+  // the real mode's K-token count, --synth-seq <n> runs the synthetic grids at
+  // a K-token count other than the test's standard 128 slice (the seq/sharpness
+  // sweep: does the synthetic l2_rel collapse at long seq the way the real
+  // one does?), a bare number is the seed offset (re-draw every distribution
+  // for a seed-to-seed stability check of the key numbers).
   const char* real_path = nullptr;
   int real_seq = 4096;
+  int synth_seq = 128;
   uint64_t offset = 0;
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--real") == 0 && i + 1 < argc) {
       real_path = argv[++i];
     } else if (std::strcmp(argv[i], "--seq") == 0 && i + 1 < argc) {
       real_seq = std::atoi(argv[++i]);
+    } else if (std::strcmp(argv[i], "--synth-seq") == 0 && i + 1 < argc) {
+      synth_seq = std::atoi(argv[++i]);
     } else {
       offset = static_cast<uint64_t>(std::strtoull(argv[i], nullptr, 10));
     }
@@ -615,8 +687,17 @@ int main(int argc, char** argv) {
   for (int di = 0; di < 4; ++di) {
     const Dist dist = dists[di];
     const uint64_t seed0 = seed_bases[di] + offset;
-    run_grid(dist_name(dist), seeds,
-             [&dist, seed0](Data& d) { gen(d, dist, seed0); });
+    const std::string title = std::string(dist_name(dist)) + " (seq=" + std::to_string(synth_seq) + ")";
+    run_grid(title.c_str(), seeds,
+             [&dist, seed0, synth_seq](Data& d) { d.seq = synth_seq; gen(d, dist, seed0); });
+    // The features that distinguish the real-vs-synthetic gap: the score
+    // spread (softmax sharpness) and the V row norms the PV product sees, on
+    // the same data the grid ran.
+    Data probe;
+    probe.seq = synth_seq;
+    gen(probe, dist, seed0);
+    print_score_stats(dist_name(dist), score_stats(probe), synth_seq);
+    print_row_stats("V rows", row_stats(probe.v, probe.D));
   }
   if (real_path != nullptr) {
     RealDump rd;
@@ -667,6 +748,11 @@ int main(int argc, char** argv) {
     }
     std::printf("[fp8-attn] grid geometry: rows=%d H=%d KV=%d seq=%d (strided from %zu tokens)\n",
                 real.rows, real.H, real.KV, real.seq, rd.tokens);
+    // The same distinguishing features on the real slice the grid runs: the
+    // score spread (softmax sharpness) and the V row norms (the full dump, the
+    // counterpart of the synthetic V rows above).
+    print_score_stats("real scores", score_stats(real), real.seq);
+    print_row_stats("real V rows", row_stats(rd.v, rd.D));
     run_grid("real post-RoPE Q/K (DGPP_DUMP_QK)", 1, [&real](Data& d) { d = real; });
   }
   return 0;
