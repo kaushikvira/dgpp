@@ -574,8 +574,13 @@ DGPP_TEST(qwen_fp8_kv_block_scale_quantizer) {
   // win at extreme within-row dynamic range, below).
   require(blk_l2 <= 1.05 * row_l2,
           "block scales are materially worse than the row baseline on unit-normal data");
-  require(blk_max_rel <= 0.0625 + 1e-6,
-          "block-scale per-element rel error exceeds the 2^-4 mantissa bound");
+  // Unit-normal rows contain near-zero elements (a value near 1e-6 denormalizes
+  // to 0, making its relative error ~1), so max_rel is ~1.0 for BOTH schemes
+  // here. The 2^-4 worst-element bound belongs to the magnitude-bounded regime
+  // below, not to this one: the 00:27 re-pin put it here by mistake and left
+  // this suite red (row and block max_rel both 1.0000 on unit-normal data).
+  require(row_max_rel > 0.5 && blk_max_rel > 0.5,
+          "unit-normal max_rel should be dominated by near-zero elements for both schemes");
 
   // 1000x geometric spread: blocks at {1, 0.1, 0.01, 0.001, 1e-4 x4} (the
   // deterministic pattern keeps |block absmax| ~ the stated magnitude; all
