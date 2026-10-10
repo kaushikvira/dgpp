@@ -501,8 +501,28 @@ DGPP_TEST(qwen_fp8_kv_hw_decode_matches_software_bitwise) {
 // C.1a (a): the block-scale quantizer, host check. For realistic bf16 rows,
 // compute the 8 per-32-dim-block e8m0 scales (the append's recipe) and the
 // dequant round-trip error, and prove the power-of-two ceiling-round cannot
-// overflow (|x|/scale <= 448) and beats the row-scale baseline. No bit-
-// exactness required -- this isolates the quantizer from the tensor core.
+// overflow (|x|/scale <= 448). No bit-exactness required -- this isolates
+// the quantizer from the tensor core.
+//
+// Two regimes (the attribution study, qwen_fp8_error_attribution, settled
+// which is which):
+//   * unit-normal (no per-block outliers): block ~= row. The e8m0 scale is a
+//     power of two, so a block's max lands in (224, 448] of the e4m3 range
+//     instead of pinned at 448 -- the finer 32-element granularity buys a
+//     bit that the coarser scale representation spends again. Measured
+//     0.98x (block slightly WORSE); assert "not materially worse".
+//   * 1000x geometric spread (blocks at {1, 0.1, 0.01, 0.001, 1e-4 x4}): the
+//     row scale is set by the top block, so the cold blocks' codes underflow
+//     (rel err -> 1 for a few-to-many percent of the cold elements). The
+//     block scales pin each block's max in (224, 448], so EVERY element stays
+//     within the 2^-4 mantissa bound. The L2 is a WASH in both regimes --
+//     e4m3's 448 max + subnormals already cover ~10^5:1 of within-row range,
+//     and the underflowed elements carry negligible L2 energy -- so the
+//     discriminating observable is the MAX per-element rel err: block scales
+//     bound it at 2^-4, row scales do not. This is why the end-to-end
+//     attention l2_rel (qwen_fp8_error_attribution) shows block ~= row on
+//     every distribution: the block-scale "win" is a worst-element bound,
+//     not an L2 gain.
 DGPP_TEST(qwen_fp8_kv_block_scale_quantizer) {
   const int dim = 256, rows = 4096;
   const auto data = random_bf16_normal(7, static_cast<int64_t>(rows) * dim, 1.0f);
@@ -542,13 +562,89 @@ DGPP_TEST(qwen_fp8_kv_block_scale_quantizer) {
   }
   const double row_l2 = std::sqrt(row_num / std::max(row_den, 1e-30));
   const double blk_l2 = std::sqrt(blk_num / std::max(blk_den, 1e-30));
-  std::printf("[fp8-kv] block-scale quantizer (n=%d rows x 256): row l2_rel %.4f  block l2_rel %.4f  "
-              "improvement %.3fx  max_rel row %.4f block %.4f  overflow %ld\n",
+  std::printf("[fp8-kv] block-scale quantizer unit-normal (n=%d rows x 256): row l2_rel %.4f  "
+              "block l2_rel %.4f  ratio %.3fx  max_rel row %.4f block %.4f  overflow %ld\n",
               rows, row_l2, blk_l2, row_l2 / std::max(blk_l2, 1e-30), row_max_rel, blk_max_rel,
               overflow);
   require(overflow == 0, "block-scale ceiling-round overflowed: |x|/scale > 448");
-  require(blk_l2 < row_l2, "block scales did not beat the row-scale baseline");
+  // Outlier-free data: the e8m0 ceiling-round spends the granularity gain
+  // (measured 0.98x, block slightly worse), so the honest bound is "not
+  // materially worse" -- NOT "must beat" (the old assertion encoded the
+  // falsified hypothesis; the attribution study shows block scales only
+  // win at extreme within-row dynamic range, below).
+  require(blk_l2 <= 1.05 * row_l2,
+          "block scales are materially worse than the row baseline on unit-normal data");
   require(blk_max_rel <= 0.0625 + 1e-6,
+          "block-scale per-element rel error exceeds the 2^-4 mantissa bound");
+
+  // 1000x geometric spread: blocks at {1, 0.1, 0.01, 0.001, 1e-4 x4} (the
+  // deterministic pattern keeps |block absmax| ~ the stated magnitude; all
+  // blocks stay above the recipe's 1e-4 scale floor). The L2 is a wash
+  // (the underflowed cold elements carry negligible energy); the
+  // discriminating observable is the max per-element rel err.
+  const float mags[8] = {1.0f, 0.1f, 0.01f, 0.001f, 1e-4f, 1e-4f, 1e-4f, 1e-4f};
+  double sp_row_num = 0, sp_row_den = 0, sp_blk_num = 0, sp_blk_den = 0;
+  double sp_row_max_rel = 0, sp_blk_max_rel = 0;
+  long sp_overflow = 0;
+  for (int r = 0; r < rows; ++r) {
+    float rabs = 0.f;
+    float bsc[8];
+    std::vector<float> x(dim);
+    for (int b = 0; b < 8; ++b)
+      for (int i = 0; i < 32; ++i) {
+        const uint32_t u = (static_cast<uint32_t>(r) * 73856093u) ^
+                           (static_cast<uint32_t>(32 * b + i) * 83492791u);
+        const float pat = (static_cast<float>(u % 2001u) - 1000.0f) / 1000.0f;  // [-1, 1)
+        x[32 * b + i] = mags[b] * pat;
+        rabs = std::max(rabs, std::fabs(x[32 * b + i]));
+      }
+    const float rsc = rabs > 0.f ? rabs / 448.f : 1.f;
+    for (int b = 0; b < 8; ++b) {
+      float babs = 0.f;
+      for (int i = 0; i < 32; ++i) babs = std::max(babs, std::fabs(x[32 * b + i]));
+      const uint8_t byt = dgpp::latent_fp8_block_scale_byte(babs);
+      bsc[b] = babs > 0.f ? dgpp::e8m0_byte_to_float(byt) : 1.f;
+    }
+    for (int j = 0; j < dim; ++j) {
+      const float xv = x[static_cast<size_t>(j)];
+      const int b = j / 32;
+      const float rc = dgpp::fp8_e4m3_bits_to_float(dgpp::float_to_fp8_e4m3_bits(xv / rsc));
+      const float rd = rc * rsc;
+      sp_row_num += static_cast<double>(xv - rd) * (xv - rd);
+      sp_row_den += static_cast<double>(xv) * xv;
+      sp_row_max_rel =
+          std::max(sp_row_max_rel,
+                   static_cast<double>(std::fabs(xv - rd) / std::max(std::fabs(xv), 1e-30f)));
+      const float bc = dgpp::fp8_e4m3_bits_to_float(dgpp::float_to_fp8_e4m3_bits(xv / bsc[b]));
+      const float bd = bc * bsc[b];
+      sp_blk_num += static_cast<double>(xv - bd) * (xv - bd);
+      sp_blk_den += static_cast<double>(xv) * xv;
+      sp_blk_max_rel =
+          std::max(sp_blk_max_rel,
+                   static_cast<double>(std::fabs(xv - bd) / std::max(std::fabs(xv), 1e-30f)));
+      if (std::fabs(xv) / bsc[b] > 448.f + 1e-6f) ++sp_overflow;
+    }
+  }
+  const double sp_row_l2 = std::sqrt(sp_row_num / std::max(sp_row_den, 1e-30));
+  const double sp_blk_l2 = std::sqrt(sp_blk_num / std::max(sp_blk_den, 1e-30));
+  std::printf("[fp8-kv] block-scale quantizer 1000x spread: row l2_rel %.4f  block l2_rel %.4f  "
+              "ratio %.3fx  max_rel row %.4f block %.4f  overflow %ld\n",
+              sp_row_l2, sp_blk_l2, sp_row_l2 / std::max(sp_blk_l2, 1e-30), sp_row_max_rel,
+              sp_blk_max_rel, sp_overflow);
+  require(sp_overflow == 0, "block-scale ceiling-round overflowed on the spread rows");
+  // L2: a wash -- e4m3's 448 max + subnormals cover ~10^5:1 of within-row
+  // range, so the underflowed cold elements (a few % of a negligible-energy
+  // block) do not move the L2. Assert "not materially worse", not "must
+  // beat" (the old assertion encoded the falsified hypothesis).
+  require(sp_blk_l2 <= 1.05 * sp_row_l2,
+          "block scales are materially worse than the row baseline at 1000x spread");
+  // Worst-element: the row scale (set by the top block) underflows the cold
+  // blocks' codes (rel err -> 1), while the block scales pin every element
+  // within the 2^-4 mantissa bound. This is the block scales' actual win:
+  // a bounded worst-element error, NOT an L2 gain.
+  require(sp_row_max_rel >= 0.5,
+          "the row-scale reference did not underflow the cold blocks (test not discriminating)");
+  require(sp_blk_max_rel <= 0.0625 + 1e-6,
           "block-scale per-element rel error exceeds the 2^-4 mantissa bound");
 }
 
@@ -684,6 +780,14 @@ DGPP_TEST(qwen_fp8_mx_partial_real_path) {
   DevBuf kc8(static_cast<size_t>(slots) * width), vc8(static_cast<size_t>(slots) * width);
   DevBuf ks(static_cast<size_t>(slots) * g.kv_heads * 4), vs(static_cast<size_t>(slots) * g.kv_heads * 4);
   DevBuf kbs(static_cast<size_t>(slots) * g.kv_heads * 8), vbs(static_cast<size_t>(slots) * g.kv_heads * 8);
+  // v_bscale is NEVER written by the C.1a append (qsa.cu: the V codes stay
+  // row-quantized; the plane is reserved for C.1b and the POOL memsets it in
+  // production). This test's buffer is raw cudaMalloc (uninitialized), so the
+  // check must be "the append left it UNTOUCHED": sentinel-fill it and
+  // require every byte is still the sentinel. (The old "all zero" assertion
+  // read uninitialized memory and failed non-deterministically.)
+  const size_t bplane = static_cast<size_t>(slots) * g.kv_heads * 8;
+  vbs.upload(std::vector<uint8_t>(bplane, 0xEE).data(), bplane);
   setenv("DGPP_QSA_FP8_MX", "1", 1);
   {
     std::vector<int32_t> req_ids(static_cast<size_t>(g.seq), 0);
@@ -697,15 +801,14 @@ DGPP_TEST(qwen_fp8_mx_partial_real_path) {
                         mptr<float>(vs), st, mptr<uint8_t>(kbs), mptr<uint8_t>(vbs));
   }
   // The K block plane was written (nonzero e8m0 bytes); the V block plane is
-  // reserved for C.1b (V codes stay row-quantized) and must stay ZERO -- a
-  // nonzero v_bscale would misdescribe the stored V codes.
-  const size_t bplane = static_cast<size_t>(slots) * g.kv_heads * 8;
+  // reserved for C.1b (V codes stay row-quantized) and must be UNTOUCHED --
+  // a written v_bscale would misdescribe the stored V codes.
   const auto kbs_h = down<uint8_t>(kbs, bplane);
   const auto vbs_h = down<uint8_t>(vbs, bplane);
   require(std::any_of(kbs_h.begin(), kbs_h.end(), [](uint8_t b) { return b != 0; }),
           "the K block plane is empty (the MX=1 append did not write it)");
-  require(std::all_of(vbs_h.begin(), vbs_h.end(), [](uint8_t b) { return b == 0; }),
-          "v_bscale must stay zero in C.1a (V codes are row-quantized; the plane is reserved for C.1b)");
+  require(std::all_of(vbs_h.begin(), vbs_h.end(), [](uint8_t b) { return b == 0xEE; }),
+          "v_bscale must stay untouched in C.1a (V codes are row-quantized; the plane is reserved for C.1b)");
   const int64_t q_row_stride = g.local_heads * (2 * g.dim);
   const auto qg = random_bf16_normal(63, static_cast<int64_t>(g.rows) * q_row_stride, 1.0f);
   std::vector<uint16_t> qonly(static_cast<size_t>(g.rows) * g.local_heads * g.dim);
