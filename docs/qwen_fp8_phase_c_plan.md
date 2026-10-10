@@ -140,6 +140,17 @@ scales per 256-dim row (one per 32 values)**, applied by `kind::mxf8f6f4` inside
   (8 blocks → 2 × b32 per operand, byte selectors alternating `0/1` per `ks`) to
   `mma_e4m3_sf`. The bf16-dequant fallback (`DGPP_QSA_FP8_MMA=0`) must dequant from the 8
   block scales, not a row scale.
+* **Read path (all attention paths, C.1a follow-up)**: in `MX=1` every path consumes the
+  block plane, so the toggle is path-independent (the fail-loud guard in `layers.cpp` is
+  gone): the warp kernel runs the block-scaled QK^T (MMA=1) or the block-aware dequant
+  (MMA=0); `attn_partial_kernel` (decode / short prefill) and
+  `attn_prefill_partial_kernel` (long prefill, `DGPP_QSA_WARP=0`) dequant a K code at dim
+  `c` with the e8m0 scale of block `c/32` (the 16-code 16-byte gather chunk is half a
+  32-dim block, so the block index is constant per load). **V stays row-quantized** in
+  C.1a (the PV `γ` epilogue is untouched), so `v_bscale` is **not written** — the plane
+  stays zero (the pool memsets it) and is reserved for C.1b; a block plane computed from
+  the bf16 source would misdescribe the row-quantized V codes. `qsa_fp8_mx()`
+  (`kernels/qsa.hpp`) is the single per-call env read.
 * **Spike first (C.1.0, blocking)**: an **SF-fragment oracle** — same shape as the existing
   A-fragment oracle (`qwen_fp8_mma_attn_test.cu:450`, "max |mma − host dot| = 0") that
   pins which lane/byte holds which (row, k-block) scale for `scale_vec::1X`. Do not write

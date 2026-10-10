@@ -26,6 +26,7 @@ __global__ void attn_prefill_partial_kernel(const uint16_t* __restrict__ q, int6
                                     const uint16_t* __restrict__ v_cache,
                                     const float* __restrict__ k_scale,
                                     const float* __restrict__ v_scale,
+                                    const uint8_t* __restrict__ k_bscale, int mx,
                                     const int32_t* __restrict__ req_ids,
                                     const int32_t* __restrict__ topk, int topk_stride,
                                     const int32_t* __restrict__ counts, int n_split,
@@ -118,7 +119,18 @@ __global__ void attn_prefill_partial_kernel(const uint16_t* __restrict__ q, int6
         const int32_t blk = bt[tok / block_tokens];
         const int64_t phys = static_cast<int64_t>(blk) * block_tokens + tok % block_tokens;
         const uint8_t* src = (which == 0 ? k8 : v8) + phys * width + kvh * D + c;
-        const float sc = (which == 0 ? k_scale : v_scale)[phys * kv_heads + kvh];
+        float sc;
+        if (which == 0) {
+          // C.1a (MX): the K codes are block-quantized (32-dim blocks, e8m0
+          // plane). This 16-code chunk is exactly half of one 32-dim block
+          // (c is a multiple of 16), so the block index c / 32 is constant
+          // per load. V stays row-quantized (the PV gamma epilogue).
+          sc = (mx && k_bscale != nullptr)
+                   ? e8m0_byte_to_float(k_bscale[phys * (kv_heads * 8) + kvh * 8 + c / 32])
+                   : k_scale[phys * kv_heads + kvh];
+        } else {
+          sc = v_scale[phys * kv_heads + kvh];
+        }
         uint16_t* dst = (which == 0 ? kt : vt) + tt * kRowStride + c;
         const uint4 v4 = *reinterpret_cast<const uint4*>(src);
         const uint8_t* b = reinterpret_cast<const uint8_t*>(&v4);
@@ -177,12 +189,13 @@ void qsa_attn_prefill_partial(const uint16_t* q, int64_t q_row_stride, const uin
                       int local_heads, int kv_heads, int dim, int block_tokens,
                       const int32_t* block_tables, int blocks_per_request, float scale,
                       float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream,
-                      const float* k_scale, const float* v_scale) {
+                      const float* k_scale, const float* v_scale, const uint8_t* k_bscale) {
   if (rows <= 0) return;
   if (dim != 256) {
     qsa_attn_partial(q, q_row_stride, k_cache, v_cache, req_ids, topk, topk_stride, counts,
                      rows, n_split, local_heads, kv_heads, dim, block_tokens, block_tables,
-                     blocks_per_request, scale, m_ws, l_ws, c_ws, stream, k_scale, v_scale);
+                     blocks_per_request, scale, m_ws, l_ws, c_ws, stream, k_scale, v_scale,
+                     k_bscale);
     return;
   }
   if (!q || !k_cache || !v_cache || !req_ids || !topk || !counts || !block_tables || !m_ws ||
@@ -203,10 +216,12 @@ void qsa_attn_prefill_partial(const uint16_t* q, int64_t q_row_stride, const uin
   const dim3 grid(static_cast<unsigned>(rows), static_cast<unsigned>(n_split),
                   static_cast<unsigned>(local_heads / hpb));
   const int threads = hpb * 32;
+  // C.1a: the block-scale flag is read per call (qsa.hpp), not latched.
+  const int mx = qsa_fp8_mx();
   attn_prefill_partial_kernel<256><<<grid, threads, smem, stream>>>(
-      q, q_row_stride, k_cache, v_cache, k_scale, v_scale, req_ids, topk, topk_stride, counts, n_split,
-      local_heads, kv_heads, block_tokens, block_tables, blocks_per_request, scale, m_ws,
-      l_ws, c_ws);
+      q, q_row_stride, k_cache, v_cache, k_scale, v_scale, k_bscale, mx, req_ids, topk, topk_stride,
+      counts, n_split, local_heads, kv_heads, block_tokens, block_tables, blocks_per_request,
+      scale, m_ws, l_ws, c_ws);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

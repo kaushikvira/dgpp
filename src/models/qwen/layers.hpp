@@ -238,8 +238,12 @@ struct QwenQsaCache {
   float* v_scale = nullptr;         // fp8: per-(slot, kv-head) scale [slots, lkv]; bf16: null
   // fp8 C.1a (docs/qwen_fp8_phase_c_plan.md §3): the additive MXFP8 block-scale
   // plane, 8 e8m0 bytes per (slot, kv-head) (one per 32 of the 256-dim row),
-  // [slots, lkv * 8]. Written by the append when DGPP_QSA_FP8_MX=1; consumed by
-  // the block-scaled QK^T mma. Null for bf16 and when the plane is absent.
+  // [slots, lkv * 8]. k_bscale is written by the append when
+  // DGPP_QSA_FP8_MX=1 and consumed by every attention read path (the warp
+  // block-scaled QK^T, the partial / prefill-partial block-aware dequant). v_bscale
+  // is reserved for C.1b (V block-quantization): C.1a leaves it zero because the
+  // V codes stay row-quantized, so a written plane would misdescribe them.
+  // Both null for bf16 and when the plane is absent.
   uint8_t* k_bscale = nullptr;
   uint8_t* v_bscale = nullptr;
   uint16_t* index_cache = nullptr;  // bf16 [pool_slots, Di]

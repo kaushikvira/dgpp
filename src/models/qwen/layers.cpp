@@ -826,30 +826,22 @@ void QwenQsaLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows& row
   }();
   const bool warp_path = warp_attn && !rows.decode && T >= 128 && qsa_warp_supported(D, lh_, lkv_);
   // C.1a (docs/qwen_fp8_phase_c_plan.md §3): DGPP_QSA_FP8_MX=1 block-quantizes
-  // the K codes (the append writes the e8m0 block plane). Only the warp kernel
-  // consumes that plane (block-scaled QK^T on MMA=1, block-aware dequant on
-  // MMA=0). The partial / decode / DGPP_QSA_WARP=0 paths dequant K with the
-  // fp32 row scale, which is inconsistent with block-quantized codes -- refuse
-  // to run them rather than silently corrupt. (Block-aware decode is C.3.)
+  // the K codes (the append writes the e8m0 block plane). Every attention read
+  // path consumes that plane: the warp kernel runs the block-scaled QK^T (MMA=1)
+  // or the block-aware dequant (MMA=0), and the partial / prefill-partial /
+  // decode kernels dequant K with the per-32-dim-block e8m0 scale (V stays
+  // row-quantized). MX=1 is therefore path-independent; no guard needed.
   if (warp_path) {
     qsa_attn_prefill_warp(qn_, static_cast<int64_t>(lh_) * D, cache.k_cache, cache.v_cache, d_req, topk_,
                           max_selected_, counts_, T, lh_, lkv_, cache.block_tokens, cache.block_tables,
                           cache.blocks_per_request, scale_, c_out_, stream, cache.k_scale, cache.v_scale,
                           cache.k_bscale);
   } else {
-    if (cache.k_scale != nullptr) {
-      const char* e = std::getenv("DGPP_QSA_FP8_MX");
-      if (e != nullptr && e[0] == '1')
-        throw std::runtime_error(
-            "QwenQsaLayer: DGPP_QSA_FP8_MX=1 block-quantizes the K codes, which only the prefill "
-            "warp kernel consumes; this row took the partial/decode path (decode, T < 128, or "
-            "DGPP_QSA_WARP=0). Block-aware decode is C.3; unset DGPP_QSA_FP8_MX for these rows.");
-    }
     const auto attend = !rows.decode && T >= 128 ? qsa_attn_prefill_partial : qsa_attn_partial;
     attend(qn_, static_cast<int64_t>(lh_) * D, cache.k_cache, cache.v_cache, d_req, topk_,
            max_selected_, counts_, T, n_split_, lh_, lkv_, D, cache.block_tokens,
            cache.block_tables, cache.blocks_per_request, scale_, m_ws_, l_ws_, c_ws_, stream,
-           cache.k_scale, cache.v_scale);
+           cache.k_scale, cache.v_scale, cache.k_bscale);
     dsa_attn_combine(m_ws_, l_ws_, c_ws_, T, n_split_, lh_, D, c_out_, stream);
   }
   qsa_gate_out(c_out_, q_ + D, QW, 2 * D, o_, T, lh_, D, stream);

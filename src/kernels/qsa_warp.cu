@@ -652,12 +652,9 @@ void qsa_attn_prefill_warp(const uint16_t* q, int64_t q_row_stride, const uint16
     const char* e = std::getenv("DGPP_QSA_FP8_MMA");
     return !(e != nullptr && e[0] == '0');
   }();
-  // DGPP_QSA_FP8_MX (C.1a, default OFF): the block-scaled math. Read per call
+  // DGPP_QSA_FP8_MX (C.1a, default OFF): the block-scaled math, read per call
   // (not latched) so a test can setenv between runs; production sets it once.
-  const int mx = [] {
-    const char* e = std::getenv("DGPP_QSA_FP8_MX");
-    return e != nullptr && e[0] == '1' ? 1 : 0;
-  }();
+  const int mx = qsa_fp8_mx();
   const dim3 grid(static_cast<unsigned>(rows), static_cast<unsigned>(kv_heads));
   qsa_attn_prefill_warp_kernel<<<grid, 32, kSmem, stream>>>(q, q_row_stride, k_cache, v_cache, k_scale,
                                                               v_scale, req_ids, topk,

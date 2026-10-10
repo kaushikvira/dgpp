@@ -27,11 +27,23 @@
 //   gate        out = bf16(bf16(c) x bf16(sigmoid(gate))).
 //
 // Every kernel is deterministic and capturable (fixed grids, no host reads).
+#include <cstdlib>
 #include <cstdint>
 
 #include <cuda_runtime.h>
 
 namespace dgpp {
+
+// DGPP_QSA_FP8_MX (Phase C.1a, docs/qwen_fp8_phase_c_plan.md §3; default OFF):
+// 1 = the append kernels block-quantize the K codes (32-dim blocks, the e8m0
+// block-scale plane) and every attention read path dequantizes K with the
+// block scale (V stays row-quantized). Read per call (not latched) so a test
+// can setenv between runs; production sets it once. The single read site for
+// the QSA kernels (qsa.cu, qsa_prefill.cu, qsa_warp.cu call this).
+inline int qsa_fp8_mx() {
+  const char* e = std::getenv("DGPP_QSA_FP8_MX");
+  return e != nullptr && e[0] == '1' ? 1 : 0;
+}
 
 // inv_freq[i] = 1 / theta^(2i / rotary_dim), i < rotary_dim / 2, in fp32 as
 // the reference computes it (host helper; upload the result). The YaRN
@@ -148,7 +160,8 @@ void qsa_attn_partial(const uint16_t* q, int64_t q_row_stride, const uint16_t* k
                       int local_heads, int kv_heads, int dim, int block_tokens,
                       const int32_t* block_tables, int blocks_per_request, float scale,
                       float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream,
-                      const float* k_scale = nullptr, const float* v_scale = nullptr);
+                      const float* k_scale = nullptr, const float* v_scale = nullptr,
+                      const uint8_t* k_bscale = nullptr);
 // The same with the tile gather pinned: 1 = the cp.async phases (the
 // default; DGPP_QSA_ASYNC=0 turns the default to the serial gather),
 // 0 = serial, -1 = the default; heads_per_block (a divisor of the heads per
@@ -161,7 +174,8 @@ void qsa_attn_partial_gather(const uint16_t* q, int64_t q_row_stride, const uint
                       const int32_t* block_tables, int blocks_per_request, float scale,
                       float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream,
                       int async_gather, int heads_per_block, int heads_per_warp,
-                      const float* k_scale = nullptr, const float* v_scale = nullptr);
+                      const float* k_scale = nullptr, const float* v_scale = nullptr,
+                      const uint8_t* k_bscale = nullptr);
 
 // Prefill variant with wider KV sharing and cooperative warp softmax at dim=256;
 // other dimensions use qsa_attn_partial. Identical split/tile arithmetic and
@@ -172,7 +186,8 @@ void qsa_attn_prefill_partial(const uint16_t* q, int64_t q_row_stride, const uin
                       int local_heads, int kv_heads, int dim, int block_tokens,
                       const int32_t* block_tables, int blocks_per_request, float scale,
                       float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream,
-                      const float* k_scale = nullptr, const float* v_scale = nullptr);
+                      const float* k_scale = nullptr, const float* v_scale = nullptr,
+                      const uint8_t* k_bscale = nullptr);
 
 // One warp per (query, KV group) on the tensor cores (qsa_warp.cu): the
 // prefill attention over each row's listed tokens, written normalized as fp32

@@ -100,9 +100,11 @@ class QwenKvPool {
   float* v_scale_ = nullptr;
   // C.1a MXFP8 block-scale plane (docs/qwen_fp8_phase_c_plan.md §3): 8 e8m0
   // bytes per (slot, kv-head) (one per 32 of the 256-dim row), additive beside
-  // the fp32 row-scale plane. fp8 only (null for bf16).
+  // the fp32 row-scale plane. fp8 only (null for bf16). k_bscale_ is written by
+  // the MX=1 append; v_bscale_ is reserved for C.1b and stays zero (the V codes
+  // stay row-quantized in C.1a, so a written plane would misdescribe them).
   uint8_t* k_bscale_ = nullptr;   // [layers][token_slots][kv_heads*8]
-  uint8_t* v_bscale_ = nullptr;
+  uint8_t* v_bscale_ = nullptr;   // zero in C.1a; reserved for C.1b
   uint16_t* idx_base_ = nullptr;  // [layers][pool_slots][idx_dim]
   uint16_t* ring_base_ = nullptr; // [layers][max_requests][kpool][idx_dim]
   bool fp8() const { return shape_.format == LatentFormat::kFp8; }

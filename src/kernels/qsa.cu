@@ -258,30 +258,26 @@ __global__ void kv_append_kernel(const uint16_t* __restrict__ k, int64_t k_row_s
     if (mx) {
       // C.1a: 8 per-32-dim-block absmaxes (a segmented warp reduce: lane l holds
       // block b's element at dim 32b + l). The K codes quantize to the block
-      // scale; the V block plane is written for C.1b (V codes stay row-quantized
-      // for the PV gamma epilogue, so vinv is unchanged).
+      // scale. v_bscale is NOT written: the V codes stay row-quantized (the PV
+      // gamma epilogue), so a block plane computed from the bf16 source would
+      // misdescribe the stored V codes. The plane stays zero (the pool
+      // memsets it) and is reserved for C.1b, which block-quantizes V.
       const int nblk = dim / 32;
-      float kb_a[8], vb_a[8];
+      float kb_a[8];
 #pragma unroll
       for (int b = 0; b < 8; ++b) {
         const int e = 32 * b + lane;
         kb_a[b] = (b < nblk && k) ? fabsf(bf16_bits_to_float(kb[warp * dim + e])) : 0.f;
-        vb_a[b] = (b < nblk) ? fabsf(bf16_bits_to_float(vb[warp * dim + e])) : 0.f;
       }
 #pragma unroll
       for (int off = 16; off > 0; off >>= 1)
 #pragma unroll
-        for (int b = 0; b < 8; ++b) {
-          kb_a[b] = fmaxf(kb_a[b], __shfl_xor_sync(~0u, kb_a[b], off));
-          vb_a[b] = fmaxf(vb_a[b], __shfl_xor_sync(~0u, vb_a[b], off));
-        }
+        for (int b = 0; b < 8; ++b) kb_a[b] = fmaxf(kb_a[b], __shfl_xor_sync(~0u, kb_a[b], off));
       if (lane == 0) {
 #pragma unroll
         for (int b = 0; b < 8; ++b) {
           const uint8_t kb_byt = latent_fp8_block_scale_byte(kb_a[b]);
-          const uint8_t vb_byt = latent_fp8_block_scale_byte(vb_a[b]);
           if (k_bscale) k_bscale[phys * (kv_heads * 8) + warp * 8 + b] = kb_byt;
-          if (v_bscale) v_bscale[phys * (kv_heads * 8) + warp * 8 + b] = vb_byt;
           kinvb[warp * 8 + b] = kb_a[b] > 0.f ? 1.0f / e8m0_byte_to_float(kb_byt) : 0.f;
         }
       }
@@ -648,6 +644,7 @@ __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_ro
                                     const uint16_t* __restrict__ v_cache,
                                     const float* __restrict__ k_scale,
                                     const float* __restrict__ v_scale,
+                                    const uint8_t* __restrict__ k_bscale, int mx,
                                     const int32_t* __restrict__ req_ids,
                                     const int32_t* __restrict__ topk, int topk_stride,
                                     const int32_t* __restrict__ counts, int n_split,
@@ -870,7 +867,18 @@ __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_ro
         const int c = (rem - tt * kFp8ChunksPerRow) * 16;
         const int64_t phys = phys_rows[tt];
         const uint8_t* src = (which == 0 ? k8 : v8) + phys * width + kvh * D + c;
-        const float sc = (which == 0 ? k_scale : v_scale)[phys * kv_heads + kvh];
+        float sc;
+        if (which == 0) {
+          // C.1a (MX): the K codes are block-quantized (32-dim blocks, e8m0
+          // plane). This 16-code chunk is exactly half of one 32-dim block
+          // (c is a multiple of 16), so the block index c / 32 is constant
+          // per load. V stays row-quantized (the PV gamma epilogue).
+          sc = (mx && k_bscale != nullptr)
+                   ? e8m0_byte_to_float(k_bscale[phys * (kv_heads * 8) + kvh * 8 + c / 32])
+                   : k_scale[phys * kv_heads + kvh];
+        } else {
+          sc = v_scale[phys * kv_heads + kvh];
+        }
         uint16_t* dst = (which == 0 ? kt : vt) + tt * kRowStride + c;
         // The hardware e4m3 -> f16 pair decode (decode_fp8x2_bf16): eight
         // 2-code conversions replace sixteen per-byte software decodes. Bitwise
@@ -995,15 +1003,9 @@ void qsa_norm_rope_bf16(const uint16_t* x, int64_t x_row_stride, int64_t x_head_
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
-// DGPP_QSA_FP8_MX (C.1a, default OFF): selects the block-scaled math. Read per
-// call (not latched) so a test can setenv between runs; production sets it once.
-// 0 = today's row-scale E4M3 path verbatim; 1 = block-quantized K codes + the
-// e8m0 block-scale plane (consumed by the block-scaled QK^T mma).
-int qsa_fp8_mx() {
-  const char* e = std::getenv("DGPP_QSA_FP8_MX");
-  return e != nullptr && e[0] == '1' ? 1 : 0;
-}
-
+// The append's MX flag (qsa_fp8_mx, qsa.hpp): 1 = block-quantized K codes +
+// the e8m0 block plane; 0 = the row-scale E4M3 path verbatim. Read per call
+// (not latched) so a test can setenv between runs; production sets it once.
 void qsa_kv_append(const uint16_t* k, int64_t k_row_stride, const uint16_t* v, int64_t v_row_stride,
                    const int32_t* req_ids, const int64_t* pos, int rows,
                    const int32_t* block_tables, int blocks_per_request, int block_tokens,
@@ -1143,11 +1145,11 @@ void qsa_attn_partial(const uint16_t* q, int64_t q_row_stride, const uint16_t* k
                       int local_heads, int kv_heads, int dim, int block_tokens,
                       const int32_t* block_tables, int blocks_per_request, float scale,
                       float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream,
-                      const float* k_scale, const float* v_scale) {
+                      const float* k_scale, const float* v_scale, const uint8_t* k_bscale) {
   qsa_attn_partial_gather(q, q_row_stride, k_cache, v_cache, req_ids, topk, topk_stride, counts, rows,
                           n_split, local_heads, kv_heads, dim, block_tokens, block_tables,
                           blocks_per_request, scale, m_ws, l_ws, c_ws, stream, -1, 0, 0, k_scale,
-                          v_scale);
+                          v_scale, k_bscale);
 }
 
 void qsa_attn_partial_gather(const uint16_t* q, int64_t q_row_stride, const uint16_t* k_cache,
@@ -1157,7 +1159,7 @@ void qsa_attn_partial_gather(const uint16_t* q, int64_t q_row_stride, const uint
                              const int32_t* block_tables, int blocks_per_request, float scale,
                              float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream,
                              int async_gather, int heads_per_block, int heads_per_warp,
-                             const float* k_scale, const float* v_scale) {
+                             const float* k_scale, const float* v_scale, const uint8_t* k_bscale) {
   if (rows <= 0) return;
   if (!q || !k_cache || !v_cache || !req_ids || !topk || !counts || !block_tables || !m_ws ||
       !l_ws || !c_ws)
@@ -1197,10 +1199,12 @@ void qsa_attn_partial_gather(const uint16_t* q, int64_t q_row_stride, const uint
   const auto launch = [&](auto dim_tag, auto hpw_tag) {
     constexpr int D = decltype(dim_tag)::value;
     constexpr int H = decltype(hpw_tag)::value;
+    // C.1a: the block-scale flag is read per call (qsa.hpp), not latched.
+    const int mx = qsa_fp8_mx();
     attn_partial_kernel<D, H><<<grid, threads, smem, stream>>>(
-        q, q_row_stride, k_cache, v_cache, k_scale, v_scale, req_ids, topk, topk_stride, counts,
-        n_split, local_heads, kv_heads, block_tokens, block_tables, blocks_per_request, scale, m_ws,
-        l_ws, c_ws, async_gather);
+        q, q_row_stride, k_cache, v_cache, k_scale, v_scale, k_bscale, mx, req_ids, topk,
+        topk_stride, counts, n_split, local_heads, kv_heads, block_tokens, block_tables,
+        blocks_per_request, scale, m_ws, l_ws, c_ws, async_gather);
   };
   const auto by_hpw = [&](auto dim_tag) {
     switch (hpw) {

@@ -103,7 +103,8 @@ std::vector<uint16_t> run_attn(const uint16_t* qonly, const uint16_t* qgate, con
                                const uint16_t* vc, const int32_t* dreq, const int32_t* dtopk,
                                const int32_t* dcounts, const int32_t* dtable, const Fp8Geo& g,
                                int n_split, cudaStream_t st, const float* k_scale = nullptr,
-                               const float* v_scale = nullptr, bool prefill = false) {
+                               const float* v_scale = nullptr, bool prefill = false,
+                               const uint8_t* k_bscale = nullptr) {
   const int width = g.width();
   const size_t part = static_cast<size_t>(g.rows) * n_split * g.local_heads;
   DevBuf m_ws(part * 4), l_ws(part * 4), c_ws(part * g.dim * 4),
@@ -114,12 +115,13 @@ std::vector<uint16_t> run_attn(const uint16_t* qonly, const uint16_t* qgate, con
     dgpp::qsa_attn_prefill_partial(qonly, q_row_stride, kc, vc, dreq, dtopk, g.seq, dcounts,
                                    g.rows, n_split, g.local_heads, g.kv_heads, g.dim, g.block_tokens,
                                    dtable, g.blocks_per_request(), 1.0f / 16.0f, mptr<float>(m_ws),
-                                   mptr<float>(l_ws), mptr<float>(c_ws), st, k_scale, v_scale);
+                                   mptr<float>(l_ws), mptr<float>(c_ws), st, k_scale, v_scale,
+                                   k_bscale);
   else
     dgpp::qsa_attn_partial(qonly, q_row_stride, kc, vc, dreq, dtopk, g.seq, dcounts,
                            g.rows, n_split, g.local_heads, g.kv_heads, g.dim, g.block_tokens, dtable,
                            g.blocks_per_request(), 1.0f / 16.0f, mptr<float>(m_ws), mptr<float>(l_ws),
-                           mptr<float>(c_ws), st, k_scale, v_scale);
+                           mptr<float>(c_ws), st, k_scale, v_scale, k_bscale);
   dgpp::dsa_attn_combine(ptr<float>(m_ws), ptr<float>(l_ws), ptr<float>(c_ws), g.rows, n_split,
                          g.local_heads, g.dim, mptr<float>(c_out), st);
   dgpp::qsa_gate_out(ptr<float>(c_out), qgate + g.dim, q_row_stride, q_head_stride,
@@ -326,6 +328,11 @@ DGPP_TEST(qwen_fp8_kv_real_path_matches_bf16) {
   std::printf("[fp8-kv] REAL PATH (append-quantize + in-kernel dequant) vs bf16: "
               "l2_rel %.4f  max_abs %.4g\n", s.l2_rel, s.max_abs);
   require(s.l2_rel <= 0.0625, "fp8 real-path attention l2_rel exceeds the 2^-4 bound");
+  // MX=0 (the default) must reproduce today's numbers to the last printed
+  // digit: the C.1a block-plane addition changed nothing on the row-scale
+  // path (the committed 0.0360, 4-digit print).
+  require(std::abs(s.l2_rel - 0.0360) < 5e-5,
+          "MX=0 real-path partial l2_rel drifted from the committed 0.0360");
 
   // The prefill kernel (the `attend` function pointer's long-prefill branch)
   // over the same fp8 pool.
@@ -347,6 +354,8 @@ DGPP_TEST(qwen_fp8_kv_real_path_matches_bf16) {
   std::printf("[fp8-kv] REAL PATH prefill kernel vs bf16: l2_rel %.4f  max_abs %.4g\n", sp.l2_rel,
               sp.max_abs);
   require(sp.l2_rel <= 0.0625, "fp8 real-path prefill l2_rel exceeds the 2^-4 bound");
+  require(std::abs(sp.l2_rel - 0.0360) < 5e-5,
+          "MX=0 real-path prefill-partial l2_rel drifted from the committed 0.0360");
 
   // The tensor-core warp prefill kernel (the serving default for long prefill).
   if (dgpp::qsa_warp_supported(g.dim, g.local_heads, g.kv_heads)) {
@@ -374,6 +383,8 @@ DGPP_TEST(qwen_fp8_kv_real_path_matches_bf16) {
     // one (~0.10), not the V-only 2^-4 bound. DGPP_QSA_FP8_MMA=0 restores the
     // Phase A dequant (~0.037).
     require(sw.l2_rel <= 0.10, "fp8 real-path warp prefill l2_rel exceeds the FP8-MMA band");
+    require(std::abs(sw.l2_rel - 0.0497) < 5e-5,
+            "MX=0 real-path warp l2_rel drifted from the committed 0.0497");
   }
 }
 
@@ -539,6 +550,307 @@ DGPP_TEST(qwen_fp8_kv_block_scale_quantizer) {
   require(blk_l2 < row_l2, "block scales did not beat the row-scale baseline");
   require(blk_max_rel <= 0.0625 + 1e-6,
           "block-scale per-element rel error exceeds the 2^-4 mantissa bound");
+}
+
+// ---- C.1a follow-up: the block plane on the PARTIAL kernels (decode / short
+// prefill / DGPP_QSA_WARP=0) -------------------------------------------------
+
+double l2_rel(const std::vector<float>& a, const std::vector<float>& b) {
+  double num = 0, den = 0;
+  for (size_t i = 0; i < a.size(); ++i) {
+    num += static_cast<double>(a[i] - b[i]) * (a[i] - b[i]);
+    den += static_cast<double>(b[i]) * b[i];
+  }
+  return std::sqrt(num / std::max(den, 1e-30));
+}
+
+// The partial kernels' math on dequantized rows: fp32 dots, P rounded to
+// bf16 (the DSA pin), l unrounded, out = sum(p * v) / l. k_deq / v_deq are
+// [seq, kv_heads, dim] fp32 rows ALREADY bf16-rounded the way the kernels'
+// smem tiles hold them (bf16(code * scale)).
+std::vector<float> host_attn_ref(const std::vector<uint16_t>& q, const std::vector<float>& k_deq,
+                                 const std::vector<float>& v_deq, const Fp8Geo& g) {
+  const float s = 1.0f / 16.0f;
+  const int grp = g.local_heads / g.kv_heads;
+  std::vector<float> out(static_cast<size_t>(g.rows) * g.local_heads * g.dim, 0.f);
+  for (int r = 0; r < g.rows; ++r)
+    for (int h = 0; h < g.local_heads; ++h) {
+      const int hkv = h / grp;
+      const uint16_t* qb = q.data() + (static_cast<size_t>(r) * g.local_heads + h) * g.dim;
+      std::vector<float> sc(static_cast<size_t>(g.seq));
+      float M = -INFINITY;
+      for (int t = 0; t < g.seq; ++t) {
+        const float* kr = k_deq.data() + (static_cast<size_t>(t) * g.kv_heads + hkv) * g.dim;
+        float dot = 0.f;
+        for (int d = 0; d < g.dim; ++d)
+          dot += dgpp::bf16_bits_to_float(qb[d]) * kr[d];
+        sc[static_cast<size_t>(t)] = s * dot;
+        M = std::max(M, sc[static_cast<size_t>(t)]);
+      }
+      float l = 0.f;
+      std::vector<float> p(static_cast<size_t>(g.seq));
+      for (int t = 0; t < g.seq; ++t) {
+        const float e = expf(sc[static_cast<size_t>(t)] - M);
+        p[static_cast<size_t>(t)] = dgpp::bf16_bits_to_float(dgpp::float_to_bf16_bits(e));
+        l += e;
+      }
+      float* o = out.data() + (static_cast<size_t>(r) * g.local_heads + h) * g.dim;
+      for (int t = 0; t < g.seq; ++t) {
+        if (p[static_cast<size_t>(t)] == 0.f) continue;
+        const float* vr = v_deq.data() + (static_cast<size_t>(t) * g.kv_heads + hkv) * g.dim;
+        for (int d = 0; d < g.dim; ++d) o[d] += p[static_cast<size_t>(t)] * vr[d];
+      }
+      const float inv = l > 0.f ? 1.f / l : 0.f;
+      for (int d = 0; d < g.dim; ++d) o[d] *= inv;
+    }
+  return out;
+}
+
+// e4m3 codes -> bf16-rounded dequant rows, two scale laws: the e8m0 block
+// plane (C.1a, [seq, kv, 8], block = d / 32) and the fp32 row scale.
+std::vector<float> dequant_k_block(const std::vector<uint8_t>& codes, const std::vector<uint8_t>& kbs,
+                                   const Fp8Geo& g) {
+  std::vector<float> out(codes.size());
+  for (int t = 0; t < g.seq; ++t)
+    for (int h = 0; h < g.kv_heads; ++h)
+      for (int d = 0; d < g.dim; ++d) {
+        const size_t i = (static_cast<size_t>(t) * g.kv_heads + h) * g.dim + d;
+        const float x = dgpp::fp8_e4m3_bits_to_float(codes[i]) *
+                        dgpp::e8m0_byte_to_float(kbs[(static_cast<size_t>(t) * g.kv_heads + h) * 8 + d / 32]);
+        out[i] = dgpp::bf16_bits_to_float(dgpp::float_to_bf16_bits(x));
+      }
+  return out;
+}
+std::vector<float> dequant_rows(const std::vector<uint8_t>& codes, const std::vector<float>& scale,
+                                const Fp8Geo& g) {
+  std::vector<float> out(codes.size());
+  for (int t = 0; t < g.seq; ++t)
+    for (int h = 0; h < g.kv_heads; ++h)
+      for (int d = 0; d < g.dim; ++d) {
+        const size_t i = (static_cast<size_t>(t) * g.kv_heads + h) * g.dim + d;
+        const float x = dgpp::fp8_e4m3_bits_to_float(codes[i]) * scale[static_cast<size_t>(t) * g.kv_heads + h];
+        out[i] = dgpp::bf16_bits_to_float(dgpp::float_to_bf16_bits(x));
+      }
+  return out;
+}
+
+// One partial kernel (decode/short-prefill or prefill) + combine, fp32 out
+// [rows, local_heads, dim] (no gate): the block-plane consumer under test.
+std::vector<float> run_partial_fp32(bool prefill, const uint16_t* dq, const uint16_t* kc8,
+                                    const uint16_t* vc8, const float* ks, const float* vs,
+                                    const uint8_t* kbs, const int32_t* dreq, const int32_t* dtopk,
+                                    const int32_t* dcounts, const int32_t* dtable, const Fp8Geo& g,
+                                    cudaStream_t st) {
+  const size_t part = static_cast<size_t>(g.rows) * g.local_heads;
+  DevBuf m_ws(part * 4), l_ws(part * 4), c_ws(part * g.dim * 4),
+      c_out(static_cast<size_t>(g.rows) * g.local_heads * g.dim * 4);
+  const int64_t qrs = static_cast<int64_t>(g.local_heads) * g.dim;
+  if (prefill)
+    dgpp::qsa_attn_prefill_partial(dq, qrs, kc8, vc8, dreq, dtopk, g.seq, dcounts, g.rows, 1,
+                                   g.local_heads, g.kv_heads, g.dim, g.block_tokens, dtable,
+                                   g.blocks_per_request(), 1.0f / 16.0f, mptr<float>(m_ws),
+                                   mptr<float>(l_ws), mptr<float>(c_ws), st, ks, vs, kbs);
+  else
+    dgpp::qsa_attn_partial(dq, qrs, kc8, vc8, dreq, dtopk, g.seq, dcounts, g.rows, 1, g.local_heads,
+                           g.kv_heads, g.dim, g.block_tokens, dtable, g.blocks_per_request(),
+                           1.0f / 16.0f, mptr<float>(m_ws), mptr<float>(l_ws), mptr<float>(c_ws), st,
+                           ks, vs, kbs);
+  dgpp::dsa_attn_combine(ptr<float>(m_ws), ptr<float>(l_ws), ptr<float>(c_ws), g.rows, 1,
+                         g.local_heads, g.dim, mptr<float>(c_out), st);
+  DGPP_CUDA_OK(cudaStreamSynchronize(st));
+  return down<float>(c_out, static_cast<size_t>(g.rows) * g.local_heads * g.dim);
+}
+
+// C.1a follow-up (a): the MX=1 REAL path on the partial kernels -- the
+// decode / short-prefill qsa_attn_partial and the long-prefill
+// qsa_attn_prefill_partial (the DGPP_QSA_WARP=0 shape). The append
+// block-quantizes the K codes and writes the e8m0 block plane; both kernels
+// dequant K with the per-32-dim-block scale (V stays row-quantized). vs the
+// bf16 reference; the C.1a bar is l2_rel <= 0.035 (block quantization beats
+// the row-scale 0.0360). Must run with DGPP_QSA_FP8_MX=1 (the append and the
+// kernels read it per call).
+DGPP_TEST(qwen_fp8_mx_partial_real_path) {
+  Fp8Geo g;
+  cudaStream_t st = test_stream();
+  const int width = g.width();
+  const int slots = g.slots();
+  std::vector<int32_t> table(static_cast<size_t>(g.blocks_per_request()));
+  for (int b = 0; b < g.blocks_per_request(); ++b) table[static_cast<size_t>(b)] = b;
+  DevBuf dtable = up(table);
+  const auto k = random_bf16_normal(61, static_cast<int64_t>(g.seq) * width, 1.0f);
+  const auto v = random_bf16_normal(62, static_cast<int64_t>(g.seq) * width, 1.0f);
+  DevBuf kc(static_cast<size_t>(slots) * width * 2), vc(static_cast<size_t>(slots) * width * 2);
+  fill_cache(k, v, g, ptr<int32_t>(dtable), mptr<uint16_t>(kc), mptr<uint16_t>(vc), st);
+  DevBuf kc8(static_cast<size_t>(slots) * width), vc8(static_cast<size_t>(slots) * width);
+  DevBuf ks(static_cast<size_t>(slots) * g.kv_heads * 4), vs(static_cast<size_t>(slots) * g.kv_heads * 4);
+  DevBuf kbs(static_cast<size_t>(slots) * g.kv_heads * 8), vbs(static_cast<size_t>(slots) * g.kv_heads * 8);
+  setenv("DGPP_QSA_FP8_MX", "1", 1);
+  {
+    std::vector<int32_t> req_ids(static_cast<size_t>(g.seq), 0);
+    std::vector<int64_t> pos(static_cast<size_t>(g.seq));
+    for (int i = 0; i < g.seq; ++i) pos[static_cast<size_t>(i)] = i;
+    DevBuf dk = up(k), dv = up(v), dreq = up(req_ids), dpos = up(pos);
+    dgpp::qsa_kv_append(ptr<uint16_t>(dk), width, ptr<uint16_t>(dv), width, ptr<int32_t>(dreq),
+                        ptr<int64_t>(dpos), g.seq, ptr<int32_t>(dtable), g.blocks_per_request(),
+                        g.block_tokens, g.kv_heads, g.dim, reinterpret_cast<uint16_t*>(mptr<uint8_t>(kc8)),
+                        reinterpret_cast<uint16_t*>(mptr<uint8_t>(vc8)), mptr<float>(ks),
+                        mptr<float>(vs), st, mptr<uint8_t>(kbs), mptr<uint8_t>(vbs));
+  }
+  // The K block plane was written (nonzero e8m0 bytes); the V block plane is
+  // reserved for C.1b (V codes stay row-quantized) and must stay ZERO -- a
+  // nonzero v_bscale would misdescribe the stored V codes.
+  const size_t bplane = static_cast<size_t>(slots) * g.kv_heads * 8;
+  const auto kbs_h = down<uint8_t>(kbs, bplane);
+  const auto vbs_h = down<uint8_t>(vbs, bplane);
+  require(std::any_of(kbs_h.begin(), kbs_h.end(), [](uint8_t b) { return b != 0; }),
+          "the K block plane is empty (the MX=1 append did not write it)");
+  require(std::all_of(vbs_h.begin(), vbs_h.end(), [](uint8_t b) { return b == 0; }),
+          "v_bscale must stay zero in C.1a (V codes are row-quantized; the plane is reserved for C.1b)");
+  const int64_t q_row_stride = g.local_heads * (2 * g.dim);
+  const auto qg = random_bf16_normal(63, static_cast<int64_t>(g.rows) * q_row_stride, 1.0f);
+  std::vector<uint16_t> qonly(static_cast<size_t>(g.rows) * g.local_heads * g.dim);
+  for (int r = 0; r < g.rows; ++r)
+    for (int h = 0; h < g.local_heads; ++h)
+      std::copy(qg.begin() + (r * q_row_stride + h * 2 * g.dim),
+                qg.begin() + (r * q_row_stride + h * 2 * g.dim + g.dim),
+                qonly.begin() + (static_cast<size_t>(r) * g.local_heads + h) * g.dim);
+  std::vector<int32_t> req_ids(static_cast<size_t>(g.rows), 0);
+  std::vector<int32_t> topk(static_cast<size_t>(g.rows) * g.seq);
+  for (int r = 0; r < g.rows; ++r)
+    for (int i = 0; i < g.seq; ++i) topk[static_cast<size_t>(r) * g.seq + i] = i;
+  std::vector<int32_t> counts(static_cast<size_t>(g.rows), g.seq);
+  DevBuf dqg = up(qg), dqonly = up(qonly), dreq = up(req_ids), dtopk = up(topk), dcounts = up(counts);
+  const long n = static_cast<long>(qonly.size());
+  const auto ref = run_attn(ptr<uint16_t>(dqonly), ptr<uint16_t>(dqg), mptr<uint16_t>(kc),
+                            mptr<uint16_t>(vc), ptr<int32_t>(dreq), ptr<int32_t>(dtopk),
+                            ptr<int32_t>(dcounts), ptr<int32_t>(dtable), g, 1, st);
+  const auto got = run_attn(ptr<uint16_t>(dqonly), ptr<uint16_t>(dqg),
+                            reinterpret_cast<uint16_t*>(mptr<uint8_t>(kc8)),
+                            reinterpret_cast<uint16_t*>(mptr<uint8_t>(vc8)), ptr<int32_t>(dreq),
+                            ptr<int32_t>(dtopk), ptr<int32_t>(dcounts), ptr<int32_t>(dtable), g, 1, st,
+                            mptr<float>(ks), mptr<float>(vs), false, mptr<uint8_t>(kbs));
+  std::vector<float> gf(n), wf(n);
+  for (long i = 0; i < n; ++i) {
+    gf[static_cast<size_t>(i)] = dgpp::bf16_bits_to_float(got[static_cast<size_t>(i)]);
+    wf[static_cast<size_t>(i)] = dgpp::bf16_bits_to_float(ref[static_cast<size_t>(i)]);
+  }
+  const Stats s = compare_abs_rel(gf.data(), wf.data(), n, 0.0);
+  std::printf("[fp8-kv] MX=1 REAL PATH partial (decode/short-prefill) vs bf16: l2_rel %.4f  max_abs %.4g\n",
+              s.l2_rel, s.max_abs);
+  require(s.l2_rel <= 0.035, "MX=1 partial l2_rel exceeds the C.1a 0.035 bar");
+  const auto ref_pf = run_attn(ptr<uint16_t>(dqonly), ptr<uint16_t>(dqg), mptr<uint16_t>(kc),
+                               mptr<uint16_t>(vc), ptr<int32_t>(dreq), ptr<int32_t>(dtopk),
+                               ptr<int32_t>(dcounts), ptr<int32_t>(dtable), g, 1, st, nullptr, nullptr,
+                               /*prefill=*/true);
+  const auto got_pf = run_attn(ptr<uint16_t>(dqonly), ptr<uint16_t>(dqg),
+                               reinterpret_cast<uint16_t*>(mptr<uint8_t>(kc8)),
+                               reinterpret_cast<uint16_t*>(mptr<uint8_t>(vc8)), ptr<int32_t>(dreq),
+                               ptr<int32_t>(dtopk), ptr<int32_t>(dcounts), ptr<int32_t>(dtable), g, 1, st,
+                               mptr<float>(ks), mptr<float>(vs), /*prefill=*/true, mptr<uint8_t>(kbs));
+  std::vector<float> gpf(n), wpf(n);
+  for (long i = 0; i < n; ++i) {
+    gpf[static_cast<size_t>(i)] = dgpp::bf16_bits_to_float(got_pf[static_cast<size_t>(i)]);
+    wpf[static_cast<size_t>(i)] = dgpp::bf16_bits_to_float(ref_pf[static_cast<size_t>(i)]);
+  }
+  const Stats sp = compare_abs_rel(gpf.data(), wpf.data(), n, 0.0);
+  std::printf("[fp8-kv] MX=1 REAL PATH prefill-partial (WARP=0) vs bf16: l2_rel %.4f  max_abs %.4g\n",
+              sp.l2_rel, sp.max_abs);
+  require(sp.l2_rel <= 0.035, "MX=1 prefill-partial l2_rel exceeds the C.1a 0.035 bar");
+  unsetenv("DGPP_QSA_FP8_MX");
+}
+
+// C.1a follow-up (c): the block-scale dequant in the partial kernels, made
+// DISCRIMINATING (the C.1.0-oracle style). K rows with one hot 32-dim block
+// (|x| ~ 1) and seven cold blocks (|x| ~ 0.01): the MX=1 append's block
+// scales make the cold blocks' codes saturate at 448, so dequantizing those
+// codes with the fp32 ROW scale (the bug this guards) blows them up ~100x
+// (448 * row_scale ~= the row absmax) and wrecks the attention output. The
+// test asserts (i) each partial kernel matches the host block-dequant
+// reference tightly, and (ii) the host ROW-dequant reference diverges from
+// it -- so a row-scale kernel would fail this test.
+DGPP_TEST(qwen_fp8_mx_partial_block_dequant_discriminating) {
+  Fp8Geo g;
+  cudaStream_t st = test_stream();
+  const int width = g.width();
+  const int slots = g.slots();
+  std::vector<int32_t> table(static_cast<size_t>(g.blocks_per_request()));
+  for (int b = 0; b < g.blocks_per_request(); ++b) table[static_cast<size_t>(b)] = b;
+  DevBuf dtable = up(table);
+  // Hot/cold K rows: block b (dims 32b..32b+31) at magnitude mags[b]; the
+  // deterministic pattern keeps |block absmax| ~ mags[b] and the row absmax ~
+  // mags[0], so the cold blocks' codes saturate under their tight block scales.
+  const float mags[8] = {1.0f, 0.1f, 0.01f, 0.001f, 1e-4f, 1e-5f, 1e-6f, 1e-7f};
+  std::vector<uint16_t> k(static_cast<size_t>(g.seq) * width, 0);
+  for (int t = 0; t < g.seq; ++t)
+    for (int h = 0; h < g.kv_heads; ++h)
+      for (int b = 0; b < 8; ++b)
+        for (int i = 0; i < 32; ++i) {
+          const uint32_t u = (static_cast<uint32_t>(t) * 73856093u) ^
+                            (static_cast<uint32_t>(h) * 19349663u) ^
+                            (static_cast<uint32_t>(32 * b + i) * 83492791u);
+          const float pat = (static_cast<float>(u % 2001u) - 1000.0f) / 1000.0f;  // [-1, 1)
+          k[(static_cast<size_t>(t) * g.kv_heads + h) * g.dim + 32 * b + i] =
+              dgpp::float_to_bf16_bits(mags[b] * pat);
+        }
+  const auto v = random_bf16_normal(64, static_cast<int64_t>(g.seq) * width, 1.0f);
+  DevBuf kc(static_cast<size_t>(slots) * width * 2), vc(static_cast<size_t>(slots) * width * 2);
+  fill_cache(k, v, g, ptr<int32_t>(dtable), mptr<uint16_t>(kc), mptr<uint16_t>(vc), st);
+  DevBuf kc8(static_cast<size_t>(slots) * width), vc8(static_cast<size_t>(slots) * width);
+  DevBuf ks(static_cast<size_t>(slots) * g.kv_heads * 4), vs(static_cast<size_t>(slots) * g.kv_heads * 4);
+  DevBuf kbs(static_cast<size_t>(slots) * g.kv_heads * 8), vbs(static_cast<size_t>(slots) * g.kv_heads * 8);
+  setenv("DGPP_QSA_FP8_MX", "1", 1);
+  {
+    std::vector<int32_t> req_ids(static_cast<size_t>(g.seq), 0);
+    std::vector<int64_t> pos(static_cast<size_t>(g.seq));
+    for (int i = 0; i < g.seq; ++i) pos[static_cast<size_t>(i)] = i;
+    DevBuf dk = up(k), dv = up(v), dreq = up(req_ids), dpos = up(pos);
+    dgpp::qsa_kv_append(ptr<uint16_t>(dk), width, ptr<uint16_t>(dv), width, ptr<int32_t>(dreq),
+                        ptr<int64_t>(dpos), g.seq, ptr<int32_t>(dtable), g.blocks_per_request(),
+                        g.block_tokens, g.kv_heads, g.dim, reinterpret_cast<uint16_t*>(mptr<uint8_t>(kc8)),
+                        reinterpret_cast<uint16_t*>(mptr<uint8_t>(vc8)), mptr<float>(ks),
+                        mptr<float>(vs), st, mptr<uint8_t>(kbs), mptr<uint8_t>(vbs));
+  }
+  const auto q = random_bf16_normal(65, static_cast<int64_t>(g.rows) * g.local_heads * g.dim, 1.0f);
+  std::vector<int32_t> req_ids(static_cast<size_t>(g.rows), 0);
+  std::vector<int32_t> topk(static_cast<size_t>(g.rows) * g.seq);
+  for (int r = 0; r < g.rows; ++r)
+    for (int i = 0; i < g.seq; ++i) topk[static_cast<size_t>(r) * g.seq + i] = i;
+  std::vector<int32_t> counts(static_cast<size_t>(g.rows), g.seq);
+  DevBuf dq = up(q), dreq = up(req_ids), dtopk = up(topk), dcounts = up(counts);
+  // Host references from the STORED codes: the block law (what the kernels
+  // must do) and the row law (what a row-scale kernel would do).
+  const auto codes_k = down<uint8_t>(kc8, static_cast<size_t>(g.seq) * width);
+  const auto codes_v = down<uint8_t>(vc8, static_cast<size_t>(g.seq) * width);
+  const auto kbs_h = down<uint8_t>(kbs, static_cast<size_t>(g.seq) * g.kv_heads * 8);
+  const auto ks_h = down<float>(ks, static_cast<size_t>(g.seq) * g.kv_heads);
+  const auto vs_h = down<float>(vs, static_cast<size_t>(g.seq) * g.kv_heads);
+  const auto k_blk = dequant_k_block(codes_k, kbs_h, g);
+  const auto k_row = dequant_rows(codes_k, ks_h, g);
+  const auto v_deq = dequant_rows(codes_v, vs_h, g);
+  const auto ref_blk = host_attn_ref(q, k_blk, v_deq, g);
+  const auto ref_row = host_attn_ref(q, k_row, v_deq, g);
+  // (ii) the test is discriminating: the row-law reference must diverge from
+  // the block-law one (a row-scale kernel would land near ref_row).
+  const double row_gap = l2_rel(ref_row, ref_blk);
+  require(row_gap >= 0.25,
+          "the row-dequant reference does not diverge from the block-dequant one; "
+          "the test is not discriminating (hot/cold construction failed)");
+  for (int prefill = 0; prefill < 2; ++prefill) {
+    const auto got = run_partial_fp32(prefill == 1, ptr<uint16_t>(dq),
+                                     reinterpret_cast<uint16_t*>(mptr<uint8_t>(kc8)),
+                                     reinterpret_cast<uint16_t*>(mptr<uint8_t>(vc8)),
+                                     mptr<float>(ks), mptr<float>(vs), mptr<uint8_t>(kbs),
+                                     ptr<int32_t>(dreq), ptr<int32_t>(dtopk), ptr<int32_t>(dcounts),
+                                     ptr<int32_t>(dtable), g, st);
+    const double blk = l2_rel(got, ref_blk);
+    const double row = l2_rel(got, ref_row);
+    std::printf("[fp8-kv] MX=1 block-dequant %s kernel: l2_rel(block ref) %.4f  l2_rel(row ref) %.4f\n",
+                prefill ? "prefill-partial" : "partial", blk, row);
+    require(blk <= 0.02, "the partial kernel does not dequant K with the block scale");
+    require(row >= 0.25, "the kernel output matches the row-dequant reference (row-scale bug)");
+  }
+  std::printf("[fp8-kv] MX=1 block-dequant discriminating: row-law gap %.4f (>= 0.25)\n", row_gap);
+  unsetenv("DGPP_QSA_FP8_MX");
 }
 
 int main() { return dgpp::test::run_all(); }
