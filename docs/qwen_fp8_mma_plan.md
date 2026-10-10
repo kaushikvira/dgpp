@@ -11,6 +11,20 @@ A-fragment oracle `max diff 0`, E4M3 warp kernel vs bf16 `0.0551` (band 0.10);
 22/22 tests pass on a forced recompile; the bf16 lane is bitwise-unchanged.
 **B.2 (decode/short-prefill) is not started** (§6). The rest of this doc is the
 plan as written; §0-§3 (the numerics proof) are unchanged.
+
+**e5m2 operand study (2026-10-10): NO-GO for both Q and P.** A host study
+(`qwen_fp8_mma_e5m2_operand_study` in `tests/cuda/qwen_fp8_mma_attn_test.cu`) asked
+whether the freshly-quantized Q / P operands should use **e5m2** (5-exponent /
+2-mantissa, max finite **57344** — *not* 448, which is e4m3's) instead of e4m3,
+with K/V storage frozen e4m3. Measured (unit-normal Q/K/V, the test's standard
+distribution): projected end-to-end `l2_rel` e4m3/e4m3 **0.0491** (the committed
+baseline) vs e5m2-Q **0.0665**, e5m2-P **0.0685**, e5m2/e5m2 **0.0826** — e5m2 is
+strictly *worse* for every combination. Per-element: e5m2's coarser 2-bit
+mantissa doubles the mean rel err (Q 0.0223→0.0446, P 0.0224→0.0429) while its
+wider exponent range buys nothing (underflow 0.000% for both formats — the
+per-row `absmax/max_finite` scaling already puts every value well above the
+subnormal floor). **Decision: keep e4m3 for both Q and P; no kernel change.**
+
 Phase A is done and is the base: the QSA K/V cache is stored as FP8 E4M3
 (1 B/elem) + a per-(slot, kv-head) fp32 scale, and the three attention kernels
 **dequantize to bf16 in-kernel** before the existing math

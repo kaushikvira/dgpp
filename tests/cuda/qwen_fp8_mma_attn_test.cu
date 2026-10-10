@@ -63,13 +63,65 @@ T* mptr(DevBuf& b) { return static_cast<T*>(b.p); }
 
 // e4m3 round (host): the exact code the tensor cores consume.
 float e4m3(float x) { return dgpp::fp8_e4m3_bits_to_float(dgpp::float_to_fp8_e4m3_bits(x)); }
+
+// e5m2 (OCP FP8, bias 15): 1 sign, 5 exponent, 2 mantissa. No infinities;
+// max finite 57344 (code 0x7B), exp field 31 (codes 0x7C-0x7F) => NaN,
+// min normal 2^-14, subnormal quantum 2^-16 (codes 0-3). Host codec matching
+// the CUDA __NV_E5M2 intrinsics (SATFINITE + RNE). NOTE: e5m2's max finite is
+// 57344, NOT 448 (that is e4m3's) -- so a proper e5m2 row scale is
+// absmax/57344, not absmax/448.
+uint8_t float_to_fp8_e5m2_bits(float f) {
+  const uint32_t u = std::bit_cast<uint32_t>(f);
+  const uint32_t sign = (u >> 24) & 0x80u;
+  const uint32_t absbits = u & 0x7FFFFFFFu;
+  if (absbits > 0x7F800000u) return static_cast<uint8_t>(sign | 0x7Fu);  // NaN
+  const float av = std::bit_cast<float>(absbits);
+  if (av < 0.00006103515625f) {  // < 2^-14 (min normal): subnormal zone, quantum 2^-16
+    const int n = static_cast<int>(std::lrintf(av * 65536.0f));  // x / 2^-16, ties-to-even
+    if (n <= 0) return static_cast<uint8_t>(sign);
+    if (n >= 4) return static_cast<uint8_t>(sign | (1u << 2));  // rounds up to min normal
+    return static_cast<uint8_t>(sign | static_cast<uint32_t>(n));
+  }
+  int e = 0;
+  float q = av;
+  while (q < 1.0f) { q *= 2.0f; --e; }
+  while (q >= 2.0f) { q *= 0.5f; ++e; }
+  const float space = exp2f(static_cast<float>(e - 2));  // 2-bit mantissa ULP
+  int n = static_cast<int>(std::lrintf(av / space));
+  if (n >= 8) { ++e; n >>= 1; }  // carry: the ULP doubles, so n halves
+  if (e > 15) return static_cast<uint8_t>(sign | 0x7Bu);  // saturate to 57344 (0x7B)
+  return static_cast<uint8_t>(sign | (static_cast<uint32_t>(e + 15) << 2) | static_cast<uint32_t>(n - 4));
+}
+float fp8_e5m2_bits_to_float(uint8_t v) {
+  const uint32_t sign = static_cast<uint32_t>(v >> 7) << 31;
+  const uint32_t exp = (v >> 2) & 0x1Fu;
+  const uint32_t man = v & 0x3u;
+  float result;
+  if (exp == 0x1Fu) {
+    result = std::bit_cast<float>(0x7FC00000u);  // NaN
+  } else if (exp == 0) {
+    result = static_cast<float>(man) * 0.0000152587890625f;  // man * 2^-16
+  } else {
+    result = (1.0f + static_cast<float>(man) * 0.25f) * exp2f(static_cast<float>(exp) - 15.0f);
+  }
+  return std::bit_cast<float>(std::bit_cast<uint32_t>(result) | sign);
+}
+float e5m2(float x) { return fp8_e5m2_bits_to_float(float_to_fp8_e5m2_bits(x)); }
+
+// The operand format for the freshly-quantized Q / P (K/V storage stays e4m3,
+// Phase A is frozen). e4m3: 3-bit mantissa, max finite 448. e5m2: 2-bit
+// mantissa, max finite 57344 (wider exponent, coarser mantissa).
+enum class Fmt { E4M3, E5M2 };
+float max_finite(Fmt f) { return f == Fmt::E4M3 ? 448.f : 57344.f; }
+float quant(Fmt f, float x) { return f == Fmt::E4M3 ? e4m3(x) : e5m2(x); }
+
 // The power-of-two P scale (§5.1): 2^ceil(log2(absmax/448)), the fp8_block
 // recipe — RNE relative error is scale-invariant (no mantissa/scale
 // interaction). 1.0 for an all-zero row (avoids the div-by-zero; the row's
 // output is 0 either way).
-float pow2_gamma(float absmax_w) {
+float pow2_gamma(float absmax_w, float maxf) {
   if (absmax_w <= 0.f) return 1.f;
-  return dgpp::e8m0_byte_to_float(dgpp::e8m0_ceil_log2_byte(absmax_w / 448.f));
+  return dgpp::e8m0_byte_to_float(dgpp::e8m0_ceil_log2_byte(absmax_w / maxf));
 }
 
 // Geometry: a small QSA slice (the real model is 24 q / 2 kv heads, dim 256;
@@ -177,25 +229,29 @@ double warp_band_l2(const Fp8Geo& g, int cnt, int seed) {
   return std::sqrt(num / std::max(den, 1e-30));
 }
 
-// The projected E4M3-MMA math in fp32 (§2.1, §2.2, §2.3): the exact result the
+// The projected FP8-MMA math in fp32 (§2.1, §2.2, §2.3): the exact result the
 // tensor cores would produce from the quantized codes, isolating the
-// quantization from the tensor-core rounding.
-std::vector<float> projected_e4m3_attn(const std::vector<float>& q, const std::vector<float>& k,
-                                       const std::vector<float>& v, const Fp8Geo& g) {
+// quantization from the tensor-core rounding. qfmt / pfmt select the
+// freshly-quantized Q / P operand format (e4m3 or e5m2); K/V storage stays
+// e4m3 (Phase A is frozen). The Q row scale is absmax/max_finite(qfmt) and the
+// P scale is the power-of-two gamma over max_finite(pfmt).
+std::vector<float> projected_attn(const std::vector<float>& q, const std::vector<float>& k,
+                                  const std::vector<float>& v, const Fp8Geo& g, Fmt qfmt, Fmt pfmt) {
   const int D = g.dim, H = g.local_heads, KV = g.kv_heads, grp = g.group();
   const float s = 1.0f / 16.0f;
+  const float qmaxf = max_finite(qfmt), pmaxf = max_finite(pfmt);
   std::vector<float> out(static_cast<size_t>(g.rows) * H * D, 0.f);
   for (int r = 0; r < g.rows; ++r)
     for (int h = 0; h < H; ++h) {
       const int hkv = h / grp;
-      // Q row -> e4m3 codes + alpha (per-row absmax/448, §2.1).
+      // Q row -> codes + alpha (per-row absmax/max_finite(qfmt), §2.1).
       const float* qr = q.data() + (static_cast<size_t>(r) * H + h) * D;
       float amax = 0.f;
       for (int j = 0; j < D; ++j) amax = std::max(amax, std::fabs(qr[j]));
-      const float alpha = amax > 0.f ? amax / 448.f : 1.f;
+      const float alpha = amax > 0.f ? amax / qmaxf : 1.f;
       std::vector<float> qt(D);
-      for (int j = 0; j < D; ++j) qt[static_cast<size_t>(j)] = e4m3(qr[j] / alpha);
-      // Per-token K/V codes + scales, the scores, the online-softmax P.
+      for (int j = 0; j < D; ++j) qt[static_cast<size_t>(j)] = quant(qfmt, qr[j] / alpha);
+      // Per-token K/V codes + scales (e4m3, frozen), the scores, the online-softmax P.
       std::vector<float> sc(g.seq), p(g.seq);
       float M = -INFINITY, l = 0.f;
       for (int n = 0; n < g.seq; ++n) {
@@ -212,7 +268,7 @@ std::vector<float> projected_e4m3_attn(const std::vector<float>& q, const std::v
         p[static_cast<size_t>(n)] = expf(sc[static_cast<size_t>(n)] - M);
         l += p[static_cast<size_t>(n)];  // l sums the UNROUNDED P (the DSA pin)
       }
-      // V-weighted P (w = P·βᵛ, §2.3) -> e4m3 codes + the power-of-two gamma.
+      // V-weighted P (w = P·βᵛ, §2.3) -> codes + the power-of-two gamma.
       std::vector<float> w(g.seq), vt(static_cast<size_t>(g.seq) * D);
       float wmax = 0.f;
       for (int n = 0; n < g.seq; ++n) {
@@ -225,12 +281,12 @@ std::vector<float> projected_e4m3_attn(const std::vector<float>& q, const std::v
         w[static_cast<size_t>(n)] = p[static_cast<size_t>(n)] * bv;
         wmax = std::max(wmax, w[static_cast<size_t>(n)]);
       }
-      const float gamma = pow2_gamma(wmax);
+      const float gamma = pow2_gamma(wmax, pmaxf);
       // PV: out = gamma · Σ_n p̃·ṽ / l  (§2.3: βᵛ cancels, one copy in P, one in V).
       float* o = out.data() + (static_cast<size_t>(r) * H + h) * D;
       for (int j = 0; j < D; ++j) o[j] = 0.f;
       for (int n = 0; n < g.seq; ++n) {
-        const float pt = e4m3(w[static_cast<size_t>(n)] / gamma);
+        const float pt = quant(pfmt, w[static_cast<size_t>(n)] / gamma);
         if (pt == 0.f) continue;
         for (int j = 0; j < D; ++j) o[j] += pt * vt[static_cast<size_t>(n) * D + j];
       }
@@ -277,7 +333,7 @@ DGPP_TEST(qwen_fp8_mma_projected_study) {
   for (size_t i = 0; i < q.size(); ++i) qf[i] = dgpp::bf16_bits_to_float(q[i]);
   for (size_t i = 0; i < k.size(); ++i) kf[i] = dgpp::bf16_bits_to_float(k[i]);
   for (size_t i = 0; i < v.size(); ++i) vf[i] = dgpp::bf16_bits_to_float(v[i]);
-  const auto proj = projected_e4m3_attn(qf, kf, vf, g);
+  const auto proj = projected_attn(qf, kf, vf, g, Fmt::E4M3, Fmt::E4M3);
 
   const long n = static_cast<long>(ref.size());
   double num = 0, den = 0;
@@ -335,7 +391,38 @@ __global__ void a_fragment_oracle_kernel(const uint8_t* a, const uint8_t* b, flo
   c[(g + 8) * 8 + 2 * t + 0] = cc[2];
   c[(g + 8) * 8 + 2 * t + 1] = cc[3];
 }
+// Encode a float to its e5m2 code with the CUDA intrinsic (the exact code the
+// tensor cores would consume) -- pins the host codec used by the e5m2 study.
+__global__ void e5m2_encode_kernel(const float* x, uint8_t* out, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = __nv_cvt_float_to_fp8(x[i], __NV_SATFINITE, __NV_E5M2);
+}
 }  // namespace
+
+// The host e5m2 codec (float_to_fp8_e5m2_bits) must match the CUDA __NV_E5M2
+// intrinsic bit-for-bit, or the e5m2 study's numbers are not trustworthy. A
+// grid over [0, 57344] + subnormals + negatives + the saturation boundary.
+DGPP_TEST(qwen_fp8_mma_e5m2_codec_matches_intrinsic) {
+  std::vector<float> vals;
+  for (int e = -20; e <= 16; ++e)
+    for (float m = 0.f; m < 4.f; m += 0.25f) vals.push_back((1.0f + m) * exp2f(static_cast<float>(e)));
+  for (float x : {0.f, 448.f, 57344.f, 57345.f, 65536.f, 0.00006103515625f}) {
+    vals.push_back(x);
+    vals.push_back(-x);
+  }
+  const int n = static_cast<int>(vals.size());
+  DevBuf dx = up(vals), dc(static_cast<size_t>(n));
+  const int block = 256;
+  e5m2_encode_kernel<<<(n + block - 1) / block, block>>>(ptr<float>(dx), mptr<uint8_t>(dc), n);
+  DGPP_CUDA_OK(cudaGetLastError());
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  const auto codes = down<uint8_t>(dc, static_cast<size_t>(n));
+  long mism = 0;
+  for (int i = 0; i < n; ++i)
+    if (codes[static_cast<size_t>(i)] != float_to_fp8_e5m2_bits(vals[static_cast<size_t>(i)])) ++mism;
+  std::printf("[fp8-mma] e5m2 codec vs __nv_cvt_float_to_fp8: %ld/%d mismatches\n", mism, n);
+  require(mism == 0, "host e5m2 codec disagrees with the CUDA __NV_E5M2 intrinsic");
+}
 
 DGPP_TEST(qwen_fp8_mma_a_fragment_oracle) {
   // Random E4M3 A (16x32) and B (32x8); the host dot product is the reference.
@@ -393,6 +480,165 @@ DGPP_TEST(qwen_fp8_mma_warp_group16_and_partial_tiles) {
     std::printf("[fp8-mma] E4M3 warp kernel vs bf16 %s: l2_rel %.4f\n", cases[i].label, l2_rel);
     require(l2_rel <= 0.10, "E4M3 warp kernel l2_rel exceeds the 0.10 band");
   }
+}
+
+// e5m2 operand study (the frontier question: does e5m2 for the freshly-
+// quantized Q / P tighten the band vs e4m3?). Two parts:
+//
+//   (a) the projected end-to-end l2_rel for all four (Q fmt, P fmt) combos,
+//       K/V storage frozen e4m3 (Phase A). The e4m3/e4m3 cell must reproduce
+//       the committed 0.0491.
+//
+//   (b) a per-element relative-error study for Q-like rows (bf16 unit-normal,
+//       per-row absmax/max_finite scale) and P-like values (softmax probs in
+//       [0,1] times the per-token V scale, per-row power-of-two gamma): mean /
+//       max per-element rel err + the underflow fraction (elements that
+//       quantize to 0). e5m2's wider exponent (min subnormal 2^-16 vs e4m3's
+//       2^-9) helps small values; its coarser 2-bit mantissa (rel err up to
+//       2^-3 vs 2^-4) hurts the large ones. Measure which dominates.
+//
+// This is host-only (no kernel): it sets the decision before any kernel edit.
+namespace {
+struct RelErrStats {
+  double mean_rel = 0, max_rel = 0, underflow_frac = 0;
+};
+}  // namespace
+
+DGPP_TEST(qwen_fp8_mma_e5m2_operand_study) {
+  Fp8Geo g;
+  const int D = g.dim, H = g.local_heads, KV = g.kv_heads, grp = g.group();
+  const float s = 1.0f / 16.0f;
+
+  // Same realistic bf16 Q/K/V as the projected study (unit-normal).
+  const auto qb = random_bf16_normal(101, static_cast<int64_t>(g.rows) * H * D, 1.0f);
+  const auto kb = random_bf16_normal(102, static_cast<int64_t>(g.seq) * g.width(), 1.0f);
+  const auto vb = random_bf16_normal(103, static_cast<int64_t>(g.seq) * g.width(), 1.0f);
+  std::vector<float> q(qb.size()), k(kb.size()), v(vb.size());
+  for (size_t i = 0; i < qb.size(); ++i) q[i] = dgpp::bf16_bits_to_float(qb[i]);
+  for (size_t i = 0; i < kb.size(); ++i) k[i] = dgpp::bf16_bits_to_float(kb[i]);
+  for (size_t i = 0; i < vb.size(); ++i) v[i] = dgpp::bf16_bits_to_float(vb[i]);
+
+  // (a) projected end-to-end l2_rel for the four operand-format combos, against
+  // the bf16 reference (the partial+combine chain, the study's ground truth).
+  cudaStream_t st = test_stream();
+  std::vector<int32_t> table(static_cast<size_t>(g.blocks_per_request()));
+  for (int b = 0; b < g.blocks_per_request(); ++b) table[static_cast<size_t>(b)] = b;
+  DevBuf dtable = up(table);
+  DevBuf kc(static_cast<size_t>(g.slots()) * g.width() * 2), vc(static_cast<size_t>(g.slots()) * g.width() * 2);
+  fill_cache(kb, vb, g, ptr<int32_t>(dtable), mptr<uint16_t>(kc), mptr<uint16_t>(vc), st);
+  std::vector<int32_t> req_ids(static_cast<size_t>(g.rows), 0);
+  std::vector<int32_t> topk(static_cast<size_t>(g.rows) * g.seq);
+  for (int r = 0; r < g.rows; ++r)
+    for (int i = 0; i < g.seq; ++i) topk[static_cast<size_t>(r) * g.seq + i] = i;
+  std::vector<int32_t> counts(static_cast<size_t>(g.rows), g.seq);
+  DevBuf dq = up(qb), dreq = up(req_ids), dtopk = up(topk), dcounts = up(counts);
+  const auto refout = run_attn_fp32(ptr<uint16_t>(dq), mptr<uint16_t>(kc), mptr<uint16_t>(vc),
+                                    ptr<int32_t>(dreq), ptr<int32_t>(dtopk), ptr<int32_t>(dcounts),
+                                    ptr<int32_t>(dtable), g, st);
+  auto l2_of = [&](const std::vector<float>& got) {
+    double num = 0, den = 0;
+    for (long i = 0, n = static_cast<long>(got.size()); i < n; ++i) {
+      const double d = static_cast<double>(got[static_cast<size_t>(i)]) - refout[static_cast<size_t>(i)];
+      num += d * d;
+      den += static_cast<double>(refout[static_cast<size_t>(i)]) * refout[static_cast<size_t>(i)];
+    }
+    return std::sqrt(num / std::max(den, 1e-30));
+  };
+  const double l2_e4e4 = l2_of(projected_attn(q, k, v, g, Fmt::E4M3, Fmt::E4M3));
+  const double l2_e5e4 = l2_of(projected_attn(q, k, v, g, Fmt::E5M2, Fmt::E4M3));
+  const double l2_e4e5 = l2_of(projected_attn(q, k, v, g, Fmt::E4M3, Fmt::E5M2));
+  const double l2_e5e5 = l2_of(projected_attn(q, k, v, g, Fmt::E5M2, Fmt::E5M2));
+  std::printf("[fp8-mma] e5m2 operand study: projected l2_rel  e4m3/e4m3 %.4f  e5m2-Q/e4m3-P %.4f  "
+              "e4m3-Q/e5m2-P %.4f  e5m2/e5m2 %.4f\n",
+              l2_e4e4, l2_e5e4, l2_e4e5, l2_e5e5);
+
+  // (b) per-element relative-error study.
+  // Q-like: every Q row, per-row absmax/max_finite(f) scale (differs by
+  // format, so each format is measured over its own scale).
+  auto q_stats = [&](Fmt f) {
+    double sum = 0, mx = 0;
+    long under = 0, tot = 0;
+    for (int r = 0; r < g.rows; ++r)
+      for (int h = 0; h < H; ++h) {
+        const float* qr = q.data() + (static_cast<size_t>(r) * H + h) * D;
+        float amax = 0.f;
+        for (int j = 0; j < D; ++j) amax = std::max(amax, std::fabs(qr[j]));
+        const float scale = amax > 0.f ? amax / max_finite(f) : 1.f;
+        for (int j = 0; j < D; ++j) {
+          const float c = quant(f, qr[j] / scale);
+          const double rel = std::fabs(qr[j] - c * scale) / std::max(std::fabs(qr[j]), 1e-30f);
+          sum += rel;
+          mx = std::max(mx, rel);
+          if (c == 0.f) ++under;
+          ++tot;
+        }
+      }
+    return RelErrStats{sum / static_cast<double>(tot), mx, under / static_cast<double>(tot)};
+  };
+  const auto qe4 = q_stats(Fmt::E4M3), qe5 = q_stats(Fmt::E5M2);
+
+  // P-like: the bf16 softmax probabilities of (row 0, head 0) times the
+  // per-token V scale, per-row power-of-two gamma (the kernel's recipe).
+  const int hkv = 0 / grp;
+  const float* qr0 = q.data();
+  float qamax = 0.f;
+  for (int j = 0; j < D; ++j) qamax = std::max(qamax, std::fabs(qr0[j]));
+  const float qalpha = qamax > 0.f ? qamax / 448.f : 1.f;
+  std::vector<float> p(g.seq);
+  float M = -INFINITY;
+  for (int n = 0; n < g.seq; ++n) {
+    const float* kr = k.data() + (static_cast<size_t>(n) * KV + hkv) * D;
+    float kamax = 0.f;
+    for (int j = 0; j < D; ++j) kamax = std::max(kamax, std::fabs(kr[j]));
+    const float bk = kamax > 0.f ? kamax / 448.f : 1.f;
+    float dot = 0.f;
+    for (int j = 0; j < D; ++j) dot += e4m3(qr0[j] / qalpha) * e4m3(kr[j] / bk);
+    const float sc = s * qalpha * bk * dot;
+    M = std::max(M, sc);
+  }
+  std::vector<float> w(g.seq);
+  float wmax = 0.f;
+  for (int n = 0; n < g.seq; ++n) {
+    const float* kr = k.data() + (static_cast<size_t>(n) * KV + hkv) * D;
+    float kamax = 0.f;
+    for (int j = 0; j < D; ++j) kamax = std::max(kamax, std::fabs(kr[j]));
+    const float bk = kamax > 0.f ? kamax / 448.f : 1.f;
+    float dot = 0.f;
+    for (int j = 0; j < D; ++j) dot += e4m3(qr0[j] / qalpha) * e4m3(kr[j] / bk);
+    p[n] = expf(s * qalpha * bk * dot - M);
+    const float* vr = v.data() + (static_cast<size_t>(n) * KV + hkv) * D;
+    float vmax = 0.f;
+    for (int j = 0; j < D; ++j) vmax = std::max(vmax, std::fabs(vr[j]));
+    const float bv = vmax > 0.f ? vmax / 448.f : 1.f;
+    w[n] = p[n] * bv;
+    wmax = std::max(wmax, w[n]);
+  }
+  auto p_stats = [&](Fmt f) {
+    const float gamma = pow2_gamma(wmax, max_finite(f));
+    double sum = 0, mx = 0;
+    long under = 0;
+    for (int n = 0; n < g.seq; ++n) {
+      const float c = quant(f, w[n] / gamma);
+      const double rel = std::fabs(w[n] - c * gamma) / std::max(std::fabs(w[n]), 1e-30f);
+      sum += rel;
+      mx = std::max(mx, rel);
+      if (c == 0.f) ++under;
+    }
+    return RelErrStats{sum / g.seq, mx, under / static_cast<double>(g.seq)};
+  };
+  const auto pe4 = p_stats(Fmt::E4M3), pe5 = p_stats(Fmt::E5M2);
+
+  std::printf("[fp8-mma]   Q per-element: e4m3 mean %.4f max %.3g underflow %.3f%% | e5m2 mean %.4f max "
+              "%.3g underflow %.3f%%\n",
+              qe4.mean_rel, qe4.max_rel, 100 * qe4.underflow_frac, qe5.mean_rel, qe5.max_rel,
+              100 * qe5.underflow_frac);
+  std::printf("[fp8-mma]   P per-element: e4m3 mean %.4f max %.3g underflow %.3f%% | e5m2 mean %.4f max "
+              "%.3g underflow %.3f%%\n",
+              pe4.mean_rel, pe4.max_rel, 100 * pe4.underflow_frac, pe5.mean_rel, pe5.max_rel,
+              100 * pe5.underflow_frac);
+  // The decision is read from the numbers: e5m2 tightens the band only if its
+  // projected l2_rel beats e4m3/e4m3 (0.0491). No assertion here -- this is
+  // the evidence that sets the kernel decision (evidence-first, plan §7).
 }
 
 int main() { return dgpp::test::run_all(); }
