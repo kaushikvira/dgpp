@@ -1112,10 +1112,12 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
           srows.request = run.span_reqs[sp];
           srows.pos0 = run.span_pos0[sp];
           qsa_->enqueue(x_ + static_cast<size_t>(row0) * H, len, srows, cache, attn_out + static_cast<size_t>(row0) * H, stream_);
+          qsa_->dump_qk(layer, len, srows, stream_);  // the DGPP_DUMP_QK instrument (one branch when unset)
           row0 += len;
         }
       } else {
         qsa_->enqueue(x_, T, qrows, cache, attn_out, stream_);
+        qsa_->dump_qk(layer, T, qrows, stream_);  // the DGPP_DUMP_QK instrument (one branch when unset)
       }
       ++qsa_ordinal;
     }

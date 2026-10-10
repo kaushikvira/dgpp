@@ -6,10 +6,15 @@
 
 #include <chrono>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -690,9 +695,81 @@ QwenQsaLayer::QwenQsaLayer(const QwenQsaResident& w, const QwenGemmWorkspace& ge
   c_ws_ = dev_alloc<float>(part * dim_);
   c_out_ = dev_alloc<float>(M * static_cast<size_t>(lh_) * dim_);
   o_ = dev_alloc<uint16_t>(M * static_cast<size_t>(lh_) * dim_);
+  // The Q/K capture instrument (DGPP_DUMP_QK): the real-data validation of the
+  // C.1a NO-GO (docs/qwen_fp8_phase_c_plan.md §3.1). Unset — the default — it
+  // costs nothing: dump_qk is one branch and nothing else here runs.
+  if (const char* dump_path = std::getenv("DGPP_DUMP_QK");
+      dump_path != nullptr && *dump_path != '\0') {
+    qk_dump_layer_ = 23;  // a middle QSA layer (the model's QSA layers are 3, 7, ..., 47)
+    if (const char* layer_env = std::getenv("DGPP_DUMP_QK_LAYER"); layer_env != nullptr && *layer_env != '\0')
+      qk_dump_layer_ = std::atoi(layer_env);
+    // One rank of the TP group owns the file: an O_EXCL sidecar. The head
+    // creates it; a peer whose filesystem does not carry the head's path
+    // (dgpp-cluster forwards every DGPP_* knob to the peers) fails here and
+    // stays off — a measurement knob must never take a boot down.
+    const std::string owner = std::string(dump_path) + ".owner";
+    if (const int fd = ::open(owner.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644); fd >= 0) {
+      ::close(fd);
+      qk_dump_fd_ = ::open(dump_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    } else if (errno == EEXIST) {
+      DGPP_LOG_WARN("qsa: DGPP_DUMP_QK {} is owned by another rank; this rank stays off", dump_path);
+      return;
+    } else {
+      DGPP_LOG_WARN("qsa: DGPP_DUMP_QK is not writable ({}); the Q/K dump stays off", dump_path);
+      return;
+    }
+    if (qk_dump_fd_ < 0) {
+      DGPP_LOG_WARN("qsa: DGPP_DUMP_QK is not writable ({}); the Q/K dump stays off", dump_path);
+      return;
+    }
+    // The 80-byte header (the reader's contract, mirrored in
+    // tests/cuda/qwen_fp8_error_attribution.cpp): magic, geometry, the cap,
+    // and the close-patched counters. Then per segment: a 24-byte record
+    // {pos0, tokens, lh, lkv, D, pad} + raw bf16 q (tokens*lh*D), k and v
+    // (tokens*lkv*D each). The cap bounds the raw bytes; a segment that
+    // would overrun it is cut to fit and truncated is set.
+    struct {
+      char magic[8];
+      uint32_t layer, lh, lkv, D;
+      uint32_t n_segments, truncated;
+      uint64_t cap_bytes, total_raw_bytes;
+      uint64_t reserved[4];
+    } h{};
+    std::memcpy(h.magic, "DGPPQK01", 8);
+    h.layer = static_cast<uint32_t>(qk_dump_layer_);
+    h.lh = static_cast<uint32_t>(lh_);
+    h.lkv = static_cast<uint32_t>(lkv_);
+    h.D = static_cast<uint32_t>(dim_);
+    h.cap_bytes = qk_dump_cap_;
+    if (::write(qk_dump_fd_, &h, sizeof(h)) != static_cast<ssize_t>(sizeof(h))) {
+      DGPP_LOG_WARN("qsa: DGPP_DUMP_QK header write failed ({}); the Q/K dump stays off", dump_path);
+      ::close(qk_dump_fd_);
+      qk_dump_fd_ = -1;
+      return;
+    }
+    qk_dump_armed_ = true;
+    DGPP_LOG_INFO("qsa: dumping layer {}'s post-norm+RoPE Q/K and raw V ({} B cap) to {} "
+                  "(a capture run: the copies perturb latency)",
+                  qk_dump_layer_, qk_dump_cap_, dump_path);
+  }
 }
 
 QwenQsaLayer::~QwenQsaLayer() {
+  if (qk_dump_fd_ >= 0) {
+    // The close patch (pwrite: no offset movement) so a reader racing the
+    // shutdown sees the true counters; then close.
+    uint32_t n = static_cast<uint32_t>(qk_dump_segments_);
+    uint32_t t = qk_dump_truncated_ ? 1u : 0u;
+    uint64_t raw = qk_dump_raw_;
+    // Best effort at shutdown (the per-segment patches already kept the
+    // counters current; a reader walking to EOF needs none of these).
+    const ssize_t p1 = ::pwrite(qk_dump_fd_, &n, 4, 24);
+    const ssize_t p2 = ::pwrite(qk_dump_fd_, &t, 4, 28);
+    const ssize_t p3 = ::pwrite(qk_dump_fd_, &raw, 8, 40);
+    (void)(p1 && p2 && p3);
+    ::close(qk_dump_fd_);
+    qk_dump_fd_ = -1;
+  }
   cudaFree(d_inv_freq_);
   cudaFree(q_);
   cudaFree(k_);
@@ -847,6 +924,72 @@ void QwenQsaLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows& row
   qsa_gate_out(c_out_, q_ + D, QW, 2 * D, o_, T, lh_, D, stream);
   gemm_dense(g_, o_, static_cast<int64_t>(lh_) * D, w_.o_proj, w_.o_proj_fp8, out, GemmOut::BF16, T, H,
              lh_ * D, stream);
+}
+
+void QwenQsaLayer::dump_qk(int layer, int tokens, const QwenQsaRows& rows, cudaStream_t stream) {
+  // Inert unless armed (the constructor's DGPP_DUMP_QK block): one branch.
+  if (!qk_dump_armed_ || layer != qk_dump_layer_ || rows.decode || tokens <= 0) return;
+  const int KW = lkv_ * dim_;
+  // Post-RoPE K in bf16: the same norm+RoPE pass the fused fp8 append runs
+  // (bitwise the two-kernel chain the append replaced), into the kn_ staging
+  // buffer the bf16 pool path uses. This is the extra launch a capture run
+  // pays — the served path is untouched.
+  qsa_norm_rope_bf16(k_, KW, dim_, w_.k_norm, rows.pos, d_inv_freq_, kn_, KW, tokens, lkv_, dim_,
+                     rotary_, eps_, mscale_, stream);
+  const size_t qe = static_cast<size_t>(tokens) * lh_ * dim_;
+  const size_t ke = static_cast<size_t>(tokens) * lkv_ * dim_;
+  qk_dump_buf_.resize(qe + 2 * ke);
+  DGPP_CUDA_OK(cudaMemcpy(qk_dump_buf_.data(), qn_, qe * 2, cudaMemcpyDeviceToHost));
+  DGPP_CUDA_OK(cudaMemcpy(qk_dump_buf_.data() + qe, kn_, ke * 2, cudaMemcpyDeviceToHost));
+  DGPP_CUDA_OK(cudaMemcpy(qk_dump_buf_.data() + qe + ke, v_, ke * 2, cudaMemcpyDeviceToHost));
+  // The cap: cut the segment to fit and say so (the header's truncated flag).
+  const uint64_t per_token = static_cast<uint64_t>(lh_ + 2 * lkv_) * dim_ * 2;
+  uint64_t n = static_cast<uint64_t>(tokens);
+  if (qk_dump_raw_ + n * per_token > qk_dump_cap_) {
+    n = (qk_dump_cap_ - qk_dump_raw_) / per_token;
+    qk_dump_truncated_ = true;
+    if (n == 0) return;  // the cap is spent; later chunks are dropped
+  }
+  struct Rec {
+    uint32_t pos0, tokens, lh, lkv, D, pad;
+  } rec{};
+  rec.pos0 = static_cast<uint32_t>(rows.pos0);
+  rec.tokens = static_cast<uint32_t>(n);
+  rec.lh = static_cast<uint32_t>(lh_);
+  rec.lkv = static_cast<uint32_t>(lkv_);
+  rec.D = static_cast<uint32_t>(dim_);
+  const size_t qn = n * lh_ * dim_ * 2, kn = n * lkv_ * dim_ * 2;
+  const uint8_t* raw = reinterpret_cast<const uint8_t*>(qk_dump_buf_.data());
+  // Sequential writes (the fd's offset) for the segment, pwrite for the
+  // header's counters (no offset movement, no stream-buffer interaction):
+  // a reader may walk the file while the capture is in flight.
+  bool ok = ::write(qk_dump_fd_, &rec, sizeof(rec)) == static_cast<ssize_t>(sizeof(rec)) &&
+            ::write(qk_dump_fd_, raw, qn) == static_cast<ssize_t>(qn) &&
+            ::write(qk_dump_fd_, raw + qn, kn) == static_cast<ssize_t>(kn) &&
+            ::write(qk_dump_fd_, raw + qn + kn, kn) == static_cast<ssize_t>(kn);
+  if (!ok) {
+    // A failed write must be loud: a silently lost capture is worse than no
+    // capture. The instrument stays armed (later chunks may still land), but
+    // the operator sees the failure.
+    DGPP_LOG_WARN("qsa: DGPP_DUMP_QK write failed at chunk [{}..{}); the dump file is "
+                  "incomplete", rows.pos0, rows.pos0 + static_cast<int64_t>(n));
+    return;
+  }
+  qk_dump_raw_ += (qn + 2 * kn);
+  ++qk_dump_segments_;
+  uint32_t cnt = static_cast<uint32_t>(qk_dump_segments_);
+  uint32_t tr = qk_dump_truncated_ ? 1u : 0u;
+  // The counter patch is best-effort (the reader walks segments to EOF); a
+  // failed patch leaves a stale count, never corrupt data.
+  if (::pwrite(qk_dump_fd_, &cnt, 4, 24) != 4 || ::pwrite(qk_dump_fd_, &tr, 4, 28) != 4) {
+    DGPP_LOG_WARN("qsa: DGPP_DUMP_QK header patch failed; the header's counters may lag");
+  }
+  uint64_t rw = qk_dump_raw_;
+  if (::pwrite(qk_dump_fd_, &rw, 8, 40) != 8)
+    DGPP_LOG_WARN("qsa: DGPP_DUMP_QK header patch failed; the header's counters may lag");
+  DGPP_LOG_INFO("qsa: dumped layer {} chunk [{}..{}) ({} B raw, {} segments{})",
+                layer, rows.pos0, rows.pos0 + static_cast<int64_t>(n), qn + 2 * kn, qk_dump_segments_,
+                qk_dump_truncated_ ? ", truncated at the cap" : "");
 }
 
 size_t QwenQsaLayer::scratch_bytes(const QwenTextConfig& cfg, int local_heads, int local_kv_heads,

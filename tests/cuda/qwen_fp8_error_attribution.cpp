@@ -21,11 +21,20 @@
 // pin: fp32 math, P rounded to bf16 (the DSA pin), l unrounded.
 //
 // Build: plain C++ (no CUDA). Run: ./qwen_fp8_error_attribution
+//   ./qwen_fp8_error_attribution                 (the four synthetic regimes)
+//   ./qwen_fp8_error_attribution --real <dump>   (the DGPP_DUMP_QK real-data
+//                                                mode: the same grid on a
+//                                                live forward pass's
+//                                                post-norm+RoPE Q/K, plus
+//                                                per-row statistics)
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <functional>
 #include <random>
 #include <string>
 #include <vector>
@@ -366,6 +375,192 @@ const Cfg kConfigs[] = {
     {QF::BF16, QF::BF16, QF::ROW, PF::BF16, false, "iso_v  Q bf16 K bf16 P bf16 V row "},
 };
 
+// ---- real-data mode (the DGPP_DUMP_QK dump) ---------------------------------
+// The engine's instrument (QwenQsaLayer::dump_qk, src/models/qwen/layers.cpp)
+// writes one layer's post-norm+RoPE Q/K (bf16) and raw V (bf16) per prefill
+// chunk. Format: an 80-byte header (magic "DGPPQK01", layer, lh, lkv, D,
+// n_segments, truncated, cap_bytes, total_raw_bytes, reserved[4]), then per
+// segment a 24-byte record {pos0, tokens, lh, lkv, D, pad} + raw bf16 q
+// (tokens*lh*D), k (tokens*lkv*D) and v (tokens*lkv*D).
+struct RealDump {
+  int layer = -1, lh = 0, lkv = 0, D = 0;
+  uint32_t n_segments = 0, truncated = 0;
+  uint64_t cap_bytes = 0, total_raw_bytes = 0;
+  size_t tokens = 0;
+  std::vector<float> q, k, v;  // fp32 [tokens, lh, D] / [tokens, lkv, D]
+};
+
+bool load_dump(const char* path, RealDump& d) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) {
+    std::fprintf(stderr, "[fp8-attn] cannot open dump %s\n", path);
+    return false;
+  }
+  struct Header {
+    char magic[8];
+    uint32_t layer, lh, lkv, D;
+    uint32_t n_segments, truncated;
+    uint64_t cap_bytes, total_raw_bytes;
+    uint64_t reserved[4];
+  } h;
+  f.read(reinterpret_cast<char*>(&h), sizeof(h));
+  if (!f || std::memcmp(h.magic, "DGPPQK01", 8) != 0) {
+    std::fprintf(stderr, "[fp8-attn] %s: bad magic (not a DGPP_DUMP_QK dump?)\n", path);
+    return false;
+  }
+  d.layer = h.layer;
+  d.lh = h.lh;
+  d.lkv = h.lkv;
+  d.D = h.D;
+  d.n_segments = h.n_segments;
+  d.truncated = h.truncated;
+  d.cap_bytes = h.cap_bytes;
+  d.total_raw_bytes = h.total_raw_bytes;
+  struct Rec {
+    uint32_t pos0, tokens, lh, lkv, D, pad;
+  };
+  // Walk segments to EOF (the header's n_segments is patched per segment by
+  // the writer, but a killed run may leave it stale): a segment whose data
+  // runs past EOF is dropped, not fatal.
+  auto push = [&](std::vector<float>& dst, const uint16_t* src, size_t n) {
+    dst.reserve(dst.size() + n);
+    for (size_t i = 0; i < n; ++i) dst.push_back(bf16_bits_to_float(src[i]));
+  };
+  uint32_t s = 0;
+  while (true) {
+    Rec r;
+    f.read(reinterpret_cast<char*>(&r), sizeof(r));
+    if (!f) break;  // clean EOF (or a cut record: the partial record is dropped)
+    const size_t qe = static_cast<size_t>(r.tokens) * r.lh * r.D;
+    const size_t ke = static_cast<size_t>(r.tokens) * r.lkv * r.D;
+    std::vector<uint16_t> buf(qe + 2 * ke);
+    f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>((qe + 2 * ke) * 2));
+    if (!f) {
+      std::fprintf(stderr, "[fp8-attn] %s: segment %u's data is cut off; using %u complete segments\n",
+                   path, s, s);
+      break;
+    }
+    push(d.q, buf.data(), qe);
+    push(d.k, buf.data() + qe, ke);
+    push(d.v, buf.data() + qe + ke, ke);
+    d.tokens += r.tokens;
+    ++s;
+  }
+  if (s != h.n_segments)
+    std::fprintf(stderr, "[fp8-attn] %s: header says %u segments, file carries %u\n", path,
+                 h.n_segments, s);
+  d.n_segments = s;
+  return d.tokens > 0;
+}
+
+// Per-row distribution statistics: the features the synthetic regimes model
+// (row norm, within-row dynamic range, kurtosis, the outlier-dim fraction).
+struct RowStats {
+  size_t rows = 0;
+  double norm_p50 = 0, norm_p99 = 0;  // row L2 norm
+  double dr_p50 = 0, dr_p99 = 0;      // within-row dynamic range: absmax / rms
+  double kurt = 0;                   // mean per-row excess kurtosis
+  double outlier_frac = 0;          // fraction of elements with |x| > 10x row rms
+};
+
+RowStats row_stats(const std::vector<float>& rows, int D) {
+  RowStats s;
+  const size_t n = rows.size() / static_cast<size_t>(D);
+  s.rows = n;
+  if (n == 0) return s;
+  std::vector<double> norms(n), drs(n), kurt(n, 0);
+  double out_num = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const float* r = rows.data() + i * static_cast<size_t>(D);
+    double ms = 0, m4 = 0;
+    float amax = 0;
+    for (int j = 0; j < D; ++j) {
+      const double x = r[j];
+      ms += x * x;
+      m4 += x * x * x * x;
+      amax = std::max(amax, std::fabs(r[j]));
+    }
+    const double rms = std::sqrt(ms / D);
+    norms[i] = rms * std::sqrt(static_cast<double>(D));
+    drs[i] = rms > 0 ? amax / rms : 0;
+    const double m2 = ms / D;
+    kurt[i] = m2 > 0 ? m4 / D / (m2 * m2) - 3.0 : 0;
+    for (int j = 0; j < D; ++j)
+      if (std::fabs(r[j]) > 10.0 * rms) ++out_num;
+  }
+  std::sort(norms.begin(), norms.end());
+  std::sort(drs.begin(), drs.end());
+  s.norm_p50 = norms[n / 2];
+  s.norm_p99 = norms[static_cast<size_t>(n * 0.99 + 0.5)];
+  s.dr_p50 = drs[n / 2];
+  s.dr_p99 = drs[static_cast<size_t>(n * 0.99 + 0.5)];
+  double ksum = 0;
+  for (double x : kurt) ksum += x;
+  s.kurt = ksum / static_cast<double>(n);
+  s.outlier_frac = static_cast<double>(out_num) / static_cast<double>(n * static_cast<size_t>(D));
+  return s;
+}
+
+void print_row_stats(const char* label, const RowStats& s) {
+  std::printf(
+      "  %-30s rows %-7zu norm p50/p99 %8.2f/%8.2f  dr p50/p99 %7.2f/%7.2f  kurt %8.2f  "
+      "outlier(>10x rms) %7.4f\n",
+      label, s.rows, s.norm_p50, s.norm_p99, s.dr_p50, s.dr_p99, s.kurt, s.outlier_frac);
+}
+
+// ---- the grid runner (shared by the synthetic and real-data modes) ---------
+struct Row {
+  const Cfg* cfg;
+  double l2;
+};
+bool is_base(const Cfg& c) { return c.name[0] == 'b' && c.name[1] == 'a'; }
+bool is_tc(const Cfg& c) {  // the tensor-core path: both mmas stay on e4m3
+  return c.q != QF::BF16 && c.k != QF::BF16 && c.p == PF::E4M3 && c.v != QF::BF16;
+}
+bool is_iso(const Cfg& c) { return c.name[0] == 'i'; }
+
+struct GridOut {
+  std::vector<Row> rows;
+  double base = -1;
+  const Row* best_tc = nullptr;
+  const Row* best_any = nullptr;
+};
+
+GridOut run_grid(const char* title, int seeds, const std::function<void(Data&)>& make) {
+  GridOut g;
+  for (const Cfg& c : kConfigs) {
+    double sum = 0;
+    for (int sd = 0; sd < seeds; ++sd) {
+      Data d;
+      make(d);
+      const auto ref = attn_ref(d);
+      sum += l2_rel(attn_sim(d, c), ref);
+    }
+    const double l2 = sum / seeds;
+    if (is_base(c)) g.base = l2;
+    g.rows.push_back({&c, l2});
+  }
+  std::printf("[fp8-attn] === %s (mean of %d) ===\n", title, seeds);
+  std::printf("  %-42s %8s %9s\n", "config", "l2_rel", "vs base");
+  for (const Row& r : g.rows) {
+    if (is_base(*r.cfg))
+      std::printf("  %-42s %8.4f  (base)\n", r.cfg->name, r.l2);
+    else
+      std::printf("  %-42s %8.4f %+9.4f\n", r.cfg->name, r.l2, r.l2 - g.base);
+  }
+  // Verdict: the best TENSOR-CORE path (both mmas e4m3) and the best
+  // DEPLOYABLE path (the iso_* rows are diagnostics -- one factor alone --
+  // not a real pool configuration, so they are excluded from best_any).
+  for (const Row& r : g.rows) {
+    if (is_tc(*r.cfg) && (g.best_tc == nullptr || r.l2 < g.best_tc->l2)) g.best_tc = &r;
+    if (!is_iso(*r.cfg) && (g.best_any == nullptr || r.l2 < g.best_any->l2)) g.best_any = &r;
+  }
+  std::printf("  best tensor-core: %-38s %.4f | best overall: %-38s %.4f | bar 0.035: %s\n",
+              g.best_tc->cfg->name, g.best_tc->l2, g.best_any->cfg->name, g.best_any->l2,
+              g.best_any->l2 <= 0.035 ? "REACHABLE" : "NOT reached");
+  return g;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -399,55 +594,80 @@ int main(int argc, char** argv) {
     }
   }
   const int seeds = 3;
-  struct Row { const Cfg* cfg; double l2; };
-  auto is_base = [](const Cfg& c) { return c.name[0] == 'b' && c.name[1] == 'a'; };
-  // The tensor-core path: both mmas stay on e4m3 (Q/K quantized, P e4m3,
-  // V quantized) -- the only regime where the Phase B/C work pays off.
-  auto is_tc = [](const Cfg& c) {
-    return c.q != QF::BF16 && c.k != QF::BF16 && c.p == PF::E4M3 && c.v != QF::BF16;
-  };
-  // Optional seed offset (argv[1]): re-draw every distribution for a
-  // seed-to-seed stability check of the key numbers.
-  const uint64_t offset =
-      argc > 1 ? static_cast<uint64_t>(std::strtoull(argv[1], nullptr, 10)) : 0;
+  // Argument scan: --real <dump> arms the real-data mode, --seq <n> overrides
+  // the real mode's K-token count (the synthetic grids keep seq=128, the
+  // test's standard slice), a bare number is the seed offset (re-draw every
+  // distribution for a seed-to-seed stability check of the key numbers).
+  const char* real_path = nullptr;
+  int real_seq = 4096;
+  uint64_t offset = 0;
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--real") == 0 && i + 1 < argc) {
+      real_path = argv[++i];
+    } else if (std::strcmp(argv[i], "--seq") == 0 && i + 1 < argc) {
+      real_seq = std::atoi(argv[++i]);
+    } else {
+      offset = static_cast<uint64_t>(std::strtoull(argv[i], nullptr, 10));
+    }
+  }
   const Dist dists[] = {Dist::kUnit, Dist::kHeavy, Dist::kHeavyNorm, Dist::kSink};
   const uint64_t seed_bases[] = {1000, 2000, 4000, 3000};
   for (int di = 0; di < 4; ++di) {
     const Dist dist = dists[di];
-    std::vector<Row> rows;
-    double base = -1;
-    for (const Cfg& c : kConfigs) {
-      double sum = 0;
-      for (int sd = 0; sd < seeds; ++sd) {
-        Data d;
-        gen(d, dist, seed_bases[di] + offset + static_cast<uint64_t>(sd) * 97);
-        const auto ref = attn_ref(d);
-        sum += l2_rel(attn_sim(d, c), ref);
+    const uint64_t seed0 = seed_bases[di] + offset;
+    run_grid(dist_name(dist), seeds,
+             [&dist, seed0](Data& d) { gen(d, dist, seed0); });
+  }
+  if (real_path != nullptr) {
+    RealDump rd;
+    if (!load_dump(real_path, rd)) return 1;
+    std::printf("[fp8-attn] === real dump %s: layer %d, %zu tokens in %u segments%s, %llu B raw ===\n",
+                real_path, rd.layer, rd.tokens, rd.n_segments,
+                rd.truncated ? " (TRUNCATED at the cap)" : "",
+                static_cast<unsigned long long>(rd.total_raw_bytes));
+    // Per-row statistics: the real rows vs the four synthetic regimes (the
+    // features the NO-GO's distribution assumptions rest on).
+    std::printf("[fp8-attn] per-row statistics (real vs synthetic K rows):\n");
+    print_row_stats("real Q rows", row_stats(rd.q, rd.D));
+    print_row_stats("real K rows", row_stats(rd.k, rd.D));
+    for (int di = 0; di < 4; ++di) {
+      Data d;
+      gen(d, dists[di], seed_bases[di] + offset);
+      print_row_stats(dist_name(dists[di]), row_stats(d.k, d.D));
+    }
+    // The grid on the real data: 16 strided query rows, all local q heads,
+    // one kv head, 4096 strided K tokens (the attention the prefill walks).
+    Data real;
+    real.rows = 16;
+    real.H = rd.lh;
+    real.KV = rd.lkv;
+    real.D = rd.D;
+    real.seq = static_cast<int>(std::min<size_t>(real_seq, rd.tokens));
+    real.q.assign(static_cast<size_t>(real.rows) * real.H * real.D, 0.f);
+    real.k.assign(static_cast<size_t>(real.seq) * real.KV * real.D, 0.f);
+    real.v.assign(static_cast<size_t>(real.seq) * real.KV * real.D, 0.f);
+    const size_t tq_stride = rd.tokens > static_cast<size_t>(real.rows)
+                                 ? rd.tokens / real.rows : 1;
+    const size_t tk_stride = rd.tokens > static_cast<size_t>(real.seq)
+                                 ? rd.tokens / real.seq : 1;
+    for (int r = 0; r < real.rows; ++r) {
+      const size_t t = static_cast<size_t>(r) * tq_stride;
+      for (int h = 0; h < real.H; ++h)
+        std::copy_n(rd.q.data() + (t * rd.lh + h) * rd.D, rd.D,
+                    real.q.data() + (static_cast<size_t>(r) * real.H + h) * real.D);
+    }
+    for (int n = 0; n < real.seq; ++n) {
+      const size_t t = static_cast<size_t>(n) * tk_stride;
+      for (int hkv = 0; hkv < real.KV; ++hkv) {
+        std::copy_n(rd.k.data() + (t * rd.lkv + hkv) * rd.D, rd.D,
+                    real.k.data() + (static_cast<size_t>(n) * real.KV + hkv) * real.D);
+        std::copy_n(rd.v.data() + (t * rd.lkv + hkv) * rd.D, rd.D,
+                    real.v.data() + (static_cast<size_t>(n) * real.KV + hkv) * real.D);
       }
-      const double l2 = sum / seeds;
-      if (is_base(c)) base = l2;
-      rows.push_back({&c, l2});
     }
-    std::printf("[fp8-attn] === %s (mean of %d seeds) ===\n", dist_name(dist), seeds);
-    std::printf("  %-42s %8s %9s\n", "config", "l2_rel", "vs base");
-    for (const Row& r : rows) {
-      if (is_base(*r.cfg))
-        std::printf("  %-42s %8.4f  (base)\n", r.cfg->name, r.l2);
-      else
-        std::printf("  %-42s %8.4f %+9.4f\n", r.cfg->name, r.l2, r.l2 - base);
-    }
-    // Verdict: the best TENSOR-CORE path (both mmas e4m3) and the best
-    // DEPLOYABLE path (the iso_* rows are diagnostics -- one factor alone --
-    // not a real pool configuration, so they are excluded from best_any).
-    auto is_iso = [](const Cfg& c) { return c.name[0] == 'i'; };
-    const Row* best_tc = nullptr, *best_any = nullptr;
-    for (const Row& r : rows) {
-      if (is_tc(*r.cfg) && (best_tc == nullptr || r.l2 < best_tc->l2)) best_tc = &r;
-      if (!is_iso(*r.cfg) && (best_any == nullptr || r.l2 < best_any->l2)) best_any = &r;
-    }
-    std::printf("  best tensor-core: %-38s %.4f | best overall: %-38s %.4f | bar 0.035: %s\n",
-                best_tc->cfg->name, best_tc->l2, best_any->cfg->name, best_any->l2,
-                best_any->l2 <= 0.035 ? "REACHABLE" : "NOT reached");
+    std::printf("[fp8-attn] grid geometry: rows=%d H=%d KV=%d seq=%d (strided from %zu tokens)\n",
+                real.rows, real.H, real.KV, real.seq, rd.tokens);
+    run_grid("real post-RoPE Q/K (DGPP_DUMP_QK)", 1, [&real](Data& d) { d = real; });
   }
   return 0;
 }

@@ -299,6 +299,16 @@ class QwenQsaLayer {
   int select_k() const { return select_k_; }
   int max_selected() const { return max_selected_; }
 
+  // The Q/K capture instrument (DGPP_DUMP_QK, docs/qwen_fp8_phase_c_plan.md
+  // §3.1 real-data validation): after a prefill chunk of the target layer
+  // (DGPP_DUMP_QK_LAYER, default 23), copy this rank's post-norm+RoPE Q
+  // (qn_), post-norm+RoPE K (re-run into kn_) and raw V (v_) to the dump
+  // file. One branch when the env var is unset; no kernel, no allocation,
+  // no I/O. Only one rank of a TP group owns the file (an O_EXCL sidecar),
+  // so the remote peer — whose filesystem may not carry the head's path —
+  // warns and stays off, the DGPP_DUMP_TOKENS precedent.
+  void dump_qk(int layer, int tokens, const QwenQsaRows& rows, cudaStream_t stream);
+
  private:
   QwenQsaResident w_;
   QwenGemmWorkspace g_;
@@ -327,6 +337,19 @@ class QwenQsaLayer {
   float* c_out_ = nullptr;         // [M, lh * D]
   uint16_t* o_ = nullptr;          // [M, lh * D]
   int n_split_ = 1;
+  // The DGPP_DUMP_QK instrument's state (all inert unless armed):
+  // the file (a raw fd: sequential write() for segments, pwrite() for the
+  // header's close-patched counters — no seeks, no stream-buffer
+  // interaction), the 300 MiB raw-byte cap, and the host staging buffer
+  // (resized only while armed).
+  bool qk_dump_armed_ = false;
+  int qk_dump_layer_ = 23;
+  int qk_dump_fd_ = -1;
+  uint64_t qk_dump_cap_ = 300ull * 1024 * 1024;
+  uint64_t qk_dump_raw_ = 0;
+  int qk_dump_segments_ = 0;
+  bool qk_dump_truncated_ = false;
+  std::vector<uint16_t> qk_dump_buf_;
 };
 
 // ---- Qwen3.5 full attention ---------------------------------------------------------

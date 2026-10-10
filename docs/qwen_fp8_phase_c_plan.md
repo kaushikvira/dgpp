@@ -11,6 +11,11 @@
 >   unit-normal, ~0.057 with realistic outlier dims; dequant path is the reference at
 >   0.0360) → `DGPP_QSA_FP8_MX` implemented, correct, **left default OFF**; C.1b (block-scale
 >   V) and C.2 (Hadamard) NO-GO; C.3b (decode mma) NO-GO stands.
+> * **Real-data validation (2026-10-11, §3.2): the NO-GO flips.** A live forward pass's
+>   post-RoPE Q/K (layer 23, 12.5k prefill, `DGPP_DUMP_QK`) is milder than every synthetic
+>   stress regime (no >10×-rms outliers, dr p99 4.37–7.83), and on it the tensor-core path
+>   reaches **0.0265 (seq=128) / 0.0145 (seq=4096) < 0.035** — the bar IS reachable; the
+>   block-scale/Hadamard levers still do not clearly earn their keep (wash / ≤1.31×).
 > * Records: `dgpp-gateway/docs/NIGHT-20261010.md`,
 >   `dgpp-gateway/results/ab-night-20261010-summary.md`,
 >   `results/ab-env-DGPP_QSA_FP8_MMA-*/record.md` (gateway repo, local by convention).
@@ -245,6 +250,71 @@ outlier-dim data) and the tensor-core path is the speed mode — a two-mode stor
 not one fp8-everywhere path. **Next work item:** sample a *real* post-RoPE
 Q/K distribution from a live forward pass (dump one layer of a 16k prefill) to
 validate the synthetic regimes before any further C.x investment.
+
+### 3.2 Real-data validation (2026-10-11) — the NO-GO flips: 0.035 IS reachable on the tensor-core path
+
+**Measured on real data** (the §3.1 work item). The `DGPP_DUMP_QK` instrument
+(`QwenQsaLayer::dump_qk`, env-gated, zero behaviour change when unset — the
+serve gate `ALL OK` on the instrumented binary with the var unset) dumped
+**layer 23** (a middle QSA layer; the model's QSA layers are 3, 7, …, 47),
+this rank's **12 q heads + 1 kv head** (TP=2 local group), post-norm+RoPE Q/K
+(bf16) and raw V, for a single 12,458-token prefill (`cache_n=0`): 11
+segments, 12,531 tokens, 89.8 MB (`results/qk-real-20261011/qk-layer23-16k.bin`,
+gateway repo; the study outputs `study-real-*.txt` beside it). The study's
+`--real` mode re-runs the §3.1 grid on it (16 strided query rows, all 12 q
+heads, 1 kv head; `--seq` sets the K-token count, 4096 default / 128 for the
+apples-to-apples slice).
+
+**Per-row statistics — the real rows are milder than every synthetic stress regime:**
+
+| rows | norm p50/p99 | dr (absmax/rms) p50/p99 | kurtosis | frac \|x\|>10×rms |
+|---|---|---|---|---|
+| **real Q (150,372 rows)** | 21.9 / 23.7 | 3.45 / 7.83 | 1.30 | 0.0000 |
+| **real K (12,531 rows)** | 23.9 / 24.2 | 3.09 / 4.37 | 0.27 | 0.0000 |
+| unit-normal | 15.9 / 17.7 | 3.02 / 4.08 | −0.03 | 0.0000 |
+| RMSNorm-pinned + 3 outlier dims | 26.2 / 90.3 | 10.4 / 15.7 | 64.1 | 0.0022 |
+| sink (one dim 32× rms) | 35.5 / 38.8 | 14.3 / 14.3 | 161.2 | 0.0039 |
+
+The real rows sit between unit-normal and the RMSNorm-pinned regime: a bit
+heavier-tailed (kurtosis 0.27–1.30, dr p99 up to 7.83 on Q) but with **no
+>10×-rms outliers and no 5–20×/32× outlier dims** — the features the
+§3.1 stress regimes model and the block scales/Hadamard were meant to fix.
+
+**The grid on the real data (the verdict flips):**
+
+| path | seq=128 (the synthetic slice) | seq=4096 | synthetic unit-normal (seq=128) |
+|---|---|---|---|
+| base (Q blk, K blk, P e4m3, V row) | 0.0314 | 0.0163 | 0.0518 |
+| best tensor-core | 0.0265 (V blk) | 0.0145 (H+K row) | 0.0501 (V blk) |
+| dequant path (Q/P bf16, K/V row) | 0.0189 | 0.0131 | 0.0368 |
+| **bar 0.035** | **REACHABLE** | **REACHABLE** | NOT reached |
+
+At the apples-to-apples seq=128 slice the real tensor-core base is **0.0314**
+(vs 0.0518 unit-normal) and the best tensor-core path **0.0265 < 0.035** — the
+§3.1 "unreachable" verdict does not hold on real data. The deciding feature:
+the real rows' within-row dynamic range (dr p99 4.37–7.83, zero >10×-rms
+outliers) is far below the stress regimes (10.4–15.9, 0.2–0.4 % outliers), so
+the e4m3 codes carry the rows with ~2× less relative error; the sharp real
+softmax at long seq dilutes the residual per-token error further (seq=4096
+numbers).
+
+**What this does and does not reopen.** The *bar* is reachable on the
+tensor-core path, so the two-mode story (MMA=1 speed / MMA=0 accuracy) is no
+longer forced — the speed mode already meets 0.035 on this data. The
+*individual levers* still do not clearly earn their keep: block scales are a
+wash (K-blk −0.0013 vs K-row at seq=128; V-blk +0.0049 at seq=128 but
+−0.0015 at seq=4096) and Hadamard is ≤1.31× (H+deq 0.0131→0.0100 at seq=4096,
+0.97× at seq=128) — at, not above, the 1.3× gate. C.1a stays as shipped
+(worst-element bound, default OFF); C.1b/C.2 remain NO-GO *as levers*, but
+the "0.035 unreachable" premise behind them is falsified.
+
+**Caveats (one capture, read before generalising):** one prompt (a
+repetitive-filler 12.4k prefill — a degenerate, low-diversity distribution;
+real agentic prompts may be heavier-tailed), one layer (23), one rank's head
+group, one seed. The l2_rel at seq=4096 is not directly comparable to the
+seq=128 synthetic numbers (softmax sharpness differs). A follow-up capture on
+a diverse real prompt (and 2–3 more layers) is the honest next step before
+re-opening any C.x work item.
 
 ## 4. C.2 — Incoherent processing (Hadamard) before the fp8 quant
 
