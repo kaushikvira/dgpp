@@ -765,7 +765,8 @@ void QwenQsaLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows& row
                      mscale_, stream);
   // The caches: K/V rows, then the compressed keys and the ring.
   qsa_kv_append(kn_, KW, v_, KW, d_req, d_pos, T, cache.block_tables, cache.blocks_per_request,
-                cache.block_tokens, lkv_, D, cache.k_cache, cache.v_cache, stream);
+                cache.block_tokens, lkv_, D, cache.k_cache, cache.v_cache, cache.k_scale,
+                cache.v_scale, stream);
   const int pools_per_block = cache.block_tokens / kpool_;
   const uint16_t* raw_k = idx_ + static_cast<int64_t>(idx_heads_) * Di;
   if (rows.decode) {
@@ -947,7 +948,7 @@ void QwenFullAttnLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows
                      mscale_, stream);
   // The caches: K/V rows (no compressed keys, no ring).
   qsa_kv_append(kn_, KW, v_, KW, d_req, d_pos, T, cache.block_tables, cache.blocks_per_request,
-                cache.block_tokens, lkv_, D, cache.k_cache, cache.v_cache, stream);
+                cache.block_tokens, lkv_, D, cache.k_cache, cache.v_cache, nullptr, nullptr, stream);
   // Dense causal attention over [0, pos] per row (kernels/full_attn.cu):
   // decode rows (arbitrary requests) through the split row walk, a prefill
   // chunk (one request, consecutive rows) through the query-tiled form.

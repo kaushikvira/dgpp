@@ -924,7 +924,7 @@ DGPP_TEST(qsa_listed_attention_and_gate_match_the_reference) {
     DevBuf dreq = up(req_ids), dpos = up(pos);
     dgpp::qsa_kv_append(ptr<uint16_t>(dk), width, ptr<uint16_t>(dv), width, ptr<int32_t>(dreq), ptr<int64_t>(dpos),
                         g.seq, ptr<int32_t>(sf.f.dtable), g.blocks_per_request, g.block_tokens, g.kv_heads, g.dim,
-                        mptr<uint16_t>(kc), mptr<uint16_t>(vc), st);
+                        mptr<uint16_t>(kc), mptr<uint16_t>(vc), nullptr, nullptr, st);
   }
   // Queries with the [q | gate] interleave; the reference lists.
   const int64_t q_head_stride = 2 * g.dim, q_row_stride = g.local_heads * q_head_stride;

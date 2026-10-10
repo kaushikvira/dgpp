@@ -93,7 +93,7 @@ void fill_cache(const std::vector<uint16_t>& k, const std::vector<uint16_t>& v, 
   DevBuf dk = up(k), dv = up(v), dreq = up(req_ids), dpos = up(pos);
   dgpp::qsa_kv_append(ptr<uint16_t>(dk), width, ptr<uint16_t>(dv), width, ptr<int32_t>(dreq),
                       ptr<int64_t>(dpos), g.seq, dtable, g.blocks_per_request(), g.block_tokens,
-                      g.kv_heads, g.dim, kc, vc, st);
+                      g.kv_heads, g.dim, kc, vc, nullptr, nullptr, st);
 }
 
 // Run the production bf16 attention chain (partial + combine + gate) over a

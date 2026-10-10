@@ -10,6 +10,7 @@
 
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
+#include "kernels/latent_format.hpp"
 #include "kernels/topk_select.cuh"
 
 namespace dgpp {
@@ -103,17 +104,47 @@ __global__ void kv_append_kernel(const uint16_t* __restrict__ k, int64_t k_row_s
                                  const int32_t* __restrict__ req_ids,
                                  const int64_t* __restrict__ pos,
                                  const int32_t* __restrict__ block_tables,
-                                 int blocks_per_request, int block_tokens, int width,
-                                 uint16_t* __restrict__ k_cache, uint16_t* __restrict__ v_cache) {
+                                 int blocks_per_request, int block_tokens, int kv_heads, int dim,
+                                 uint16_t* __restrict__ k_cache, uint16_t* __restrict__ v_cache,
+                                 float* __restrict__ k_scale, float* __restrict__ v_scale) {
   const int64_t r = blockIdx.x;
   const int64_t p = pos[r];
   if (p < 0) return;
   const int32_t blk = block_tables[static_cast<int64_t>(req_ids[r]) * blocks_per_request +
                                    p / block_tokens];
   const int64_t phys = static_cast<int64_t>(blk) * block_tokens + p % block_tokens;
-  for (int e = threadIdx.x; e < width; e += blockDim.x) {
-    k_cache[phys * width + e] = k[r * k_row_stride + e];
-    v_cache[phys * width + e] = v[r * v_row_stride + e];
+  if (k_scale == nullptr) {
+    // bf16: the historical copy, element-strided over the row (bitwise unchanged).
+    const int width = kv_heads * dim;
+    for (int e = threadIdx.x; e < width; e += blockDim.x) {
+      k_cache[phys * width + e] = k[r * k_row_stride + e];
+      v_cache[phys * width + e] = v[r * v_row_stride + e];
+    }
+    return;
+  }
+  // fp8: one thread per (token, kv-head) row — quantize the dim-wide row to
+  // e4m3 with the per-row absmax/448 scale (kernels/latent_format.hpp), store
+  // the codes (1 B/elem) and the per-head scale. k_cache / v_cache are the
+  // uint8 code planes (cast from the uint16* the caller passes).
+  const int h = threadIdx.x;
+  if (h >= kv_heads) return;
+  {
+    const uint16_t* src = k + r * k_row_stride + h * dim;
+    float amax = 0.0f;
+    for (int e = 0; e < dim; ++e) amax = fmaxf(amax, fabsf(bf16_bits_to_float(src[e])));
+    const auto s = latent_fp8_row_scale(amax);
+    uint8_t* dst = reinterpret_cast<uint8_t*>(k_cache) + (phys * kv_heads + h) * dim;
+    for (int e = 0; e < dim; ++e) dst[e] = latent_fp8_encode(bf16_bits_to_float(src[e]), s.inv);
+    k_scale[phys * kv_heads + h] = s.scale;
+  }
+  {
+    const uint16_t* src = v + r * v_row_stride + h * dim;
+    float amax = 0.0f;
+    for (int e = 0; e < dim; ++e) amax = fmaxf(amax, fabsf(bf16_bits_to_float(src[e])));
+    const auto s = latent_fp8_row_scale(amax);
+    uint8_t* dst = reinterpret_cast<uint8_t*>(v_cache) + (phys * kv_heads + h) * dim;
+    for (int e = 0; e < dim; ++e) dst[e] = latent_fp8_encode(bf16_bits_to_float(src[e]), s.inv);
+    v_scale[phys * kv_heads + h] = s.scale;
   }
 }
 
@@ -771,13 +802,13 @@ void qsa_kv_append(const uint16_t* k, int64_t k_row_stride, const uint16_t* v, i
                    const int32_t* req_ids, const int64_t* pos, int rows,
                    const int32_t* block_tables, int blocks_per_request, int block_tokens,
                    int kv_heads, int dim, uint16_t* k_cache, uint16_t* v_cache,
-                   cudaStream_t stream) {
+                   float* k_scale, float* v_scale, cudaStream_t stream) {
   if (rows <= 0) return;
   if (!k || !v || !req_ids || !pos || !block_tables || !k_cache || !v_cache)
     throw std::invalid_argument("qsa_kv_append: null pointer");
   kv_append_kernel<<<static_cast<unsigned>(rows), 256, 0, stream>>>(
       k, k_row_stride, v, v_row_stride, req_ids, pos, block_tables, blocks_per_request,
-      block_tokens, kv_heads * dim, k_cache, v_cache);
+      block_tokens, kv_heads, dim, k_cache, v_cache, k_scale, v_scale);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

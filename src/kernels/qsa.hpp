@@ -61,7 +61,8 @@ void qsa_kv_append(const uint16_t* k, int64_t k_row_stride, const uint16_t* v,
                    int64_t v_row_stride, const int32_t* req_ids, const int64_t* pos,
                    int rows, const int32_t* block_tables, int blocks_per_request,
                    int block_tokens, int kv_heads, int dim, uint16_t* k_cache,
-                   uint16_t* v_cache, cudaStream_t stream);
+                   uint16_t* v_cache, float* k_scale = nullptr, float* v_scale = nullptr,
+                   cudaStream_t stream = nullptr);
 
 // Prefill compression: pools [first_pool, first_pool + n_pools) of one
 // request, pool i's kpool raw keys at chunk rows [i * kpool, +kpool) of
