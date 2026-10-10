@@ -62,7 +62,8 @@ void qsa_kv_append(const uint16_t* k, int64_t k_row_stride, const uint16_t* v,
                    int rows, const int32_t* block_tables, int blocks_per_request,
                    int block_tokens, int kv_heads, int dim, uint16_t* k_cache,
                    uint16_t* v_cache, float* k_scale = nullptr, float* v_scale = nullptr,
-                   cudaStream_t stream = nullptr);
+                   cudaStream_t stream = nullptr, uint8_t* k_bscale = nullptr,
+                   uint8_t* v_bscale = nullptr);
 
 // Fused (1+w) RMSNorm + RoPE + fp8 quantize + paged scatter for the QSA K cache
 // (the zero-copy K write): replaces qsa_norm_rope_bf16 into the kn_ staging
@@ -73,7 +74,7 @@ void qsa_norm_rope_append_fp8(const uint16_t* x, int64_t x_row_stride, int64_t x
                               const int32_t* req_ids, const int32_t* block_tables,
                               int blocks_per_request, int block_tokens, int rows, int kv_heads,
                               int dim, int rotary_dim, float eps, float mscale, uint8_t* k_cache,
-                              float* k_scale, cudaStream_t stream);
+                              float* k_scale, cudaStream_t stream, uint8_t* k_bscale = nullptr);
 
 // Prefill compression: pools [first_pool, first_pool + n_pools) of one
 // request, pool i's kpool raw keys at chunk rows [i * kpool, +kpool) of

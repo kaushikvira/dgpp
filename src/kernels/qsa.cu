@@ -148,7 +148,8 @@ __global__ void norm_rope_append_fp8_kernel(const uint16_t* __restrict__ x,
                                             int blocks_per_request, int block_tokens, int kv_heads,
                                             int dim, int rotary_dim, float eps, float mscale,
                                             uint8_t* __restrict__ k_cache,
-                                            float* __restrict__ k_scale) {
+                                            float* __restrict__ k_scale,
+                                            uint8_t* __restrict__ k_bscale, int mx) {
   extern __shared__ float xs[];
   __shared__ float scratch[33];
   const int64_t r = blockIdx.x / kv_heads;
@@ -171,7 +172,23 @@ __global__ void norm_rope_append_fp8_kernel(const uint16_t* __restrict__ x,
         block_tables[static_cast<int64_t>(req_ids[r]) * blocks_per_request + p / block_tokens];
     const int64_t phys = static_cast<int64_t>(blk) * block_tokens + p % block_tokens;
     const int width = kv_heads * dim;
-    k_cache[phys * width + h * dim + d] = latent_fp8_encode(xs[d], s.inv);
+    if (mx) {
+      // C.1a (docs/qwen_fp8_phase_c_plan.md §3): the 32-dim block this warp owns
+      // (warp w = block w for dim a multiple of 32). Block absmax -> e8m0 byte
+      // (a power of two, the fp8_block recipe); the K codes quantize to the
+      // block scale so the block-scaled QK^T mma applies 2^(sfa+sfb) inside the
+      // tensor core. The fp32 row scale is written unchanged (byte-identical).
+      float bmax = fabsf(xs[d]);
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) bmax = fmaxf(bmax, __shfl_xor_sync(~0u, bmax, off));
+      const uint8_t byt = latent_fp8_block_scale_byte(bmax);
+      const float binv = bmax > 0.f ? 1.0f / e8m0_byte_to_float(byt) : 0.f;
+      k_cache[phys * width + h * dim + d] = latent_fp8_encode(xs[d], binv);
+      if ((d & 31) == 0 && k_bscale != nullptr)
+        k_bscale[phys * (kv_heads * 8) + h * 8 + (d / 32)] = byt;
+    } else {
+      k_cache[phys * width + h * dim + d] = latent_fp8_encode(xs[d], s.inv);
+    }
     if (d == 0) k_scale[phys * kv_heads + h] = s.scale;
   }
 }
@@ -183,7 +200,9 @@ __global__ void kv_append_kernel(const uint16_t* __restrict__ k, int64_t k_row_s
                                  const int32_t* __restrict__ block_tables,
                                  int blocks_per_request, int block_tokens, int kv_heads, int dim,
                                  uint16_t* __restrict__ k_cache, uint16_t* __restrict__ v_cache,
-                                 float* __restrict__ k_scale, float* __restrict__ v_scale) {
+                                 float* __restrict__ k_scale, float* __restrict__ v_scale,
+                                 uint8_t* __restrict__ k_bscale, uint8_t* __restrict__ v_bscale,
+                                 int mx) {
   const int64_t r = blockIdx.x;
   const int64_t p = pos[r];
   if (p < 0) return;
@@ -215,6 +234,7 @@ __global__ void kv_append_kernel(const uint16_t* __restrict__ k, int64_t k_row_s
   }
   __syncthreads();
   __shared__ float kinv[32], vinv[32];
+  __shared__ float kinvb[32 * 8];  // C.1a: per-(head, 32-block) K inv (mx only)
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   if (warp < kv_heads) {
     float ka = 0.f, va = 0.f;
@@ -235,13 +255,47 @@ __global__ void kv_append_kernel(const uint16_t* __restrict__ k, int64_t k_row_s
       if (k) k_scale[phys * kv_heads + warp] = sk.scale;
       v_scale[phys * kv_heads + warp] = sv.scale;
     }
+    if (mx) {
+      // C.1a: 8 per-32-dim-block absmaxes (a segmented warp reduce: lane l holds
+      // block b's element at dim 32b + l). The K codes quantize to the block
+      // scale; the V block plane is written for C.1b (V codes stay row-quantized
+      // for the PV gamma epilogue, so vinv is unchanged).
+      const int nblk = dim / 32;
+      float kb_a[8], vb_a[8];
+#pragma unroll
+      for (int b = 0; b < 8; ++b) {
+        const int e = 32 * b + lane;
+        kb_a[b] = (b < nblk && k) ? fabsf(bf16_bits_to_float(kb[warp * dim + e])) : 0.f;
+        vb_a[b] = (b < nblk) ? fabsf(bf16_bits_to_float(vb[warp * dim + e])) : 0.f;
+      }
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1)
+#pragma unroll
+        for (int b = 0; b < 8; ++b) {
+          kb_a[b] = fmaxf(kb_a[b], __shfl_xor_sync(~0u, kb_a[b], off));
+          vb_a[b] = fmaxf(vb_a[b], __shfl_xor_sync(~0u, vb_a[b], off));
+        }
+      if (lane == 0) {
+#pragma unroll
+        for (int b = 0; b < 8; ++b) {
+          const uint8_t kb_byt = latent_fp8_block_scale_byte(kb_a[b]);
+          const uint8_t vb_byt = latent_fp8_block_scale_byte(vb_a[b]);
+          if (k_bscale) k_bscale[phys * (kv_heads * 8) + warp * 8 + b] = kb_byt;
+          if (v_bscale) v_bscale[phys * (kv_heads * 8) + warp * 8 + b] = vb_byt;
+          kinvb[warp * 8 + b] = kb_a[b] > 0.f ? 1.0f / e8m0_byte_to_float(kb_byt) : 0.f;
+        }
+      }
+    }
   }
   __syncthreads();
   uint8_t* kdst = reinterpret_cast<uint8_t*>(k_cache);
   uint8_t* vdst = reinterpret_cast<uint8_t*>(v_cache);
   for (int e = threadIdx.x; e < width; e += blockDim.x) {
     const int h = e / dim;
-    if (k) kdst[phys * width + e] = latent_fp8_encode(bf16_bits_to_float(kb[e]), kinv[h]);
+    if (k) {
+      const float inv = mx ? kinvb[h * 8 + (e % dim) / 32] : kinv[h];
+      kdst[phys * width + e] = latent_fp8_encode(bf16_bits_to_float(kb[e]), inv);
+    }
     vdst[phys * width + e] = latent_fp8_encode(bf16_bits_to_float(vb[e]), vinv[h]);
   }
 }
@@ -941,11 +995,21 @@ void qsa_norm_rope_bf16(const uint16_t* x, int64_t x_row_stride, int64_t x_head_
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
+// DGPP_QSA_FP8_MX (C.1a, default OFF): selects the block-scaled math. Read per
+// call (not latched) so a test can setenv between runs; production sets it once.
+// 0 = today's row-scale E4M3 path verbatim; 1 = block-quantized K codes + the
+// e8m0 block-scale plane (consumed by the block-scaled QK^T mma).
+int qsa_fp8_mx() {
+  const char* e = std::getenv("DGPP_QSA_FP8_MX");
+  return e != nullptr && e[0] == '1' ? 1 : 0;
+}
+
 void qsa_kv_append(const uint16_t* k, int64_t k_row_stride, const uint16_t* v, int64_t v_row_stride,
                    const int32_t* req_ids, const int64_t* pos, int rows,
                    const int32_t* block_tables, int blocks_per_request, int block_tokens,
                    int kv_heads, int dim, uint16_t* k_cache, uint16_t* v_cache,
-                   float* k_scale, float* v_scale, cudaStream_t stream) {
+                   float* k_scale, float* v_scale, cudaStream_t stream,
+                   uint8_t* k_bscale, uint8_t* v_bscale) {
   if (rows <= 0) return;
   // k may be null when the fused norm+RoPE+quantize kernel already wrote K.
   if (!v || !req_ids || !pos || !block_tables || !v_cache)
@@ -956,7 +1020,8 @@ void qsa_kv_append(const uint16_t* k, int64_t k_row_stride, const uint16_t* v, i
       k_scale != nullptr ? 2 * static_cast<size_t>(kv_heads) * dim * sizeof(uint16_t) : 0;
   kv_append_kernel<<<static_cast<unsigned>(rows), 256, smem, stream>>>(
       k, k_row_stride, v, v_row_stride, req_ids, pos, block_tables, blocks_per_request,
-      block_tokens, kv_heads, dim, k_cache, v_cache, k_scale, v_scale);
+      block_tokens, kv_heads, dim, k_cache, v_cache, k_scale, v_scale, k_bscale, v_bscale,
+      qsa_fp8_mx());
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
@@ -969,7 +1034,7 @@ void qsa_norm_rope_append_fp8(const uint16_t* x, int64_t x_row_stride, int64_t x
                               const int32_t* req_ids, const int32_t* block_tables,
                               int blocks_per_request, int block_tokens, int rows, int kv_heads,
                               int dim, int rotary_dim, float eps, float mscale, uint8_t* k_cache,
-                              float* k_scale, cudaStream_t stream) {
+                              float* k_scale, cudaStream_t stream, uint8_t* k_bscale) {
   if (rows <= 0) return;
   if (!x || !w || !pos || !inv_freq || !req_ids || !block_tables || !k_cache || !k_scale)
     throw std::invalid_argument("qsa_norm_rope_append_fp8: null pointer");
@@ -977,7 +1042,8 @@ void qsa_norm_rope_append_fp8(const uint16_t* x, int64_t x_row_stride, int64_t x
   norm_rope_append_fp8_kernel<<<static_cast<unsigned>(rows * kv_heads), threads,
                                 dim * sizeof(float), stream>>>(
       x, x_row_stride, x_head_stride, w, pos, inv_freq, req_ids, block_tables, blocks_per_request,
-      block_tokens, kv_heads, dim, rotary_dim, eps, mscale, k_cache, k_scale);
+      block_tokens, kv_heads, dim, rotary_dim, eps, mscale, k_cache, k_scale, k_bscale,
+      qsa_fp8_mx());
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
