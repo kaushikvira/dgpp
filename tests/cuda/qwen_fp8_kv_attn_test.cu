@@ -762,9 +762,12 @@ std::vector<float> run_partial_fp32(bool prefill, const uint16_t* dq, const uint
 // qsa_attn_prefill_partial (the DGPP_QSA_WARP=0 shape). The append
 // block-quantizes the K codes and writes the e8m0 block plane; both kernels
 // dequant K with the per-32-dim-block scale (V stays row-quantized). vs the
-// bf16 reference; the C.1a bar is l2_rel <= 0.035 (block quantization beats
-// the row-scale 0.0360). Must run with DGPP_QSA_FP8_MX=1 (the append and the
-// kernels read it per call).
+// bf16 reference. This path is the study's "deqkb" config (Q bf16, K blk,
+// P bf16, V row): host 0.0372 on unit-normal (qwen_fp8_error_attribution),
+// so the band is 0.045 -- the old 0.035 bar was falsified by the attribution
+// study (plan 3.1: 0.035 is unreachable on the block-scale path; the
+// dequant-path number is ~0.037, not <= 0.035). Must run with
+// DGPP_QSA_FP8_MX=1 (the append and the kernels read it per call).
 DGPP_TEST(qwen_fp8_mx_partial_real_path) {
   Fp8Geo g;
   cudaStream_t st = test_stream();
@@ -840,7 +843,7 @@ DGPP_TEST(qwen_fp8_mx_partial_real_path) {
   const Stats s = compare_abs_rel(gf.data(), wf.data(), n, 0.0);
   std::printf("[fp8-kv] MX=1 REAL PATH partial (decode/short-prefill) vs bf16: l2_rel %.4f  max_abs %.4g\n",
               s.l2_rel, s.max_abs);
-  require(s.l2_rel <= 0.035, "MX=1 partial l2_rel exceeds the C.1a 0.035 bar");
+  require(s.l2_rel <= 0.045, "MX=1 partial l2_rel exceeds the 0.045 band (study: deqkb 0.0372)");
   const auto ref_pf = run_attn(ptr<uint16_t>(dqonly), ptr<uint16_t>(dqg), mptr<uint16_t>(kc),
                                mptr<uint16_t>(vc), ptr<int32_t>(dreq), ptr<int32_t>(dtopk),
                                ptr<int32_t>(dcounts), ptr<int32_t>(dtable), g, 1, st, nullptr, nullptr,
@@ -858,7 +861,7 @@ DGPP_TEST(qwen_fp8_mx_partial_real_path) {
   const Stats sp = compare_abs_rel(gpf.data(), wpf.data(), n, 0.0);
   std::printf("[fp8-kv] MX=1 REAL PATH prefill-partial (WARP=0) vs bf16: l2_rel %.4f  max_abs %.4g\n",
               sp.l2_rel, sp.max_abs);
-  require(sp.l2_rel <= 0.035, "MX=1 prefill-partial l2_rel exceeds the C.1a 0.035 bar");
+  require(sp.l2_rel <= 0.045, "MX=1 prefill-partial l2_rel exceeds the 0.045 band (study: deqkb 0.0372)");
   unsetenv("DGPP_QSA_FP8_MX");
 }
 

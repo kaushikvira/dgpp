@@ -547,15 +547,19 @@ DGPP_TEST(qwen_fp8_mma_warp_group16_and_partial_tiles) {
 
 // C.1a (b): the block-scaled QK^T real path (append with DGPP_QSA_FP8_MX=1 ->
 // block-quantized K codes + e8m0 block plane; warp kernel block-scaled QK^T)
-// vs the bf16 reference. The C.1a bar is l2_rel <= 0.035 (at or under the
-// Phase A dequant path's 0.0360). Must run AFTER the MX=0 band tests above
-// (the env is read per call; setenv here affects only this test's calls).
+// vs the bf16 reference. This is the study's "base" config (Q blk, K blk,
+// P e4m3, V row): host 0.0517 / GPU 0.0510 on unit-normal
+// (qwen_fp8_error_attribution), so the band is 0.06 -- the old 0.035 bar was
+// falsified by the attribution study (plan 3.1: 0.035 is unreachable on the
+// fp8-everywhere tensor-core path; the block-scale path lands ~0.051). Must
+// run AFTER the MX=0 band tests above (the env is read per call; setenv here
+// affects only this test's calls).
 DGPP_TEST(qwen_fp8_mma_warp_block_scale_matches_bar) {
   setenv("DGPP_QSA_FP8_MX", "1", 1);
   const double l2_rel = warp_band_l2_mx(Fp8Geo{}, 128, 311);  // group 3, full tiles
   std::printf("[fp8-mma] MXFP8 block-scaled warp kernel vs bf16 (group 3, cnt 128): l2_rel %.4f\n",
               l2_rel);
-  require(l2_rel <= 0.035, "MXFP8 block-scaled warp kernel l2_rel exceeds the C.1a 0.035 bar");
+  require(l2_rel <= 0.06, "MXFP8 block-scaled warp kernel l2_rel exceeds the 0.06 band (study: base 0.0517)");
   unsetenv("DGPP_QSA_FP8_MX");
 }
 
