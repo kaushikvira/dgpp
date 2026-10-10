@@ -98,6 +98,11 @@ class QwenKvPool {
   uint8_t* v_base_ = nullptr;
   float* k_scale_ = nullptr;      // [layers][token_slots][kv_heads] fp8 only (null for bf16)
   float* v_scale_ = nullptr;
+  // C.1a MXFP8 block-scale plane (docs/qwen_fp8_phase_c_plan.md §3): 8 e8m0
+  // bytes per (slot, kv-head) (one per 32 of the 256-dim row), additive beside
+  // the fp32 row-scale plane. fp8 only (null for bf16).
+  uint8_t* k_bscale_ = nullptr;   // [layers][token_slots][kv_heads*8]
+  uint8_t* v_bscale_ = nullptr;
   uint16_t* idx_base_ = nullptr;  // [layers][pool_slots][idx_dim]
   uint16_t* ring_base_ = nullptr; // [layers][max_requests][kpool][idx_dim]
   bool fp8() const { return shape_.format == LatentFormat::kFp8; }
@@ -106,6 +111,10 @@ class QwenKvPool {
   size_t layer_kv_bytes() const { return static_cast<size_t>(shape_.token_slots) * kv_row_bytes(); }
   size_t layer_scale_bytes() const {
     return static_cast<size_t>(shape_.token_slots) * shape_.kv_heads * sizeof(float);
+  }
+  // The MXFP8 block-scale plane: 8 e8m0 bytes per (slot, kv-head).
+  size_t layer_block_scale_bytes() const {
+    return static_cast<size_t>(shape_.token_slots) * shape_.kv_heads * 8;
   }
   size_t layer_idx_elems() const { return static_cast<size_t>(pool_slots()) * shape_.idx_dim; }
   size_t layer_ring_elems() const {

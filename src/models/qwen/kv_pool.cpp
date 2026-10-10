@@ -27,6 +27,8 @@ QwenKvPool::~QwenKvPool() {
   cudaFree(v_base_);
   cudaFree(k_scale_);
   cudaFree(v_scale_);
+  cudaFree(k_bscale_);
+  cudaFree(v_bscale_);
   cudaFree(idx_base_);
   cudaFree(ring_base_);
 }
@@ -36,10 +38,12 @@ size_t QwenKvPool::cache_bytes(const QwenKvPoolShape& s) {
   const size_t L = static_cast<size_t>(s.layers);
   const size_t kvb = static_cast<size_t>(s.token_slots) * s.kv_heads * s.dim * (s.format == LatentFormat::kFp8 ? 1 : 2);
   const size_t scale = s.format == LatentFormat::kFp8 ? 2 * static_cast<size_t>(s.token_slots) * s.kv_heads * sizeof(float) : 0;
+  // C.1a MXFP8 block-scale plane: 8 e8m0 bytes per (slot, kv-head), K and V.
+  const size_t bscale = s.format == LatentFormat::kFp8 ? 2 * static_cast<size_t>(s.token_slots) * s.kv_heads * 8 : 0;
   const size_t idx = static_cast<size_t>(s.token_slots / s.kpool) * s.idx_dim * 2;
   const size_t ring = static_cast<size_t>(s.max_requests) * s.kpool * s.idx_dim * 2;
   const size_t table = PagedBlockTable::table_bytes(s.max_requests, s.token_slots / s.block_tokens);
-  return L * (2 * kvb + scale + idx + ring) + table;
+  return L * (2 * kvb + scale + bscale + idx + ring) + table;
 }
 
 void QwenKvPool::init(const QwenKvPoolShape& shape) {
@@ -53,6 +57,8 @@ void QwenKvPool::init(const QwenKvPoolShape& shape) {
   if (fp8()) {
     alloc(reinterpret_cast<void**>(&k_scale_), L * layer_scale_bytes());
     alloc(reinterpret_cast<void**>(&v_scale_), L * layer_scale_bytes());
+    alloc(reinterpret_cast<void**>(&k_bscale_), L * layer_block_scale_bytes());
+    alloc(reinterpret_cast<void**>(&v_bscale_), L * layer_block_scale_bytes());
   }
   alloc(reinterpret_cast<void**>(&idx_base_), L * layer_idx_elems() * 2);
   alloc(reinterpret_cast<void**>(&ring_base_), L * layer_ring_elems() * 2);
@@ -79,6 +85,9 @@ QwenQsaCache QwenKvPool::view(int layer) const {
   c.v_cache = reinterpret_cast<uint16_t*>(v_base_ + l * layer_kv_bytes());
   c.k_scale = fp8() ? k_scale_ + l * scale_off : nullptr;
   c.v_scale = fp8() ? v_scale_ + l * scale_off : nullptr;
+  const size_t bscale_off = static_cast<size_t>(shape_.token_slots) * shape_.kv_heads * 8;
+  c.k_bscale = fp8() ? k_bscale_ + l * bscale_off : nullptr;
+  c.v_bscale = fp8() ? v_bscale_ + l * bscale_off : nullptr;
   c.index_cache = idx_base_ + l * layer_idx_elems();
   c.ring = ring_base_ + l * layer_ring_elems();
   c.block_tables = const_cast<int32_t*>(table_.device_tables());
@@ -115,6 +124,8 @@ void QwenKvPool::reset_all(cudaStream_t stream) {
   if (fp8()) {
     DGPP_CUDA_OK(cudaMemsetAsync(k_scale_, 0, L * layer_scale_bytes(), stream));
     DGPP_CUDA_OK(cudaMemsetAsync(v_scale_, 0, L * layer_scale_bytes(), stream));
+    DGPP_CUDA_OK(cudaMemsetAsync(k_bscale_, 0, L * layer_block_scale_bytes(), stream));
+    DGPP_CUDA_OK(cudaMemsetAsync(v_bscale_, 0, L * layer_block_scale_bytes(), stream));
   }
   DGPP_CUDA_OK(cudaMemsetAsync(idx_base_, 0, L * layer_idx_elems() * 2, stream));
   DGPP_CUDA_OK(cudaMemsetAsync(ring_base_, 0, L * layer_ring_elems() * 2, stream));
@@ -127,6 +138,7 @@ void QwenKvPool::copy_block_contents(int32_t src, int32_t dst, cudaStream_t stre
   if (src == dst) return;
   const size_t kv_blk_bytes = static_cast<size_t>(shape_.block_tokens) * kv_row_bytes();
   const size_t scale_blk = static_cast<size_t>(shape_.block_tokens) * shape_.kv_heads;  // floats
+  const size_t bscale_blk = static_cast<size_t>(shape_.block_tokens) * shape_.kv_heads * 8;  // e8m0 bytes
   const size_t idx_blk = static_cast<size_t>(pools_per_block()) * shape_.idx_dim;
   for (int l = 0; l < shape_.layers; ++l) {
     const QwenQsaCache c = view(l);
@@ -144,6 +156,14 @@ void QwenKvPool::copy_block_contents(int32_t src, int32_t dst, cudaStream_t stre
                                    cudaMemcpyDeviceToDevice, stream));
       DGPP_CUDA_OK(cudaMemcpyAsync(c.v_scale + static_cast<size_t>(dst) * scale_blk,
                                    c.v_scale + static_cast<size_t>(src) * scale_blk, scale_blk * 4,
+                                   cudaMemcpyDeviceToDevice, stream));
+      // The MXFP8 block-scale plane must move with the block: a missed copy
+      // silently corrupts cached prefixes (their K codes are block-quantized).
+      DGPP_CUDA_OK(cudaMemcpyAsync(c.k_bscale + static_cast<size_t>(dst) * bscale_blk,
+                                   c.k_bscale + static_cast<size_t>(src) * bscale_blk, bscale_blk,
+                                   cudaMemcpyDeviceToDevice, stream));
+      DGPP_CUDA_OK(cudaMemcpyAsync(c.v_bscale + static_cast<size_t>(dst) * bscale_blk,
+                                   c.v_bscale + static_cast<size_t>(src) * bscale_blk, bscale_blk,
                                    cudaMemcpyDeviceToDevice, stream));
     }
     DGPP_CUDA_OK(cudaMemcpyAsync(c.index_cache + static_cast<size_t>(dst) * idx_blk,

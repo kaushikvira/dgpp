@@ -236,6 +236,12 @@ struct QwenQsaCache {
   uint16_t* v_cache = nullptr;      // bf16 [slots, lkv * D]; fp8: e4m3 codes (cast to uint8)
   float* k_scale = nullptr;         // fp8: per-(slot, kv-head) scale [slots, lkv]; bf16: null
   float* v_scale = nullptr;         // fp8: per-(slot, kv-head) scale [slots, lkv]; bf16: null
+  // fp8 C.1a (docs/qwen_fp8_phase_c_plan.md §3): the additive MXFP8 block-scale
+  // plane, 8 e8m0 bytes per (slot, kv-head) (one per 32 of the 256-dim row),
+  // [slots, lkv * 8]. Written by the append when DGPP_QSA_FP8_MX=1; consumed by
+  // the block-scaled QK^T mma. Null for bf16 and when the plane is absent.
+  uint8_t* k_bscale = nullptr;
+  uint8_t* v_bscale = nullptr;
   uint16_t* index_cache = nullptr;  // bf16 [pool_slots, Di]
   uint16_t* ring = nullptr;         // bf16 [max_requests, kpool, Di]
   int32_t* block_tables = nullptr;  // int32 [max_requests, blocks_per_request]
