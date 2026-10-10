@@ -2523,9 +2523,10 @@ int main(int argc, char** argv) {
                   decode_rows, max_concurrency, graph_rows_per_request, dgpp::kDecodeRows, family->name(),
                   family->decode_rows_cap());
     if (std::string(family->name()) != "glm5" && std::string(family->name()) != "glm_moe_dsa" &&
-        std::string(family->name()) != "mimo_v2" && kv_dtype != "bf16")
-      DGPP_LOG_WARN("serve: --kv-dtype {} applies to the GLM-5.3 latent caches and the MiMo-V2 K/V cache only; "
-                    "the {} caches stay bf16",
+        std::string(family->name()) != "mimo_v2" && std::string(family->name()) != "qwen4_exp" &&
+        kv_dtype != "bf16")
+      DGPP_LOG_WARN("serve: --kv-dtype {} applies to the GLM-5.3 latent caches, the MiMo-V2 and "
+                    "Qwen3.8-Flash-Next K/V caches only; the {} caches stay bf16",
                     kv_dtype, family->name());
     if (std::string(family->name()) != "qwen4_exp" && ngram_table != "resident")
       DGPP_LOG_WARN("serve: --ngram-table {} applies to the Qwen n-gram table only; the {} family has none",
