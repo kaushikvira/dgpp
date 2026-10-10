@@ -116,6 +116,67 @@ std::vector<float> run_attn_fp32(const uint16_t* qonly, const uint16_t* kc, cons
   return down<float>(c_out, static_cast<size_t>(g.rows) * g.local_heads * g.dim);
 }
 
+// One (geometry, cnt) run of the E4M3 warp kernel against the bf16 reference;
+// returns the output l2_rel. Parameterized so the review's untested paths can
+// be exercised: group > 8 (the g+8 row half) and partial tiles (cnt not a
+// multiple of 16, cnt < 16).
+double warp_band_l2(const Fp8Geo& g, int cnt, int seed) {
+  cudaStream_t st = test_stream();
+  const int width = g.width();
+  const int slots = g.slots();
+  std::vector<int32_t> table(static_cast<size_t>(g.blocks_per_request()));
+  for (int b = 0; b < g.blocks_per_request(); ++b) table[static_cast<size_t>(b)] = b;
+  DevBuf dtable = up(table);
+  const auto k = random_bf16_normal(seed, static_cast<int64_t>(g.seq) * width, 1.0f);
+  const auto v = random_bf16_normal(seed + 1, static_cast<int64_t>(g.seq) * width, 1.0f);
+  DevBuf kc(static_cast<size_t>(slots) * width * 2), vc(static_cast<size_t>(slots) * width * 2);
+  fill_cache(k, v, g, ptr<int32_t>(dtable), mptr<uint16_t>(kc), mptr<uint16_t>(vc), st);
+  // fp8 pool: 1 B/elem codes + [slots, kv_heads] fp32 scales.
+  DevBuf kc8(static_cast<size_t>(slots) * width), vc8(static_cast<size_t>(slots) * width);
+  DevBuf ks(static_cast<size_t>(slots) * g.kv_heads * 4), vs(static_cast<size_t>(slots) * g.kv_heads * 4);
+  {
+    std::vector<int32_t> req_ids(static_cast<size_t>(g.seq), 0);
+    std::vector<int64_t> pos(static_cast<size_t>(g.seq));
+    for (int i = 0; i < g.seq; ++i) pos[static_cast<size_t>(i)] = i;
+    DevBuf dk = up(k), dv = up(v), dreq = up(req_ids), dpos = up(pos);
+    dgpp::qsa_kv_append(ptr<uint16_t>(dk), width, ptr<uint16_t>(dv), width, ptr<int32_t>(dreq),
+                        ptr<int64_t>(dpos), g.seq, ptr<int32_t>(dtable), g.blocks_per_request(),
+                        g.block_tokens, g.kv_heads, g.dim,
+                        reinterpret_cast<uint16_t*>(mptr<uint8_t>(kc8)),
+                        reinterpret_cast<uint16_t*>(mptr<uint8_t>(vc8)), mptr<float>(ks),
+                        mptr<float>(vs), st);
+  }
+  const auto q = random_bf16_normal(seed + 2, static_cast<int64_t>(g.rows) * g.local_heads * g.dim, 1.0f);
+  std::vector<int32_t> req_ids(static_cast<size_t>(g.rows), 0);
+  std::vector<int32_t> topk(static_cast<size_t>(g.rows) * g.seq);
+  for (int r = 0; r < g.rows; ++r)
+    for (int i = 0; i < g.seq; ++i) topk[static_cast<size_t>(r) * g.seq + i] = i;
+  std::vector<int32_t> counts(static_cast<size_t>(g.rows), cnt);
+  DevBuf dq = up(q), dreq = up(req_ids), dtopk = up(topk), dcounts = up(counts);
+  const long n = static_cast<long>(g.rows) * g.local_heads * g.dim;
+  const auto ref = run_attn_fp32(ptr<uint16_t>(dq), mptr<uint16_t>(kc), mptr<uint16_t>(vc),
+                                 ptr<int32_t>(dreq), ptr<int32_t>(dtopk), ptr<int32_t>(dcounts),
+                                 ptr<int32_t>(dtable), g, st);
+  DevBuf got(static_cast<size_t>(n) * 4);
+  const int64_t qrs = static_cast<int64_t>(g.local_heads) * g.dim;
+  dgpp::qsa_attn_prefill_warp(ptr<uint16_t>(dq), qrs,
+                              reinterpret_cast<uint16_t*>(mptr<uint8_t>(kc8)),
+                              reinterpret_cast<uint16_t*>(mptr<uint8_t>(vc8)), ptr<int32_t>(dreq),
+                              ptr<int32_t>(dtopk), g.seq, ptr<int32_t>(dcounts), g.rows, g.local_heads,
+                              g.kv_heads, g.block_tokens, ptr<int32_t>(dtable),
+                              g.blocks_per_request(), 1.0f / 16.0f, mptr<float>(got), st,
+                              mptr<float>(ks), mptr<float>(vs));
+  DGPP_CUDA_OK(cudaStreamSynchronize(st));
+  const auto gw = down<float>(got, static_cast<size_t>(n));
+  double num = 0, den = 0;
+  for (long i = 0; i < n; ++i) {
+    const double d = static_cast<double>(gw[static_cast<size_t>(i)]) - ref[static_cast<size_t>(i)];
+    num += d * d;
+    den += static_cast<double>(ref[static_cast<size_t>(i)]) * ref[static_cast<size_t>(i)];
+  }
+  return std::sqrt(num / std::max(den, 1e-30));
+}
+
 // The projected E4M3-MMA math in fp32 (§2.1, §2.2, §2.3): the exact result the
 // tensor cores would produce from the quantized codes, isolating the
 // quantization from the tensor-core rounding.
@@ -307,73 +368,31 @@ DGPP_TEST(qwen_fp8_mma_a_fragment_oracle) {
 // reference, within the Step-0 band. The E4M3 path runs when the fp8 pool is
 // active (k_scale != nullptr) and DGPP_QSA_FP8_MMA is on (default).
 DGPP_TEST(qwen_fp8_mma_warp_matches_band) {
-  Fp8Geo g;
-  cudaStream_t st = test_stream();
-  const int width = g.width();
-  const int slots = g.slots();
-
-  std::vector<int32_t> table(static_cast<size_t>(g.blocks_per_request()));
-  for (int b = 0; b < g.blocks_per_request(); ++b) table[static_cast<size_t>(b)] = b;
-  DevBuf dtable = up(table);
-
-  const auto k = random_bf16_normal(111, static_cast<int64_t>(g.seq) * width, 1.0f);
-  const auto v = random_bf16_normal(112, static_cast<int64_t>(g.seq) * width, 1.0f);
-
-  DevBuf kc(static_cast<size_t>(slots) * width * 2), vc(static_cast<size_t>(slots) * width * 2);
-  fill_cache(k, v, g, ptr<int32_t>(dtable), mptr<uint16_t>(kc), mptr<uint16_t>(vc), st);
-
-  // fp8 pool: 1 B/elem codes + [slots, kv_heads] fp32 scales (the Phase A
-  // storage the E4M3 path reads).
-  DevBuf kc8(static_cast<size_t>(slots) * width), vc8(static_cast<size_t>(slots) * width);
-  DevBuf ks(static_cast<size_t>(slots) * g.kv_heads * 4), vs(static_cast<size_t>(slots) * g.kv_heads * 4);
-  {
-    std::vector<int32_t> req_ids(static_cast<size_t>(g.seq), 0);
-    std::vector<int64_t> pos(static_cast<size_t>(g.seq));
-    for (int i = 0; i < g.seq; ++i) pos[static_cast<size_t>(i)] = i;
-    DevBuf dk = up(k), dv = up(v), dreq = up(req_ids), dpos = up(pos);
-    dgpp::qsa_kv_append(ptr<uint16_t>(dk), width, ptr<uint16_t>(dv), width, ptr<int32_t>(dreq),
-                        ptr<int64_t>(dpos), g.seq, ptr<int32_t>(dtable), g.blocks_per_request(),
-                        g.block_tokens, g.kv_heads, g.dim,
-                        reinterpret_cast<uint16_t*>(mptr<uint8_t>(kc8)),
-                        reinterpret_cast<uint16_t*>(mptr<uint8_t>(vc8)), mptr<float>(ks),
-                        mptr<float>(vs), st);
-  }
-
-  const auto q = random_bf16_normal(113, static_cast<int64_t>(g.rows) * g.local_heads * g.dim, 1.0f);
-  std::vector<int32_t> req_ids(static_cast<size_t>(g.rows), 0);
-  std::vector<int32_t> topk(static_cast<size_t>(g.rows) * g.seq);
-  for (int r = 0; r < g.rows; ++r)
-    for (int i = 0; i < g.seq; ++i) topk[static_cast<size_t>(r) * g.seq + i] = i;
-  std::vector<int32_t> counts(static_cast<size_t>(g.rows), g.seq);
-  DevBuf dq = up(q), dreq = up(req_ids), dtopk = up(topk), dcounts = up(counts);
-
-  const long n = static_cast<long>(g.rows) * g.local_heads * g.dim;
-  const auto ref = run_attn_fp32(ptr<uint16_t>(dq), mptr<uint16_t>(kc), mptr<uint16_t>(vc),
-                                 ptr<int32_t>(dreq), ptr<int32_t>(dtopk), ptr<int32_t>(dcounts),
-                                 ptr<int32_t>(dtable), g, st);
-  DevBuf got(static_cast<size_t>(n) * 4);
-  const int64_t qrs = static_cast<int64_t>(g.local_heads) * g.dim;
-  dgpp::qsa_attn_prefill_warp(ptr<uint16_t>(dq), qrs,
-                              reinterpret_cast<uint16_t*>(mptr<uint8_t>(kc8)),
-                              reinterpret_cast<uint16_t*>(mptr<uint8_t>(vc8)), ptr<int32_t>(dreq),
-                              ptr<int32_t>(dtopk), g.seq, ptr<int32_t>(dcounts), g.rows, g.local_heads,
-                              g.kv_heads, g.block_tokens, ptr<int32_t>(dtable),
-                              g.blocks_per_request(), 1.0f / 16.0f, mptr<float>(got), st,
-                              mptr<float>(ks), mptr<float>(vs));
-  DGPP_CUDA_OK(cudaStreamSynchronize(st));
-  const auto gw = down<float>(got, static_cast<size_t>(n));
-
-  double num = 0, den = 0;
-  float max_abs = 0.f;
-  for (long i = 0; i < n; ++i) {
-    const float d = gw[static_cast<size_t>(i)] - ref[static_cast<size_t>(i)];
-    num += static_cast<double>(d) * d;
-    den += static_cast<double>(ref[static_cast<size_t>(i)]) * ref[static_cast<size_t>(i)];
-    max_abs = std::max(max_abs, std::fabs(d));
-  }
-  const double l2_rel = std::sqrt(num / std::max(den, 1e-30));
-  std::printf("[fp8-mma] E4M3 warp kernel vs bf16: l2_rel %.4f  max_abs %.4g\n", l2_rel, max_abs);
+  const double l2_rel = warp_band_l2(Fp8Geo{}, 128, 111);  // group 3, full tiles
+  std::printf("[fp8-mma] E4M3 warp kernel vs bf16 (group 3, cnt 128): l2_rel %.4f\n", l2_rel);
   require(l2_rel <= 0.10, "E4M3 warp kernel l2_rel exceeds the Step-0 0.10 band");
+}
+
+// The review (docs/qwen_fp8_mma_plan.md §11 follow-up) flagged two paths the
+// band test above does not cover: group > 8 (the g+8 half of the m16 A-fragment,
+// untested at group 3) and partial tiles (cnt not a multiple of 16, cnt < 16).
+DGPP_TEST(qwen_fp8_mma_warp_group16_and_partial_tiles) {
+  struct Case { int lh, kv, cnt; const char* label; };
+  const Case cases[] = {
+      {16, 1, 128, "group16 cnt128 (full tiles)"},
+      {16, 1, 17, "group16 cnt17 (partial 16+1)"},
+      {16, 1, 5, "group16 cnt5 (cnt < 16)"},
+      {6, 2, 17, "group3 cnt17 (partial)"},
+  };
+  for (int i = 0; i < 4; ++i) {
+    Fp8Geo g;
+    g.local_heads = cases[i].lh;
+    g.kv_heads = cases[i].kv;
+    g.rows = 4;
+    const double l2_rel = warp_band_l2(g, cases[i].cnt, 200 + 10 * i);
+    std::printf("[fp8-mma] E4M3 warp kernel vs bf16 %s: l2_rel %.4f\n", cases[i].label, l2_rel);
+    require(l2_rel <= 0.10, "E4M3 warp kernel l2_rel exceeds the 0.10 band");
+  }
 }
 
 int main() { return dgpp::test::run_all(); }
