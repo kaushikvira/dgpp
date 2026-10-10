@@ -698,7 +698,11 @@ void qsa_attn_prefill_warp(const uint16_t* q, int64_t q_row_stride, const uint16
                                                                     block_tables, blocks_per_request,
                                                                     scale, out, fp8_mma, k_bscale, mx);
   };
-  if (fp8_mma)
+  // MODE 1 needs the scale planes (the E4M3 path reads k_scale / v_scale per
+  // token); a null k_scale is the bf16 call, so the pre-split guard was
+  // `fp8_mma && k_scale != nullptr`. Keep it: launching MODE 1 with a null
+  // scale plane is an illegal memory access.
+  if (fp8_mma && k_scale != nullptr)
     launch(std::integral_constant<int, 1>{});
   else
     launch(std::integral_constant<int, 0>{});
