@@ -64,6 +64,17 @@ void qsa_kv_append(const uint16_t* k, int64_t k_row_stride, const uint16_t* v,
                    uint16_t* v_cache, float* k_scale = nullptr, float* v_scale = nullptr,
                    cudaStream_t stream = nullptr);
 
+// Fused (1+w) RMSNorm + RoPE + fp8 quantize + paged scatter for the QSA K cache
+// (the zero-copy K write): replaces qsa_norm_rope_bf16 into the kn_ staging
+// buffer plus the K half of qsa_kv_append. The cache bytes are bitwise the
+// two-kernel chain's. x is the raw k_proj output [rows, lkv * D].
+void qsa_norm_rope_append_fp8(const uint16_t* x, int64_t x_row_stride, int64_t x_head_stride,
+                              const uint16_t* w, const int64_t* pos, const float* inv_freq,
+                              const int32_t* req_ids, const int32_t* block_tables,
+                              int blocks_per_request, int block_tokens, int rows, int kv_heads,
+                              int dim, int rotary_dim, float eps, float mscale, uint8_t* k_cache,
+                              float* k_scale, cudaStream_t stream);
+
 // Prefill compression: pools [first_pool, first_pool + n_pools) of one
 // request, pool i's kpool raw keys at chunk rows [i * kpool, +kpool) of
 // raw_k (row stride k_stride). The compressed key lands at the pool's slot

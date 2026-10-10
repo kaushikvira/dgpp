@@ -370,4 +370,66 @@ DGPP_TEST(qwen_fp8_kv_real_path_matches_bf16) {
   }
 }
 
+// The fused norm+RoPE+quantize+scatter kernel must reproduce the two-kernel
+// chain (qsa_norm_rope_bf16 into kn_, then the append) bit for bit, so the
+// zero-copy K write changes no cache byte.
+DGPP_TEST(qwen_fp8_kv_fused_norm_rope_append_matches_chain) {
+  Fp8Geo g;
+  cudaStream_t st = test_stream();
+  const int width = g.width();
+  const int slots = g.slots();
+  const int rotary = 64;
+  std::vector<int32_t> table(static_cast<size_t>(g.blocks_per_request()));
+  for (int b = 0; b < g.blocks_per_request(); ++b) table[static_cast<size_t>(b)] = b;
+  DevBuf dtable = up(table);
+  const auto k = random_bf16_normal(51, static_cast<int64_t>(g.seq) * width, 1.0f);
+  const auto v = random_bf16_normal(52, static_cast<int64_t>(g.seq) * width, 1.0f);
+  const auto wnorm = random_bf16_normal(53, g.dim, 1.0f);
+  std::vector<float> inv(static_cast<size_t>(rotary) / 2);
+  dgpp::qsa_rope_inv_freq(1e7, rotary, inv.data());
+  std::vector<int32_t> req_ids(static_cast<size_t>(g.seq), 0);
+  std::vector<int64_t> pos(static_cast<size_t>(g.seq));
+  for (int i = 0; i < g.seq; ++i) pos[static_cast<size_t>(i)] = i;
+  DevBuf dk = up(k), dv = up(v), dw = up(wnorm), dinv = up(inv), dreq = up(req_ids), dpos = up(pos);
+
+  // Path A: norm+RoPE into kn_, then the append.
+  DevBuf kn(static_cast<size_t>(g.seq) * width * 2);
+  dgpp::qsa_norm_rope_bf16(ptr<uint16_t>(dk), width, g.dim, ptr<uint16_t>(dw), ptr<int64_t>(dpos),
+                           ptr<float>(dinv), mptr<uint16_t>(kn), width, g.seq, g.kv_heads, g.dim,
+                           rotary, 1e-6f, 1.0f, st);
+  DevBuf kcA(static_cast<size_t>(slots) * width), vcA(static_cast<size_t>(slots) * width),
+      ksA(static_cast<size_t>(slots) * g.kv_heads * 4), vsA(static_cast<size_t>(slots) * g.kv_heads * 4);
+  dgpp::qsa_kv_append(ptr<uint16_t>(kn), width, ptr<uint16_t>(dv), width, ptr<int32_t>(dreq),
+                      ptr<int64_t>(dpos), g.seq, ptr<int32_t>(dtable), g.blocks_per_request(),
+                      g.block_tokens, g.kv_heads, g.dim,
+                      reinterpret_cast<uint16_t*>(mptr<uint8_t>(kcA)),
+                      reinterpret_cast<uint16_t*>(mptr<uint8_t>(vcA)), mptr<float>(ksA),
+                      mptr<float>(vsA), st);
+
+  // Path B: the fused kernel, then the append with k == nullptr (V only).
+  DevBuf kcB(static_cast<size_t>(slots) * width), vcB(static_cast<size_t>(slots) * width),
+      ksB(static_cast<size_t>(slots) * g.kv_heads * 4), vsB(static_cast<size_t>(slots) * g.kv_heads * 4);
+  dgpp::qsa_norm_rope_append_fp8(ptr<uint16_t>(dk), width, g.dim, ptr<uint16_t>(dw),
+                                 ptr<int64_t>(dpos), ptr<float>(dinv), ptr<int32_t>(dreq),
+                                 ptr<int32_t>(dtable), g.blocks_per_request(), g.block_tokens, g.seq,
+                                 g.kv_heads, g.dim, rotary, 1e-6f, 1.0f, mptr<uint8_t>(kcB),
+                                 mptr<float>(ksB), st);
+  dgpp::qsa_kv_append(nullptr, 0, ptr<uint16_t>(dv), width, ptr<int32_t>(dreq), ptr<int64_t>(dpos),
+                      g.seq, ptr<int32_t>(dtable), g.blocks_per_request(), g.block_tokens,
+                      g.kv_heads, g.dim, reinterpret_cast<uint16_t*>(mptr<uint8_t>(kcB)),
+                      reinterpret_cast<uint16_t*>(mptr<uint8_t>(vcB)), mptr<float>(ksB),
+                      mptr<float>(vsB), st);
+  DGPP_CUDA_OK(cudaStreamSynchronize(st));
+
+  const size_t nbytes = static_cast<size_t>(g.seq) * width;  // identity table: slots 0..seq-1
+  const auto kcA_h = down<uint8_t>(kcA, nbytes), kcB_h = down<uint8_t>(kcB, nbytes);
+  const auto vcA_h = down<uint8_t>(vcA, nbytes), vcB_h = down<uint8_t>(vcB, nbytes);
+  const auto ksA_h = down<float>(ksA, static_cast<size_t>(g.seq) * g.kv_heads);
+  const auto ksB_h = down<float>(ksB, static_cast<size_t>(g.seq) * g.kv_heads);
+  require_bitwise("fused K codes", kcA_h.data(), kcB_h.data(), nbytes);
+  require_bitwise("fused K scales", ksA_h.data(), ksB_h.data(), ksA_h.size() * sizeof(float));
+  require_bitwise("fused V codes", vcA_h.data(), vcB_h.data(), nbytes);
+  std::printf("[fp8-kv] FUSED norm+RoPE+quantize == norm_rope+append (bitwise): K codes, K scales, V codes\n");
+}
+
 int main() { return dgpp::test::run_all(); }

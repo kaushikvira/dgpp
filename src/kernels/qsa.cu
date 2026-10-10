@@ -48,6 +48,25 @@ __device__ inline float block_sum(float v, float* scratch) {
   return total;
 }
 
+// Block-wide max (mirrors block_sum's shape; scratch >= 33 floats).
+__device__ inline float block_max(float v, float* scratch) {
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int nwarps = (blockDim.x + 31) / 32;
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor_sync(~0u, v, off));
+  if (lane == 0) scratch[warp] = v;
+  __syncthreads();
+  float total = 0.f;
+  if (threadIdx.x == 0) {
+    for (int w = 0; w < nwarps; ++w) total = fmaxf(total, scratch[w]);
+    scratch[0] = total;
+  }
+  __syncthreads();
+  total = scratch[0];
+  __syncthreads();
+  return total;
+}
+
 // The (1+w) RMSNorm of the bf16 values in xs[0, dim) (one rounding) then
 // RoPE on [0, rotary_dim) at `pos` with the reference's bf16 ops; every
 // thread owns dim d = threadIdx.x. scratch: smem [33] floats.
@@ -99,6 +118,51 @@ __global__ void norm_rope_kernel(const uint16_t* __restrict__ x, int64_t x_row_s
   if (d < dim) out[r * out_row_stride + static_cast<int64_t>(h) * dim + d] = o;
 }
 
+// Fused (1+w) RMSNorm + RoPE + fp8 quantize + paged scatter for the QSA K
+// cache (the zero-copy K write, 2026-10-10): it replaces
+// `qsa_norm_rope_bf16(k_ -> kn_)` followed by the K half of `qsa_kv_append`,
+// so the kn_ staging buffer (a full bf16 K round trip per token per layer) is
+// gone. The norm + RoPE math is norm_rope_thread's, bit for bit; the
+// absmax / scale / encode are kv_append_kernel's — so the cache bytes are
+// exactly those of the two-kernel chain.
+__global__ void norm_rope_append_fp8_kernel(const uint16_t* __restrict__ x,
+                                            int64_t x_row_stride, int64_t x_head_stride,
+                                            const uint16_t* __restrict__ w,
+                                            const int64_t* __restrict__ pos,
+                                            const float* __restrict__ inv_freq,
+                                            const int32_t* __restrict__ req_ids,
+                                            const int32_t* __restrict__ block_tables,
+                                            int blocks_per_request, int block_tokens, int kv_heads,
+                                            int dim, int rotary_dim, float eps, float mscale,
+                                            uint8_t* __restrict__ k_cache,
+                                            float* __restrict__ k_scale) {
+  extern __shared__ float xs[];
+  __shared__ float scratch[33];
+  const int64_t r = blockIdx.x / kv_heads;
+  const int h = static_cast<int>(blockIdx.x % kv_heads);
+  const int64_t p = pos[r];
+  if (p < 0) return;
+  const int d = threadIdx.x;
+  if (d < dim) xs[d] = bf16_bits_to_float(x[r * x_row_stride + h * x_head_stride + d]);
+  __syncthreads();
+  const uint16_t o = norm_rope_thread(xs, w, p, inv_freq, dim, rotary_dim, eps, scratch, mscale);
+  __syncthreads();  // every thread is done reading xs before it is overwritten
+  if (d < dim) xs[d] = bf16_bits_to_float(o);
+  __syncthreads();
+  float amax = 0.f;
+  if (d < dim) amax = fabsf(xs[d]);
+  amax = block_max(amax, scratch);
+  if (d < dim) {
+    const auto s = latent_fp8_row_scale(amax);
+    const int32_t blk =
+        block_tables[static_cast<int64_t>(req_ids[r]) * blocks_per_request + p / block_tokens];
+    const int64_t phys = static_cast<int64_t>(blk) * block_tokens + p % block_tokens;
+    const int width = kv_heads * dim;
+    k_cache[phys * width + h * dim + d] = latent_fp8_encode(xs[d], s.inv);
+    if (d == 0) k_scale[phys * kv_heads + h] = s.scale;
+  }
+}
+
 __global__ void kv_append_kernel(const uint16_t* __restrict__ k, int64_t k_row_stride,
                                  const uint16_t* __restrict__ v, int64_t v_row_stride,
                                  const int32_t* __restrict__ req_ids,
@@ -122,29 +186,50 @@ __global__ void kv_append_kernel(const uint16_t* __restrict__ k, int64_t k_row_s
     }
     return;
   }
-  // fp8: one thread per (token, kv-head) row — quantize the dim-wide row to
-  // e4m3 with the per-row absmax/448 scale (kernels/latent_format.hpp), store
-  // the codes (1 B/elem) and the per-head scale. k_cache / v_cache are the
-  // uint8 code planes (cast from the uint16* the caller passes).
-  const int h = threadIdx.x;
-  if (h >= kv_heads) return;
-  {
-    const uint16_t* src = k + r * k_row_stride + h * dim;
-    float amax = 0.0f;
-    for (int e = 0; e < dim; ++e) amax = fmaxf(amax, fabsf(bf16_bits_to_float(src[e])));
-    const auto s = latent_fp8_row_scale(amax);
-    uint8_t* dst = reinterpret_cast<uint8_t*>(k_cache) + (phys * kv_heads + h) * dim;
-    for (int e = 0; e < dim; ++e) dst[e] = latent_fp8_encode(bf16_bits_to_float(src[e]), s.inv);
-    k_scale[phys * kv_heads + h] = s.scale;
+  // fp8: cooperative over the block. Stage this token's K/V rows in smem ONCE
+  // (a single global read — the previous per-head form read every row twice:
+  // an absmax pass then an encode pass), reduce the per-head absmax with one
+  // warp per head, then encode every element. k == nullptr: the K half was
+  // already written by the fused norm+RoPE+quantize kernel
+  // (norm_rope_append_fp8); only V is written here.
+  const int width = kv_heads * dim;
+  extern __shared__ uint16_t kvstage[];  // [width] k bf16, then [width] v bf16
+  uint16_t* kb = kvstage;
+  uint16_t* vb = kvstage + width;
+  for (int e = threadIdx.x; e < width; e += blockDim.x) {
+    kb[e] = k ? k[r * k_row_stride + e] : uint16_t(0);
+    vb[e] = v[r * v_row_stride + e];
   }
-  {
-    const uint16_t* src = v + r * v_row_stride + h * dim;
-    float amax = 0.0f;
-    for (int e = 0; e < dim; ++e) amax = fmaxf(amax, fabsf(bf16_bits_to_float(src[e])));
-    const auto s = latent_fp8_row_scale(amax);
-    uint8_t* dst = reinterpret_cast<uint8_t*>(v_cache) + (phys * kv_heads + h) * dim;
-    for (int e = 0; e < dim; ++e) dst[e] = latent_fp8_encode(bf16_bits_to_float(src[e]), s.inv);
-    v_scale[phys * kv_heads + h] = s.scale;
+  __syncthreads();
+  __shared__ float kinv[32], vinv[32];
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  if (warp < kv_heads) {
+    float ka = 0.f, va = 0.f;
+    for (int e = lane; e < dim; e += 32) {
+      if (k) ka = fmaxf(ka, fabsf(bf16_bits_to_float(kb[warp * dim + e])));
+      va = fmaxf(va, fabsf(bf16_bits_to_float(vb[warp * dim + e])));
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      ka = fmaxf(ka, __shfl_xor_sync(~0u, ka, off));
+      va = fmaxf(va, __shfl_xor_sync(~0u, va, off));
+    }
+    if (lane == 0) {
+      const auto sk = latent_fp8_row_scale(ka);
+      const auto sv = latent_fp8_row_scale(va);
+      kinv[warp] = sk.inv;
+      vinv[warp] = sv.inv;
+      if (k) k_scale[phys * kv_heads + warp] = sk.scale;
+      v_scale[phys * kv_heads + warp] = sv.scale;
+    }
+  }
+  __syncthreads();
+  uint8_t* kdst = reinterpret_cast<uint8_t*>(k_cache);
+  uint8_t* vdst = reinterpret_cast<uint8_t*>(v_cache);
+  for (int e = threadIdx.x; e < width; e += blockDim.x) {
+    const int h = e / dim;
+    if (k) kdst[phys * width + e] = latent_fp8_encode(bf16_bits_to_float(kb[e]), kinv[h]);
+    vdst[phys * width + e] = latent_fp8_encode(bf16_bits_to_float(vb[e]), vinv[h]);
   }
 }
 
@@ -841,11 +926,37 @@ void qsa_kv_append(const uint16_t* k, int64_t k_row_stride, const uint16_t* v, i
                    int kv_heads, int dim, uint16_t* k_cache, uint16_t* v_cache,
                    float* k_scale, float* v_scale, cudaStream_t stream) {
   if (rows <= 0) return;
-  if (!k || !v || !req_ids || !pos || !block_tables || !k_cache || !v_cache)
+  // k may be null when the fused norm+RoPE+quantize kernel already wrote K.
+  if (!v || !req_ids || !pos || !block_tables || !v_cache)
     throw std::invalid_argument("qsa_kv_append: null pointer");
-  kv_append_kernel<<<static_cast<unsigned>(rows), 256, 0, stream>>>(
+  if (k == nullptr && k_scale == nullptr)
+    throw std::invalid_argument("qsa_kv_append: null k with a bf16 cache");
+  const size_t smem =
+      k_scale != nullptr ? 2 * static_cast<size_t>(kv_heads) * dim * sizeof(uint16_t) : 0;
+  kv_append_kernel<<<static_cast<unsigned>(rows), 256, smem, stream>>>(
       k, k_row_stride, v, v_row_stride, req_ids, pos, block_tables, blocks_per_request,
       block_tokens, kv_heads, dim, k_cache, v_cache, k_scale, v_scale);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
+// Fused (1+w) RMSNorm + RoPE + fp8 quantize + paged scatter for the QSA K
+// cache (the zero-copy K write): one launch replaces qsa_norm_rope_bf16 into
+// the kn_ staging buffer plus the K half of qsa_kv_append. The cache bytes are
+// bitwise the two-kernel chain's. x is the raw k_proj output [rows, lkv * D].
+void qsa_norm_rope_append_fp8(const uint16_t* x, int64_t x_row_stride, int64_t x_head_stride,
+                              const uint16_t* w, const int64_t* pos, const float* inv_freq,
+                              const int32_t* req_ids, const int32_t* block_tables,
+                              int blocks_per_request, int block_tokens, int rows, int kv_heads,
+                              int dim, int rotary_dim, float eps, float mscale, uint8_t* k_cache,
+                              float* k_scale, cudaStream_t stream) {
+  if (rows <= 0) return;
+  if (!x || !w || !pos || !inv_freq || !req_ids || !block_tables || !k_cache || !k_scale)
+    throw std::invalid_argument("qsa_norm_rope_append_fp8: null pointer");
+  const int threads = block_threads_for(dim);
+  norm_rope_append_fp8_kernel<<<static_cast<unsigned>(rows * kv_heads), threads,
+                                dim * sizeof(float), stream>>>(
+      x, x_row_stride, x_head_stride, w, pos, inv_freq, req_ids, block_tables, blocks_per_request,
+      block_tokens, kv_heads, dim, rotary_dim, eps, mscale, k_cache, k_scale);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
