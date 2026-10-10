@@ -75,16 +75,18 @@ dequant path's error instead of 1.5× above it.
 Outcome: a real prefill number for B.1 on/off, and a harness that stays useful for C.1-C.3.
 
 * Harness (built, in `dgpp-gateway`): `make ab-env VAR=DGPP_QSA_FP8_MMA A=1 B=0
-  LENGTHS="4096 16384 65536 262144" REPEAT=5 BENCH=1` — `bench/ab-env.sh` boots the same
+  LENGTHS="4096 16384 65536 131072" REPEAT=5 BENCH=1` — `bench/ab-env.sh` boots the same
   lane once per arm (the launcher forwards any `DGPP_*` from the head's environment to
   every rank, `dgpp-cluster` `spawn_peer`), runs `bench/ttft-probe.py` (unique nonce
   prompts, server-side `timings.prompt_ms`), optionally `make bench` for the prose guard,
   restores the knob to unset, and writes `results/ab-env-<VAR>-<ts>/summary.json`.
   It **refuses to run against a live stack** (it restarts it) unless `FORCE=1`.
   `make ttft LENGTHS="..."` probes the running stack without any restart.
-* Record `results/ab-fp8-mma-b1.json` with `DGPP_QSA_FP8_MMA=1` vs `0` at
-  **4k / 16k / 64k / 256k** prompt tokens × ≥5 repeats, same binary, plus `make bench`
-  C1/C2/C4 to prove no prose regression.
+* Record `results/ab-env-DGPP_QSA_FP8_MMA-*/summary.json` with `DGPP_QSA_FP8_MMA=1` vs
+  `0` at **4k / 16k / 64k / 128k** prompt tokens × ≥5 repeats, same binary, plus the
+  `BENCH=1` prose guard (C1/C2/C4) to prove no regression. Stay ≤ 128k: the lane is
+  standard-context (native 256k, `engine.kv_capacity` 1048576), so a 256k prompt leaves
+  nothing for the reply.
 * Pre-registered expectation: **neutral at 4k** (K/V still a rounding error in the byte
   budget), **≥ 10 % faster prefill at ≥ 16k**, C1/C2/C4 within ±2 %.
 * Decision: if prefill is neutral everywhere, B.1 stays default-ON (it is strictly less
