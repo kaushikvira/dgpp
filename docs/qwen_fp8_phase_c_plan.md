@@ -1,5 +1,20 @@
 # Qwen3.8-Flash-Next — FP8 attention, Phase C plan (block scales + incoherent rotation + decode)
 
+> **Status (2026-10-10, after the night runs):**
+> * **Implemented + measured:** B.1 E4M3 warp attention (default ON); C.1a block (MXFP8)
+>   scales (correct); C.3a cp.async fp8 decode gather (validated); warp kernel specialized
+>   into `template<int MODE>` (bf16 vs E4M3) + per-instantiation smem (`kSmem8`).
+> * **Measured (same-binary A/B, 02:35 binary `03d27060`):** E4M3 prefill **19.5–25.1 %
+>   faster** than dequant at 4k/16k/64k/128k; dequant arm ≤1 % off the pre-B.1 baseline;
+>   quality gate: greedy transcripts identical on all 4 prompts (§7).
+> * **NO-GO:** the `l2_rel ≤ 0.035` bar is unreachable on the tensor-core path (best ~0.050
+>   unit-normal, ~0.057 with realistic outlier dims; dequant path is the reference at
+>   0.0360) → `DGPP_QSA_FP8_MX` implemented, correct, **left default OFF**; C.1b (block-scale
+>   V) and C.2 (Hadamard) NO-GO; C.3b (decode mma) NO-GO stands.
+> * Records: `dgpp-gateway/docs/NIGHT-20261010.md`,
+>   `dgpp-gateway/results/ab-night-20261010-summary.md`,
+>   `results/ab-env-DGPP_QSA_FP8_MMA-*/record.md` (gateway repo, local by convention).
+
 Branch: `feat/qwen-fp8-mma-attn` (stacked on Phase A `docs/qwen_fp8_kv_plan.md` and
 Phase B.1 `docs/qwen_fp8_mma_plan.md`). Scope: **Qwen3.8-Flash-Next only** (the QSA
 kernels + the Qwen serve family).
@@ -10,7 +25,7 @@ Reference techniques, adapted (not ported) — see §1 for why neither library i
 * Transformer Engine `MXFP8BlockScaling` / `fp8_dpa` recipes: E8M0 power-of-two scale
   per 32 values, applied by the tensor core.
 
-## 0. What is already done (verified 2026-10-10, HEAD `3c6f41d6`)
+## 0. What is already done (verified 2026-10-10, HEAD `03d27060`)
 
 | piece | state | where |
 |---|---|---|
@@ -21,16 +36,21 @@ Reference techniques, adapted (not ported) — see §1 for why neither library i
 | **native E4M3 MMA QKᵀ + PV, prefill-warp (B.1)** | shipped, default ON | `qsa_warp.cu:86-107` (mma/quantize), toggle `qsa_warp.cu:532` |
 | reachability gate | `!decode && T >= 128 && qsa_warp_supported` | `src/models/qwen/layers.cpp:822-830` |
 | e5m2 for Q / P | **NO-GO** (0.0491 → 0.0665 / 0.0685 / 0.0826) | `docs/qwen_fp8_mma_plan.md` §"e5m2 operand study" |
-| **B.2 decode / short prefill** | **not started** | `qsa.cu:737` scores are still SIMT |
-| **block (MXFP8) scales** | **not started** | scale plane is one fp32 per (slot, kv-head) |
-| **Hadamard / incoherent rotation** | **not in the Qwen path**; asset exists | `src/kernels/dsv4_attn.cu:206` `hadamard128_smem`, `:224` kernel, `:619` wrapper |
+| **B.2 C.3a (cp.async fp8 decode gather)** | shipped, validated (fp8-lane prose C4 114.7 → 117.5 tok/s, +2.46 %) | `qsa.cu` `issue_rows` fp8 branch; §5, §7 |
+| **B.2 C.3b (decode mma)** | **NO-GO** (m16 tile 6.25 % / 25 % full < 50 % gate) | decode stays SIMT; §5 |
+| **block (MXFP8) scales (C.1a)** | implemented, correct; **NO-GO on the ≤ 0.035 bar** (GPU 0.0510 vs 0.0551 row-scale; bar unreachable, §3.1) → `DGPP_QSA_FP8_MX` left default OFF | 8 B e8m0 plane per (slot, kv-head) row; §3.1 |
+| **Hadamard / incoherent rotation (C.2)** | **NO-GO** (host study: 1.00× / 1.20× / 1.08×, 0.86× harmful; < 1.3× gate) | `tests/cuda/qwen_fp8_error_attribution.cpp`; §3.1 |
+| **warp-kernel MODE specialization (bf16 vs E4M3)** | shipped — undid a 32–38 % `MMA=0` fallback regression (128k 0.8721 → 0.6407 ms/tok vs pre-B.1 0.6392) and made the E4M3 arm 3.7–5.7 % faster | `qsa_warp.cu` `template<int MODE>`; §7 |
+| **per-instantiation smem (`kSmem8`, 8 KiB E4M3 tiles)** | shipped — E4M3 instantiation 5 → 8 blocks/SM, +2.2–2.5 % end-to-end (kernel-level 1.76–1.87×) | `qsa_warp.cu` launch + `kSmem8`; §7 |
 
 **Two evidence problems that gate everything else**
 
 1. *B.1 has no valid perf evidence.* `results/bench-fp8-mma-b1-*.json` (22.13 ms/chunk)
    and `bench-fp8-mma-clean-*.json` (18.99 ms/chunk) are single-shot probes with an
    **87-token prompt** → `T < 128` → the E4M3 warp kernel is **never entered**. Both
-   records measure the bf16 path twice. No `make ab` record exists.
+   records measure the bf16 path twice. **Resolved 2026-10-10:** the night's `ab-env`
+   runs produced the same-binary A/B records (`results/ab-env-DGPP_QSA_FP8_MMA-*/`);
+   see §7.
 2. *The version banner is not trustworthy.* `make status` printed
    `git a91cceca95f4` (Phase A) for a process started 13 s after the binary was
    relinked with B.1 in it — the stamp is configure-time metadata. Identify deployed
@@ -113,6 +133,11 @@ Outcome: a real prefill number for B.1 on/off, and a harness that stays useful f
 
 Replace "one fp32 absmax scale per 256-dim row + a rank-1 `α·βᵏ` epilogue" with **8 E8M0
 scales per 256-dim row (one per 32 values)**, applied by `kind::mxf8f6f4` inside the mma.
+
+**Outcome (2026-10-10): the ≤ 0.035 bar is unreachable on this path** (best ~0.050
+unit-normal, ~0.057 with realistic outlier dims; the dequant path is the accuracy
+reference at 0.0360) — see §3.1. C.1a ships as a bounded worst-element win, not an L2
+lever; `DGPP_QSA_FP8_MX` is left default OFF; C.1b and C.2 are NO-GO.
 
 * **Numerics**: `score = Σ_{b=0..7} 2^(sfa_b + sfb_b) · <qa_b, kb_b>`; the hardware
   applies the pair product per k-block, so the scales no longer have to factor out of the
@@ -249,7 +274,7 @@ FA3's second FP8 technique; cheapest accuracy per engineering dollar.
 
 Two separate, independent defects:
 
-* **C.3a (cheap, do first) — implemented, pending A/B.** The fp8 branch of
+* **C.3a (cheap, do first) — implemented, validated (2026-10-10).** The fp8 branch of
   `attn_partial_kernel` gathered with plain global `uint4` loads + in-register decode
   (`qsa.cu:818-832`), which **bypassed the `issue_rows` cp.async pipeline** (`qsa.cu:720`)
   the bf16 branch uses — the known Phase A penalty (the ~9 % C4 prose gap vs bf16).
@@ -263,11 +288,20 @@ Two separate, independent defects:
   codes, same scales, same op order); the bf16 branch is untouched. The prefill-partial
   kernel (`qsa_prefill.cu`, the `DGPP_QSA_WARP=0` long-prefill fallback) is left on its
   serial gather: the deployed long-prefill default is the warp kernel (already cp.async),
-  so that fallback is not on the measured path. `DGPP_QSA_WARP_STAGES` stays 1: the warp
-  kernel's fp8 stage is 8 KiB (raw codes) vs 16.5 KiB (bf16, padded), but the smem
-  allocation is the bf16 size (`kSmem = kStages·16896` B), so 2 stages = 33 KiB → ~3 blocks/SM
-  vs 1 stage's ~6; residency already hides the gather, so 2 stages is a bad trade. Not
-  flipped.
+  so that fallback is not on the measured path. **Result (same-lane A/B, 2026-10-10):**
+  fp8-lane prose C4 114.7 → 117.5 tok/s (**+2.46 %**, below the pre-registered +5 %);
+  C1/C2 flat (−0.27 % / −0.45 %). The historical "~9 % fp8 prose cost" is no longer
+  measurable: in the same session, prose C4 is fp8 117.5 vs bf16 113.7 but *chat* C4 is
+  fp8 116.2 vs bf16 121.4 (single-session cross-lane comparison) — the classes disagree
+  in sign, so the claim is **no measurable difference**, not a win. **Stages note
+  superseded:** the per-instantiation smem change (§0) gives the E4M3 instantiation
+  `kSmem8` (8 KiB raw-code tiles) instead of the bf16 16896 B, lifting it 5 → 8
+  blocks/SM, so the "2 stages ≈ 3 blocks/SM" reasoning below is obsolete for the fp8
+  path (`DGPP_QSA_WARP_STAGES` stays 1 for bf16). Superseded reasoning, kept for
+  history: the warp kernel's fp8 stage is 8 KiB (raw codes) vs 16.5 KiB (bf16, padded),
+  but the smem allocation was the bf16 size (`kSmem = kStages·16896` B), so 2 stages =
+  33 KiB → ~3 blocks/SM vs 1 stage's ~6; residency already hides the gather, so 2
+  stages was a bad trade. Not flipped.
 * **C.3b (the real work) — NO-GO for decode, verified.** The m16 A-tile gate is ≥ 50 %
   full. The decode kernel (`attn_partial_kernel`) is one **query row** per block per head
   (grid `(rows, n_split, local_heads/hpb)`; `rows` is 1 for standard decode, ≤ 4 for
@@ -284,21 +318,62 @@ Two separate, independent defects:
 
 | # | work | gate to proceed | effort |
 |---|---|---|---|
-| C.0 | prefill measurement harness + B.1 A/B record | prefill win ≥ 10 % at ≥ 16k, else C.1 motivation = accuracy only | ~1 h |
-| C.1.0 | SF-fragment oracle (`scale_vec::1X` lane/byte map) | oracle max diff 0 — **hard blocker for C.1** | ~2 h |
-| C.1a | block scales for QKᵀ (pool + append + warp read) — **implemented, pending GPU** | `l2_rel ≤ 0.035`, gate green | ~1 day |
-| C.1b | block scales for PV (32-token k-step or keep γ) | error split says PV is worth the tile change | ~0.5 day, likely skipped |
-| C.2.0 | host incoherent-processing study | ≥ 1.3× error reduction, else drop | ~2 h |
-| C.2 | H after RoPE on Q + K append | prose C1 within 1 % | ~0.5 day |
-| C.3a | cp.async restore in the fp8 decode gather + warp stages 1 vs 2 — **implemented, pending A/B** | C1/C2/C4 within ±2 % | ~2 h |
+| C.0 | prefill measurement harness + B.1 A/B record — **done, gate MET** | 19.5–25.1 % faster at all 4 lengths (A 0.4481/0.4394/0.4514/0.4887 vs B 0.5568/0.5834/0.6024/0.6407 ms/tok, n=5, `cache_n==0`); §7 | ~1 h |
+| C.1.0 | SF-fragment oracle (`scale_vec::1X` lane/byte map) — **done** (C.1a shipped) | oracle max diff 0 | ~2 h |
+| C.1a | block scales for QKᵀ — **done; NO-GO on the ≤ 0.035 bar** (GPU 0.0510 vs 0.0551 row; bar unreachable, §3.1) | `DGPP_QSA_FP8_MX` left default OFF; repositioned as worst-element bound | ~1 day |
+| C.1b | block scales for PV — **NO-GO** (V-blk −0.0013…−0.0038 on every distribution, §3.1) | — | — |
+| C.2.0 | host incoherent-processing study — **done**: best 1.20× < 1.3× gate → C.2 dropped | §3.1 | ~2 h |
+| C.2 | H after RoPE on Q + K — **NO-GO** (1.00×/1.20×/1.08×, 0.86× harmful; H preserves row norms) | — | — |
+| C.3a | cp.async restore in the fp8 decode gather — **done, validated**: C4 114.7 → 117.5 tok/s (+2.46 %, below +5 %), C1/C2 flat | §5 | ~2 h |
 | C.3b | decode/prefill-partial mma — **NO-GO for decode** (m16 tile 6.25 % / 25 % full, < 50 % gate) | — | — |
+| (unplanned) warp-kernel MODE split + `kSmem8` | **done**: undid the 32–38 % `MMA=0` fallback regression (128k 0.8721 → 0.6407); E4M3 +3.7–5.7 %, then +2.2–2.5 % from `kSmem8` (5 → 8 blocks/SM) | §7 | — |
 
-Housekeeping on this branch regardless: **push `feat/qwen-fp8-mma-attn`** (it is local-only
-through `3c6f41d6`), and keep `121a` in the arch flag (§1). The C.0 harness is already in
+Housekeeping on this branch: `feat/qwen-fp8-mma-attn` is pushed through `03d27060`, and
+keep `121a` in the arch flag (§1). The C.0 harness is already in
 `dgpp-gateway` (`bench/ab-env.sh` + the `ttft` / `ab-env` targets).
 
 Non-goals: no FA3/TE/cuDNN dependency, no TMA rewrite, no e5m2 (NO-GO), no YaRN/1M-KV
 changes, no Qwen3.5 full-attn changes, no pool dtype change beyond the scale planes.
+
+## 7. Night results 2026-10-10 (all GPU-measured; final binary 02:35, `03d27060`)
+
+**Prefill, same-binary A/B** (`DGPP_QSA_FP8_MMA` 1 vs 0, n=5, `cache_n==0`, spreads ≲1 %):
+
+| ms/tok | 4k | 16k | 64k | 128k |
+|---|---|---|---|---|
+| E4M3 (MMA=1) | 0.4481 | 0.4394 | 0.4514 | 0.4887 |
+| dequant (MMA=0) | 0.5568 | 0.5834 | 0.6024 | 0.6407 |
+| pre-B.1 baseline | 0.5381 | 0.5777 | 0.5988 | 0.6392 |
+
+E4M3 is **19.5–25.1 % faster** than dequant and ~16–24 % faster than the pre-B.1
+baseline; the dequant arm matches the old kernel (≤1 %). The warp kernel had to be
+specialized into `template<int MODE>` (bf16 vs E4M3): the unified ~22,000-instruction
+body cost I-cache/IPC and had regressed the `MMA=0` fallback 32–38 % (128k 0.8721 →
+0.6407 vs pre-B.1 0.6392). Register counts (MODE 0: 246, MODE 1: 254) were *not* the
+limiter — occupancy was smem-bound at 5 blocks/SM. Per-instantiation smem (`kSmem8`,
+8 KiB raw-code tiles for MODE 1 instead of the bf16 16896 B) then lifted the E4M3
+instantiation 5 → 8 blocks/SM, worth another **2.2–2.5 %** end-to-end (kernel-level
+1.76–1.87×). **Dilution:** the attention kernel is ~5 % of prefill time, so further
+attention-kernel gains are bounded to a few percent end-to-end.
+
+**Quality:** `make ab-gate VAR=DGPP_QSA_FP8_MMA A=1 B=0` — both arms' api gates `ALL OK`,
+greedy transcripts **identical** on all four gate prompts (chat 1382 / code 1247 /
+math 747 / json 842 chars, temperature 0). Limited power: 4 prompts; the eval suite was
+not run (local humaneval/gsm8k datasets absent).
+
+**Recommendation (two-mode):** keep `DGPP_QSA_FP8_MMA=1` (the default) for speed —
+quality-identical transcripts on the gate set; `MMA=0` is the accuracy mode
+(`l2_rel` 0.0360, §3.1) and is now speed-viable again (0.6407 ms/tok at 128k).
+
+**Open items:** `make eval` is the strongest available next quality check, blocked on
+the absent local datasets; real-data Q/K validation (dump one layer's post-RoPE Q/K
+from a 16k prefill and re-run the attribution, §3.1); the `DGPP_QSA_FP8_MX` toggle is
+implemented, correct, and deliberately unused (no accuracy win to justify enabling it;
+its timing A/B was skipped for the same reason).
+
+Records: `dgpp-gateway/docs/NIGHT-20261010.md` (narrative),
+`dgpp-gateway/results/ab-night-20261010-summary.md` (the three A/Bs with pre-registered
+conditions marked met/not-met), per-run `results/ab-env-DGPP_QSA_FP8_MMA-*/record.md`.
 
 ## Appendix A — the hardware facts, reproducible
 
