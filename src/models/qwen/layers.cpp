@@ -824,11 +824,27 @@ void QwenQsaLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows& row
     const char* e = std::getenv("DGPP_QSA_WARP");
     return !(e != nullptr && e[0] == '0');
   }();
-  if (warp_attn && !rows.decode && T >= 128 && qsa_warp_supported(D, lh_, lkv_)) {
+  const bool warp_path = warp_attn && !rows.decode && T >= 128 && qsa_warp_supported(D, lh_, lkv_);
+  // C.1a (docs/qwen_fp8_phase_c_plan.md §3): DGPP_QSA_FP8_MX=1 block-quantizes
+  // the K codes (the append writes the e8m0 block plane). Only the warp kernel
+  // consumes that plane (block-scaled QK^T on MMA=1, block-aware dequant on
+  // MMA=0). The partial / decode / DGPP_QSA_WARP=0 paths dequant K with the
+  // fp32 row scale, which is inconsistent with block-quantized codes -- refuse
+  // to run them rather than silently corrupt. (Block-aware decode is C.3.)
+  if (warp_path) {
     qsa_attn_prefill_warp(qn_, static_cast<int64_t>(lh_) * D, cache.k_cache, cache.v_cache, d_req, topk_,
                           max_selected_, counts_, T, lh_, lkv_, cache.block_tokens, cache.block_tables,
-                          cache.blocks_per_request, scale_, c_out_, stream, cache.k_scale, cache.v_scale);
+                          cache.blocks_per_request, scale_, c_out_, stream, cache.k_scale, cache.v_scale,
+                          cache.k_bscale);
   } else {
+    if (cache.k_scale != nullptr) {
+      const char* e = std::getenv("DGPP_QSA_FP8_MX");
+      if (e != nullptr && e[0] == '1')
+        throw std::runtime_error(
+            "QwenQsaLayer: DGPP_QSA_FP8_MX=1 block-quantizes the K codes, which only the prefill "
+            "warp kernel consumes; this row took the partial/decode path (decode, T < 128, or "
+            "DGPP_QSA_WARP=0). Block-aware decode is C.3; unset DGPP_QSA_FP8_MX for these rows.");
+    }
     const auto attend = !rows.decode && T >= 128 ? qsa_attn_prefill_partial : qsa_attn_partial;
     attend(qn_, static_cast<int64_t>(lh_) * D, cache.k_cache, cache.v_cache, d_req, topk_,
            max_selected_, counts_, T, n_split_, lh_, lkv_, D, cache.block_tokens,

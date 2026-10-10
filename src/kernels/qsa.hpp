@@ -185,7 +185,7 @@ void qsa_attn_prefill_warp(const uint16_t* q, int64_t q_row_stride, const uint16
                            const int32_t* counts, int rows, int local_heads, int kv_heads, int block_tokens,
                            const int32_t* block_tables, int blocks_per_request, float scale, float* out,
                            cudaStream_t stream, const float* k_scale = nullptr,
-                           const float* v_scale = nullptr);
+                           const float* v_scale = nullptr, const uint8_t* k_bscale = nullptr);
 
 // out[r, h * dim + d] = bf16(bf16(c[r, h, d]) x bf16(sigmoid(gate))) with
 // the gate of head h at gate + r * gate_row_stride + h * gate_head_stride.
