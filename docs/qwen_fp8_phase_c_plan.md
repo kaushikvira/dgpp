@@ -170,6 +170,57 @@ scales per 256-dim row (one per 32 values)**, applied by `kind::mxf8f6f4` inside
   unchanged (`qsa_test` 12/12); pool `make gate` green; C.0 harness shows prefill ≤ −0 %
   (no regression) at 4k and the same ≥ 10 % win at ≥ 16k.
 
+### 3.1 C.1a error attribution (host study, 2026-10-11) — verdict: 0.035 is NOT reachable on the tensor-core path
+
+`tests/cuda/qwen_fp8_error_attribution.cpp` (host-only, no GPU; exact e4m3/e8m0
+recipes from `latent_format.hpp`, fp32 accumulation, the DSA-pin bf16 reference;
+mean of 3 seeds, stable under a seed offset) attributes the C.1a baseline
+(Q blk, K blk, P e4m3 pow2-γ, V row) across four K distributions. **Host-simulated
+numbers** (GPU-measured ones are marked):
+
+* **Where the 0.051 comes from** (unit-normal, per-factor isolation, all others bf16):
+  Q **0.0261**, K **0.0261**, P **0.0219**, V **0.0264** — four roughly equal
+  contributors, combining in quadrature to 0.0504 ≈ the measured 0.0517 baseline
+  (GPU: 0.0510). No single factor dominates; there is no cheap single lever.
+* **Block scales buy nothing in L2, on any distribution.** Unit-normal:
+  base 0.0517 vs Q-row 0.0512 / K-row 0.0520 (a wash; GPU 0.0510 vs 0.0551 row).
+  Outlier regimes: K-row **beats** K-blk by 0.0215 (RMSNorm-pinned + 3 outlier
+  dims 5–20×: 0.0567 vs 0.0782), 0.0302 (sink, one dim at 32× row rms: 0.0512 vs
+  0.0814), 0.0234 (lognormal-row + 10–100× spikes: 0.1335 vs 0.1568). The e8m0
+  power-of-two scale spends the granularity gain: a block's max lands in
+  (224, 448] of the e4m3 range instead of pinned at 448, and when a block holds
+  the outlier its other 31 elements (or the 7 cold blocks) lose the precision
+  the finer granularity was supposed to buy. At the quantizer level the truth is
+  sharper: e4m3's 448 max + subnormals already cover ~10⁵:1 of within-row range,
+  so the elements a row scale underflows carry negligible L2 energy — block
+  scales' only win is a **bounded worst-element error** (max_rel ≤ 2⁻⁴ vs 1.0
+  for row at 1000× spread; pinned by the fixed
+  `qwen_fp8_kv_block_scale_quantizer`), not an L2 gain.
+* **Hadamard (C.2) does not earn 1.3× on our distributions**: 1.00× unit-normal
+  (0.0516), 1.20× RMSNorm-pinned + outliers (0.0782 → 0.0651), 1.08× sink
+  (0.0814 → 0.0753), and **harmful** (0.86×) on the lognormal-row stress regime
+  (H preserves row norms, so it cannot remove row-level outliers). FA3's 2.6×
+  claim does not reproduce here.
+* **The 0.035 bar is met only by the dequant path** (Q bf16, K row, P bf16, V
+  row — the Phase A path, GPU-measured 0.0360): host 0.0299 (RMSNorm-pinned +
+  outliers), 0.0368 (sink), 0.0377 (unit-normal). Best tensor-core path:
+  0.0505 (unit-normal, V blk), 0.0567 (RMSNorm-pinned + outliers, K row),
+  0.0512 (sink, K row), 0.1335 (stress, K row).
+
+**Verdict: NO-GO for 0.035 on the fp8-everywhere (tensor-core) path.** Best
+achievable there is ~0.05 (unit-normal) / ~0.057 (realistic outlier dims).
+**Recommendations:** (1) keep C.1a as shipped — correct, neutral-to-positive on
+unit-normal (GPU 0.0510 vs 0.0551), repositioned as a worst-element bound, not
+an L2 lever; (2) **C.1b (PV block scales): NO-GO** — V-blk is −0.0013…−0.0038
+on every distribution for the expensive 32-token tile change; (3) **C.2
+(Hadamard): NO-GO** at the 1.3× gate (best 1.20×); (4) revised bar: ~0.05 for
+the tensor-core path; if 0.035 accuracy is a hard requirement, the dequant path
+(`DGPP_QSA_FP8_MMA=0`) is the accuracy mode (meets 0.035 on realistic
+outlier-dim data) and the tensor-core path is the speed mode — a two-mode story,
+not one fp8-everywhere path. **Next work item:** sample a *real* post-RoPE
+Q/K distribution from a live forward pass (dump one layer of a 16k prefill) to
+validate the synthetic regimes before any further C.x investment.
+
 ## 4. C.2 — Incoherent processing (Hadamard) before the fp8 quant
 
 FA3's second FP8 technique; cheapest accuracy per engineering dollar.
