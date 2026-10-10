@@ -56,11 +56,13 @@ row, exactly as the plan wants; the `α·βᵏ` rank-1 epilogue is deleted.
   (all-ones probe 132.0/516.0 with C=1, i.e. 32.0/128.0 per element at C=0);
   rejected on plain `sm_121` (the `121a` arch flag stays).
 - **Verified (by the test, once run in the GPU window)**: the lane/byte map
-  above against the exact host oracle with 16/8 *distinct* scale bytes
-  (max diff 0), plus sensitivity — byte-swapped SFA/SFB and uniform-A
-  mappings must all FAIL the oracle (if uniform-A passed, the A side would be
-  uniform across the 8-row pair and the per-row design is a NO-GO with the
-  fallback of K-side-only block scales).
+  above against the exact host oracle with 9/7 *distinct* scale bytes (9 A
+  scales over 16 rows, 7 B scales over 8 cols; rows `g` and `g+8` always
+  differ and cols `2t` and `2t+1` always differ, so a wrong byte mapping
+  cannot hide) (max diff 0), plus sensitivity — byte-swapped SFA/SFB and
+  uniform-A mappings must all FAIL the oracle (if uniform-A passed, the A
+  side would be uniform across the 8-row pair and the per-row design is a
+  NO-GO with the fallback of K-side-only block scales).
 - **Verified (ptxas trial on this box)**: the exact operand order — the
   selectors are *pairs* of `.b16` registers interleaved after each scale
   register (`{sfa} {sel,sel} {sfb} {sel,sel}`), matching the in-repo mxf4nvf4

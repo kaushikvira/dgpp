@@ -31,11 +31,17 @@
 // hardware forced a uniform pair, the spec mapping would fail and the
 // uniform mapping would pass, which the sensitivity test reports explicitly.
 //
-// Exactness: the e4m3 codes are drawn from {0, +/-0.5, +/-1} (0x00, 0x30, 0x38,
-// 0x50, 0x58), so every 32-term dot product is an exact multiple of 0.25 with
-// |dot| <= 32; the ue8m0 scales are powers of two (2^-4..2^4 for A, 2^-3..2^3
-// for B); the fp32 mma result is therefore exact and the host oracle compares
-// bitwise (max diff must be 0).
+// Exactness: the e4m3 codes are drawn from {0, 0.5, 1, 8, 16} (0x00, 0x30,
+// 0x38, 0x50, 0x58 -- all non-negative; 0x50=+8 and 0x58=+16, sign bit clear),
+// so every product a*b is an exact multiple of 2^-2 and the 32-term dot
+// product is an exact multiple of 2^-2 with |dot| <= 32*16*16 = 8192 = 2^13;
+// write dot = D*2^-2 with integer |D| <= 2^15. The ue8m0 scales are powers of
+// two (2^-4..2^4 for A, 2^-3..2^3 for B), so the scale product is a power of
+// two in 2^-7..2^7 and the final value is D*2^e with |D| <= 2^15 and e in
+// -9..5; since |D| <= 2^15 < 2^24 (the fp32 significand) it is exactly
+// representable in fp32 (magnitude 2^-9..2^20, normal, no denormal flush).
+// The fp32 mma result is therefore exact and the host oracle (computed in
+// double, exact for these values) compares bitwise (max diff must be 0).
 //
 // Run:  ctest -R qwen_fp8_mxfp8_sf   (or the built binary directly)
 #include <algorithm>
@@ -203,8 +209,13 @@ float run_mapping(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b,
   return max_diff;
 }
 
-// The distinct-scale inputs: e4m3 codes from {0, +/-0.5, +/-1} (exact small
-// dots) and 16 / 8 DISTINCT ue8m0 bytes (a wrong byte mapping cannot hide).
+// The distinct-scale inputs: e4m3 codes from {0, 0.5, 1, 8, 16} (exact dyadic
+// dots) and 9 / 7 DISTINCT ue8m0 bytes (a wrong byte mapping cannot hide:
+// sfa[m] = 127-4+(m%9) yields 9 distinct A scales over 16 rows and
+// sfb[n] = 127-3+(n%7) yields 7 distinct B scales over 8 cols; for every pair
+// (g, g+8) the two A scales differ (sfa[g] vs sfa[g+8] are never equal under
+// this formula) and for every t the B cols 2t and 2t+1 differ, so a swapped
+// or uniform mapping cannot masquerade as the spec mapping).
 struct SfInputs {
   std::vector<uint8_t> a, b, sfa, sfb;
 };
@@ -212,7 +223,7 @@ SfInputs distinct_inputs() {
   SfInputs x;
   x.a.resize(16 * 32);
   x.b.resize(32 * 8);
-  const uint8_t vals[5] = {0x00u, 0x30u, 0x38u, 0x50u, 0x58u};  // 0, 0.5, 1, -0.5, -1
+  const uint8_t vals[5] = {0x00u, 0x30u, 0x38u, 0x50u, 0x58u};  // 0, 0.5, 1, 8, 16 (all non-negative)
   uint64_t seed = 7;
   auto rnd = [&]() {
     seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
@@ -248,7 +259,7 @@ DGPP_TEST(qwen_fp8_mxfp8_sf_sanity) {
 DGPP_TEST(qwen_fp8_mxfp8_sf_oracle) {
   const SfInputs x = distinct_inputs();
   const float d = run_mapping(x.a, x.b, x.sfa, x.sfb, 0);
-  std::printf("[mxfp8-sf] SF-fragment oracle (spec mapping, 16x8 distinct scales): "
+  std::printf("[mxfp8-sf] SF-fragment oracle (spec mapping, 16x8 tile, 9/7 distinct scales): "
               "max |mma - host oracle| = %.3g\n",
               d);
   require(d == 0.f,
