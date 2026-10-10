@@ -10,26 +10,41 @@
 // What this file pins (the governed outcome of C.1.0): which lane's which byte
 // of which register supplies the scale for which (row, k-block) of A and which
 // (col, k-block) of B, so the C.1a kernel can read/write the SF registers
-// without guessing. The layout asserted here (PTX ISA 9.7.14.6.1,
-// .kind::mxf8f6f4 .scale_vec::1X):
+// without guessing.
 //
-//   lane = 4*g + t (g = lane/4, t = lane%4)
-//   SFA: 1 .b32 register per thread:  byte0 = SFA[g]   (row g,   block of 32)
-//                                          byte1 = SFA[g+8] (row g+8)
-//         (the 4 threads of a group carry the same two bytes)
-//   SFB: 1 .b32 register per thread:  byte0 = SFB[2t]  (col 2t)
-//                                          byte1 = SFB[2t+1] (col 2t+1)
-//   selectors: a PAIR of .b16 registers follows each scale register
-//   ({sfa} {sfa_sel0,sfa_sel1} {sfb} {sfb_sel0,sfb_sel1}, the mxf4nvf4 4X
-//   operand order); all four are 0 for scale_vec::1X.
+// THE MAP BELOW IS PROBE-VERIFIED, NOT CREDITED TO THE PTX ISA TABLE. The
+// earlier doc (and this file's first revision) asserted the PTX ISA 9.7.14.6.1
+// table layout (sfa byte0=row g / byte1=row g+8 in the SAME thread; sfb
+// byte0=col 2t / byte1=col 2t+1). That mapping was FALSIFIED by running the
+// oracle on the GPU (max |mma - oracle| = 6.06e+04, non-zero). The true map was
+// then established empirically with a map-independent single-byte-boost probe
+// (A/B codes all 0x38=1.0, all SF bytes 0x7f=2^0 except one byte set to
+// 0x84=2^5; read all 128 outputs to see which rows/cols get the 32x boost),
+// and cross-checked with a distinct-per-row/per-col-scale oracle (max diff 0).
+//
+// PROBE-VERIFIED TRUE MAP (scale_vec::1X, selectors all 0, byte0 is the active
+// scale byte; bytes 1-3 of each register are ignored at sel=0):
+//
+//   lane = 4*g + t  (g = lane/4, t = lane%4)
+//   SFA: A row g   -> thread (g, t=0) register, byte0
+//        A row g+8 -> thread (g, t=1) register, byte0
+//        (threads t=2, t=3 of a group carry no A scale)
+//   SFB: B col g   -> thread (g, t=0) register, byte0
+//        (threads t=1, t=2, t=3 of a group carry no B scale)
+//
+// So the A side is PER-ROW (rows g and g+8 live in DIFFERENT threads of the
+// same group, so they can hold distinct scales -- the 8-scales-per-256-dim-row
+// design is supported), and the B side is PER-COLUMN (one scale per column, in
+// that column's group t=0 thread). This is NOT the uniform-pair / 2-col-per-
+// thread layout the PTX ISA table implied.
 //
 // A row of the m16n8k32 A tile is exactly one 32-wide k-block, so one mma
 // carries ONE scale per A row and ONE per B column; the 8-scales-per-256-dim-row
 // design is 8 sequential k-steps, each with its own SFA/SFB registers (no
 // k-steps share a byte). The oracle below proves the A side can hold 16
-// distinct row scales (rows g and g+8 differ inside one register) -- if the
-// hardware forced a uniform pair, the spec mapping would fail and the
-// uniform mapping would pass, which the sensitivity test reports explicitly.
+// distinct row scales (rows g and g+8 differ, in different threads) -- the
+// sensitivity test reports explicitly that the uniform-A and the falsified
+// spec mappings FAIL.
 //
 // Exactness: the e4m3 codes are drawn from {0, 0.5, 1, 8, 16} (0x00, 0x30,
 // 0x38, 0x50, 0x58 -- all non-negative; 0x50=+8 and 0x58=+16, sign bit clear),
@@ -101,11 +116,13 @@ struct DevBuf {
 };
 
 // The block-scaled mma. `map` selects the SF byte mapping under test:
-//   0 spec      : sfa byte0=SFA[g] byte1=SFA[g+8]; sfb byte0=SFB[2t] byte1=SFB[2t+1]
-//   1 sfa_swap  : the two SFA bytes exchanged (a deliberately wrong mapping)
-//   2 sfb_swap  : the two SFB bytes exchanged (a deliberately wrong mapping)
-//   3 sfa_unif  : both SFA bytes = SFA[g] (the fallback the hardware would use
-//                 if A-side scales were uniform across the 8-row pair)
+//   0 true      : PROBE-VERIFIED. sfa: thread(g,0) byte0=row g, thread(g,1)
+//                 byte0=row g+8; sfb: thread(g,0) byte0=col g. (bytes 1-3 = 0x7f)
+//   1 sfa_swap  : the two A rows exchanged between threads (g,0)/(g,1) -- wrong
+//   2 sfb_swap  : the B col scale placed in the ignored thread (g,1) -- wrong
+//   3 sfa_unif  : both A rows use row g's scale (uniform across the 8-row pair)
+//   4 old_spec  : the FALSIFIED PTX ISA table map (sfa byte0=row g / byte1=row
+//                 g+8 in the same thread; sfb byte0=col 2t / byte1=col 2t+1)
 // A/B/C fragment packing is the plain e4m3 m16n8k32 layout (pinned by
 // qwen_fp8_mma_a_fragment_oracle): a0=A[g][4t..4t+3], a1=A[g+8][4t..4t+3],
 // a2=A[g][4t+16..4t+19], a3=A[g+8][4t+16..4t+19]; b0=B[4t..4t+3][g],
@@ -133,31 +150,39 @@ __global__ void mxfp8_sf_kernel(const uint8_t* a, const uint8_t* b, const uint8_
   const uint32_t a2 = packA(g, 4 * t + 16), a3 = packA(g + 8, 4 * t + 16);
   const uint32_t b0 = packB(4 * t, g), b1 = packB(4 * t + 16, g);
   uint32_t sfa_r, sfb_r;
-  const uint32_t sfa_spec = static_cast<uint32_t>(sfa[g]) | (static_cast<uint32_t>(sfa[g + 8]) << 8);
-  const uint32_t sfb_spec = static_cast<uint32_t>(sfb[2 * t]) | (static_cast<uint32_t>(sfb[2 * t + 1]) << 8);
+  const uint32_t sfa_lo = sfa[g];          // row g
+  const uint32_t sfa_hi = sfa[g + 8];      // row g+8
+  const uint32_t sfb_c = sfb[g];           // col g
+  // Pad the ignored bytes 1-3 with 0x7f (2^0, neutral) so the only difference
+  // between maps is the placement of the active (byte0) scale.
+  auto pad = [](uint32_t v) { return v | 0x7f7f7f00u; };
   switch (map) {
-    case 1:
-      sfa_r = static_cast<uint32_t>(sfa[g + 8]) | (static_cast<uint32_t>(sfa[g]) << 8);
-      sfb_r = sfb_spec;
+    case 1:  // sfa_swap: exchange which thread holds row g vs row g+8
+      sfa_r = pad(t == 0 ? sfa_hi : (t == 1 ? sfa_lo : 0x7f));
+      sfb_r = pad(t == 0 ? sfb_c : 0x7f);
       break;
-    case 2:
-      sfa_r = sfa_spec;
-      sfb_r = static_cast<uint32_t>(sfb[2 * t + 1]) | (static_cast<uint32_t>(sfb[2 * t]) << 8);
+    case 2:  // sfb_swap: put the col scale in the ignored thread (g,1)
+      sfa_r = pad(t == 0 ? sfa_lo : (t == 1 ? sfa_hi : 0x7f));
+      sfb_r = pad(t == 1 ? sfb_c : 0x7f);
       break;
-    case 3:
-      sfa_r = static_cast<uint32_t>(sfa[g]) | (static_cast<uint32_t>(sfa[g]) << 8);
-      sfb_r = sfb_spec;
+    case 3:  // sfa_unif: both A rows use row g's scale
+      sfa_r = pad((t == 0 || t == 1) ? sfa_lo : 0x7f);
+      sfb_r = pad(t == 0 ? sfb_c : 0x7f);
       break;
-    default:
-      sfa_r = sfa_spec;
-      sfb_r = sfb_spec;
+    case 4:  // old_spec: the falsified PTX ISA table map (same-thread bytes)
+      sfa_r = sfa_lo | (sfa_hi << 8);
+      sfb_r = static_cast<uint32_t>(sfb[2 * t]) | (static_cast<uint32_t>(sfb[2 * t + 1]) << 8);
+      break;
+    default:  // 0 = true (probe-verified)
+      sfa_r = pad(t == 0 ? sfa_lo : (t == 1 ? sfa_hi : 0x7f));
+      sfb_r = pad(t == 0 ? sfb_c : 0x7f);
       break;
   }
   float cc[4] = {0.f, 0.f, 0.f, 0.f};
   // The selector operands are PAIRS of .b16 registers interleaved after each
   // scale register (the mxf4nvf4 4X form in moe_w4a4.cu is the in-repo
   // precedent): {sfa} {sfa_sel0,sfa_sel1} {sfb} {sfb_sel0,sfb_sel1}. Both
-  // selectors are 0 for scale_vec::1X.
+  // selectors are 0 for scale_vec::1X (byte0 is the active scale byte).
   asm volatile(
       "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
       "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
@@ -214,8 +239,8 @@ float run_mapping(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b,
 // sfa[m] = 127-4+(m%9) yields 9 distinct A scales over 16 rows and
 // sfb[n] = 127-3+(n%7) yields 7 distinct B scales over 8 cols; for every pair
 // (g, g+8) the two A scales differ (sfa[g] vs sfa[g+8] are never equal under
-// this formula) and for every t the B cols 2t and 2t+1 differ, so a swapped
-// or uniform mapping cannot masquerade as the spec mapping).
+// this formula) and for every t the B cols 2t and 2t+1 differ, so a swapped,
+// uniform, or same-thread (old spec) mapping cannot masquerade as the true map).
 struct SfInputs {
   std::vector<uint8_t> a, b, sfa, sfb;
 };
@@ -242,7 +267,9 @@ SfInputs distinct_inputs() {
 
 // The verified probe from the plan (appendix A): all e4m3 codes 0x38 (1.0),
 // ue8m0 scales 0x7f (2^0) -> each C element 32.0 (the plan's 132.0 was with
-// C=1: 4*(32*1)+4); scales 0x80 (2^1) -> 128.0 each (the plan's 516.0).
+// C=1: 4*(32*1)+4); scales 0x80 (2^1) -> 128.0 each (the plan's 516.0). This
+// establishes the exponent convention (bias 127, sfa*sfb multiplicative) and
+// is map-independent (uniform scales), so it holds under the true map too.
 DGPP_TEST(qwen_fp8_mxfp8_sf_sanity) {
   std::vector<uint8_t> a(16 * 32, 0x38u), b(32 * 8, 0x38u);
   for (uint8_t sc : {0x7fu, 0x80u}) {
@@ -254,38 +281,44 @@ DGPP_TEST(qwen_fp8_mxfp8_sf_sanity) {
   }
 }
 
-// The spec mapping over distinct per-row / per-col scales must match the exact
-// host oracle bitwise. This is the C.1.0 gate: max diff 0.
+// The PROBE-VERIFIED TRUE mapping over distinct per-row / per-col scales must
+// match the exact host oracle bitwise. This is the C.1.0 gate: max diff 0.
 DGPP_TEST(qwen_fp8_mxfp8_sf_oracle) {
   const SfInputs x = distinct_inputs();
   const float d = run_mapping(x.a, x.b, x.sfa, x.sfb, 0);
-  std::printf("[mxfp8-sf] SF-fragment oracle (spec mapping, 16x8 tile, 9/7 distinct scales): "
+  std::printf("[mxfp8-sf] SF-fragment oracle (TRUE map: sfa thread(g,0) byte0=row g / thread(g,1) "
+              "byte0=row g+8; sfb thread(g,0) byte0=col g; 16x8 tile, 9/7 distinct scales): "
               "max |mma - host oracle| = %.3g\n",
               d);
   require(d == 0.f,
-          "MXFP8 SF-fragment spec mapping (sfa byte0=row g / byte1=row g+8; sfb byte0=col 2t / "
-          "byte1=col 2t+1) disagrees with the exact host oracle");
+          "MXFP8 SF-fragment TRUE map (sfa: thread(g,0) byte0=row g, thread(g,1) byte0=row g+8; "
+          "sfb: thread(g,0) byte0=col g) disagrees with the exact host oracle");
 }
 
-// Sensitivity: a deliberately wrong byte mapping MUST fail the oracle. If any
-// of these comes back 0.0, the oracle is not discriminating (or the hardware
-// ignores the bytes it is supposed to use) and the spec is not pinned. The
-// uniform-A case is the blocker probe: if spec fails but uniform passes, the
-// A side cannot hold distinct scales for rows g and g+8 and C.1's 8-scales-
-// per-row design needs the fallback (block scales on the K/B side only).
+// Sensitivity: a deliberately wrong byte mapping MUST fail the oracle,
+// RELATIVE TO THE TRUE MAP. If any of these comes back 0.0, the oracle is not
+// discriminating (or the hardware ignores the bytes it is supposed to use) and
+// the true map is not pinned. The old_spec case is the regression guard for the
+// falsified PTX ISA table map. The uniform-A case is the design probe: if it
+// passed, the A side would be uniform across the 8-row pair and C.1's
+// 8-scales-per-row design would be a NO-GO (it does NOT pass: rows g and g+8
+// live in different threads and hold distinct scales).
 DGPP_TEST(qwen_fp8_mxfp8_sf_mapping_sensitivity) {
   const SfInputs x = distinct_inputs();
   const float d_swap_a = run_mapping(x.a, x.b, x.sfa, x.sfb, 1);
   const float d_swap_b = run_mapping(x.a, x.b, x.sfa, x.sfb, 2);
   const float d_unif_a = run_mapping(x.a, x.b, x.sfa, x.sfb, 3);
-  std::printf("[mxfp8-sf] sensitivity: sfa byte-swap max diff %.3g (must be > 0), "
-              "sfb byte-swap %.3g (must be > 0), sfa uniform %.3g\n",
-              d_swap_a, d_swap_b, d_unif_a);
-  require(d_swap_a > 0.f, "swapped SFA bytes pass the oracle: the test cannot detect a wrong A mapping");
-  require(d_swap_b > 0.f, "swapped SFB bytes pass the oracle: the test cannot detect a wrong B mapping");
+  const float d_old_spec = run_mapping(x.a, x.b, x.sfa, x.sfb, 4);
+  std::printf("[mxfp8-sf] sensitivity (vs TRUE map): sfa byte-swap %.3g, sfb byte-swap %.3g, "
+              "sfa uniform %.3g, old-spec-map %.3g (all must be > 0)\n",
+              d_swap_a, d_swap_b, d_unif_a, d_old_spec);
+  require(d_swap_a > 0.f, "swapped SFA rows pass the oracle: the test cannot detect a wrong A mapping");
+  require(d_swap_b > 0.f, "misplaced SFB col scale passes the oracle: the test cannot detect a wrong B mapping");
   require(d_unif_a > 0.f,
           "uniform-A passes the oracle: the hardware may be forcing A-side scales uniform "
           "across the 8-row pair (C.1 blocker: distinct per-row A scales unavailable)");
+  require(d_old_spec > 0.f,
+          "the falsified old-spec (PTX ISA table) map passes the oracle: regression guard tripped");
 }
 
 int main() { return dgpp::test::run_all(); }
