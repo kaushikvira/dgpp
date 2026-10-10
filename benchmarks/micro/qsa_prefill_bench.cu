@@ -48,6 +48,21 @@
 // MODE 1 9,656 (REG 254) vs the unified kernel's single ~22,000-instruction
 // REG-255 body -- the per-instantiation footprint is the lever (occupancy is
 // smem-bound at 5 blocks/SM either way).
+//
+// Measured (GB10 sm_121a, Release, median of 3 runs x 5 iters, rows=256;
+// per-mode smem: the E4M3 path launches with kSmem8 (8 KiB raw-code tiles)
+// instead of the bf16 kSmem, so it runs register-bound at 8 blocks/SM
+// (REG 254 x 32) instead of smem-bound at 5; __launch_bounds__(32, 8) pins
+// the target with no spills):
+//   mma=1: 4k 1.384 -> 0.785 (1.76x)  16k 1.523 -> 0.814 (1.87x)
+//          64k 1.541 -> 0.838 (1.84x)  128k 1.575 -> 0.879 (1.79x)
+//   mma=0: 4k 6.693 -> 6.586  16k 7.387 -> 7.123  64k 7.775 -> 7.678
+//          128k 7.919 -> 7.845 (unchanged within noise; the bf16 path keeps
+//          the full kSmem tile and its 5 blocks/SM)
+// 2 stages for the E4M3 path (DGPP_QSA_WARP_STAGES8=2: 16384 B dynamic +
+// 1408 B static smem -> 5 blocks/SM) measured 1.296/1.387/1.381/1.448 at
+// 4k/16k/64k/128k -- the 1-stage form wins: residency, not double-buffering,
+// hides the gather (the bf16 path's kStages is untouched).
 #include <algorithm>
 #include <cmath>
 #include <cstdio>

@@ -14,6 +14,10 @@
 // One stage by default: ncu showed the two-stage form at 2 blocks/SM
 // (shared-memory bound); one stage gives 5 warps/SM and residency hides the
 // gather (DGPP_QSA_WARP_STAGES=2 at build time keeps the double buffer).
+// The smem request is per-instantiation: the bf16 path launches with kSmem
+// (the padded 16.5 KiB tile) and the E4M3 path with kSmem8 (raw 8 KiB tiles,
+// DGPP_QSA_WARP_STAGES8, default 1) -- the E4M3 kernel is then register-bound
+// at 8 blocks/SM instead of smem-bound at 5 by the bf16 allocation.
 //
 // Numerics: probabilities rounded to bf16 for P V, the denominator summing
 // the unrounded values (the partial kernels' rule); the dots' summation order
@@ -59,6 +63,15 @@ constexpr size_t kSmem = size_t(kStages) * kStageElems * 2;  // bytes
 // 4-byte B-fragment loads are aligned). K then V, 256 B/token each.
 constexpr int kRow8 = kD;                 // bytes per e4m3 token row
 constexpr size_t kStage8 = 2 * kTileTok * kRow8;  // bytes, one e4m3 stage
+// The E4M3 path stages 8 KiB tiles, so it gets its own (smaller) stage count
+// and smem budget: 1 stage = 8192 B -> 8 blocks/SM (register-bound at
+// REG 254 x 32), 2 stages = 16384 B -> 5 blocks/SM (smem-bound with the
+// 1408 B static smem). DGPP_QSA_WARP_STAGES8 selects at build time.
+#ifndef DGPP_QSA_WARP_STAGES8
+#define DGPP_QSA_WARP_STAGES8 1
+#endif
+constexpr int kStages8 = DGPP_QSA_WARP_STAGES8;
+constexpr size_t kSmem8 = size_t(kStages8) * kStage8;  // bytes
 
 __device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* p) {
   const unsigned a = static_cast<unsigned>(__cvta_generic_to_shared(p));
@@ -132,7 +145,7 @@ __device__ __forceinline__ float pow2_ceil(float x) {
 // single kernel was register-capped at 255 by the E4M3 branch's appetite, which
 // cost the bf16 branch occupancy/IPC; the split lets each mode compile lean.
 template <int MODE>
-__global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
+__global__ __launch_bounds__(32, 8) void qsa_attn_prefill_warp_kernel(
     const uint16_t* __restrict__ q, int64_t q_row_stride, const uint16_t* __restrict__ k_cache,
     const uint16_t* __restrict__ v_cache, const float* __restrict__ k_scale,
     const float* __restrict__ v_scale, const int32_t* __restrict__ req_ids, const int32_t* __restrict__ topk,
@@ -154,6 +167,7 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
   // MODE 1 = the FP8-MMA path (plan §5); MODE 0 = the bf16 path (pure or fp8
   // dequant). C.1a (e8mx) is the block-scaled QK^T sub-variant, MODE 1 only.
   const bool e8mx = (MODE == 1) && mx && k_bscale != nullptr;
+  constexpr int kStagesM = (MODE == 1) ? kStages8 : kStages;  // per-mode stages
 
   // Q A-fragments: bf16 16 k-steps x 4 registers; the E4M3 path quantizes the
   // same rows to 8 k-steps x 4 registers (4 e4m3 each, the m16n8k32 layout)
@@ -386,10 +400,10 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
   float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;  // rows g, g + 8 (lane-partial l)
 
   const int tiles = (cnt + kTileTok - 1) / kTileTok;
-  if (kStages == 2 && tiles > 0) stage(0, 0);
+  if (kStagesM == 2 && tiles > 0) stage(0, 0);
   for (int it = 0; it < tiles; ++it) {
-    const int buf = kStages == 2 ? (it & 1) : 0;
-    if (kStages == 1) {
+    const int buf = kStagesM == 2 ? (it & 1) : 0;
+    if (kStagesM == 1) {
       // One stage: residency (more warps per SM) hides the gather instead.
       stage(it, 0);
       asm volatile("cp.async.wait_group 0;\n" ::);
@@ -660,17 +674,19 @@ void qsa_attn_prefill_warp(const uint16_t* q, int64_t q_row_stride, const uint16
   if (!qsa_warp_supported(kD, local_heads, kv_heads))
     throw std::invalid_argument("qsa_attn_prefill_warp: dim 256, <= 16 query heads per KV head");
   static const bool opted = [] {  // once per process, thread-safe (TP ranks may share one)
-    // Both MODE instantiations get the smem + carveout (the bf16 and E4M3 paths
-    // share the kSmem budget; the E4M3 raw-code tiles fit within it).
+    // Per-instantiation smem: the bf16 path needs the full kSmem tile; the E4M3
+    // path stages raw 8 KiB tiles (kSmem8), so it gets the occupancy its own
+    // budget allows (8 blocks/SM at 1 stage, register-bound) instead of being
+    // smem-bound at 5 by the bf16 allocation. All of L1 as shared memory:
+    // residency here is bounded by the stages.
     DGPP_CUDA_OK(cudaFuncSetAttribute(qsa_attn_prefill_warp_kernel<0>,
                                       cudaFuncAttributeMaxDynamicSharedMemorySize,
                                       static_cast<int>(kSmem)));
-    // All of L1 as shared memory: residency here is bounded by the 33.8 KB stages.
     DGPP_CUDA_OK(cudaFuncSetAttribute(qsa_attn_prefill_warp_kernel<0>,
                                       cudaFuncAttributePreferredSharedMemoryCarveout, 100));
     DGPP_CUDA_OK(cudaFuncSetAttribute(qsa_attn_prefill_warp_kernel<1>,
                                       cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                      static_cast<int>(kSmem)));
+                                      static_cast<int>(kSmem8)));
     DGPP_CUDA_OK(cudaFuncSetAttribute(qsa_attn_prefill_warp_kernel<1>,
                                       cudaFuncAttributePreferredSharedMemoryCarveout, 100));
     return true;
@@ -691,7 +707,8 @@ void qsa_attn_prefill_warp(const uint16_t* q, int64_t q_row_stride, const uint16
   const dim3 grid(static_cast<unsigned>(rows), static_cast<unsigned>(kv_heads));
   const auto launch = [&](auto mode_tag) {
     constexpr int MODE = decltype(mode_tag)::value;
-    qsa_attn_prefill_warp_kernel<MODE><<<grid, 32, kSmem, stream>>>(q, q_row_stride, k_cache, v_cache,
+    constexpr size_t smem = (MODE == 1) ? kSmem8 : kSmem;  // per-mode dynamic smem
+    qsa_attn_prefill_warp_kernel<MODE><<<grid, 32, smem, stream>>>(q, q_row_stride, k_cache, v_cache,
                                                                     k_scale, v_scale, req_ids, topk,
                                                                     topk_stride, counts, local_heads,
                                                                     kv_heads, block_tokens,
