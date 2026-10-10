@@ -1,5 +1,53 @@
 // Paired listed-QSA prefill timings on idle hardware. Synthetic values with
 // paged, request-specific sparse lists; compare every FP32 partial exactly.
+//
+// Measured (GB10 sm_121a, Release, median of 5 reps, ms per launch, this
+// bench's --warp mode; "unified" = the pre-MODE-split kernel at f2552271,
+// "split" = the template<int MODE> kernel at f7fb60fd+):
+//   rows=1   mma=0: 7.155 -> 3.398 (2.11x)  4k..128k 7.155->3.406 (2.10x)
+//   rows=1   mma=1: 1.128 -> 0.669 (1.69x)  4k..128k 1.156->0.696 (1.66x)
+//   rows=1   mx=1+mma=1: 1.140 -> 0.694 (1.64x)  128k 1.172->0.726 (1.62x)
+//   rows=256 mma=0: 14.292 -> 6.669 (2.14x) 128k 16.691->7.844 (2.13x)
+//   rows=256 mma=1: 2.314 -> 1.390 (1.67x)  128k 2.556->1.585 (1.61x)
+//   rows=256 mx=1+mma=1: 2.341 -> 1.461 (1.60x) 128k 2.592->1.731 (1.50x)
+// The whole gain is the MODE split: the split-only tree (f7fb60fd, pre-C.3a)
+// already measures within 1 % of HEAD, so C.3a's pipelined fp8 gather
+// contributes ~0 to the warp kernel. SASS: MODE 0 11,888 insns (REG 244),
+// MODE 1 9,656 (REG 254) vs the unified kernel's single ~22,000-instruction
+// REG-255 body -- the per-instantiation footprint is the lever (occupancy is
+// smem-bound at 5 blocks/SM either way).
+//
+// Measured (GB10 sm_121a, Release, median of 5 reps, ms per launch, this
+// bench's --warp mode; "unified" = the pre-MODE-split kernel at f2552271,
+// "split" = the template<int MODE> kernel at f7fb60fd+):
+//   rows=1   mma=0: 7.155 -> 3.398 (2.11x)  4k..128k 7.155->3.406 (2.10x)
+//   rows=1   mma=1: 1.128 -> 0.669 (1.69x)  4k..128k 1.156->0.696 (1.66x)
+//   rows=1   mx=1+mma=1: 1.140 -> 0.694 (1.64x)  128k 1.172->0.726 (1.62x)
+//   rows=256 mma=0: 14.292 -> 6.669 (2.14x) 128k 16.691->7.844 (2.13x)
+//   rows=256 mma=1: 2.314 -> 1.390 (1.67x)  128k 2.556->1.585 (1.61x)
+//   rows=256 mx=1+mma=1: 2.341 -> 1.461 (1.60x) 128k 2.592->1.731 (1.50x)
+// The whole gain is the MODE split: the split-only tree (f7fb60fd, pre-C.3a)
+// already measures within 1 % of HEAD, so C.3a's pipelined fp8 gather
+// contributes ~0 to the warp kernel. SASS: MODE 0 11,888 insns (REG 244),
+// MODE 1 9,656 (REG 254) vs the unified kernel's single ~22,000-instruction
+// REG-255 body -- the per-instantiation footprint is the lever (occupancy is
+// smem-bound at 5 blocks/SM either way).
+//
+// Measured (GB10 sm_121a, Release, median of 5 reps, ms per launch, this
+// bench's --warp mode; "unified" = the pre-MODE-split kernel at f2552271,
+// "split" = the template<int MODE> kernel at f7fb60fd+):
+//   rows=1   mma=0: 7.155 -> 3.398 (2.11x)  4k..128k 7.155->3.406 (2.10x)
+//   rows=1   mma=1: 1.128 -> 0.669 (1.69x)  4k..128k 1.156->0.696 (1.66x)
+//   rows=1   mx=1+mma=1: 1.140 -> 0.694 (1.64x)  128k 1.172->0.726 (1.62x)
+//   rows=256 mma=0: 14.292 -> 6.669 (2.14x) 128k 16.691->7.844 (2.13x)
+//   rows=256 mma=1: 2.314 -> 1.390 (1.67x)  128k 2.556->1.585 (1.61x)
+//   rows=256 mx=1+mma=1: 2.341 -> 1.461 (1.60x) 128k 2.592->1.731 (1.50x)
+// The whole gain is the MODE split: the split-only tree (f7fb60fd, pre-C.3a)
+// already measures within 1 % of HEAD, so C.3a's pipelined fp8 gather
+// contributes ~0 to the warp kernel. SASS: MODE 0 11,888 insns (REG 244),
+// MODE 1 9,656 (REG 254) vs the unified kernel's single ~22,000-instruction
+// REG-255 body -- the per-instantiation footprint is the lever (occupancy is
+// smem-bound at 5 blocks/SM either way).
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
