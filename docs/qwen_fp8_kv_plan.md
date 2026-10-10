@@ -367,17 +367,24 @@ Gate order: unit → parity → memory → bench → A/B.
 
 ## 6. Definition of done
 
-- [ ] `engine.kv_dtype: "fp8"` boots the Qwen lane; `make gate` (in
-      `~/work/dgpp-gateway`) passes within the FP8 tolerance band.
-- [ ] bf16 lane bitwise-unchanged (baseline A/B matches).
-- [ ] Memory plan shows the pool line drop 13.81 → ~7.41 GiB/rank; a larger
-      `kv_capacity` (or 8 slots @ 256K) fits.
-- [ ] `make ab` record for the fp8 lane in `results/`.
-- [ ] **Docs:** update the `README.md:451` row ("Qwen, GLM-4.7 and DeepSeek K/V
-      caches remain BF16") and `docs/operations.md` to reflect the new Qwen
-      `kv_dtype` knob.
-- [ ] (Phase B) native FP8-MMA attention merged, within its tolerance band,
-      decode-neutral-or-faster vs Phase A.
+Phase A is **functionally complete** (2026-10-10). Status per item:
+
+- [x] `engine.kv_dtype: "fp8"` boots the Qwen lane (verified: pool **7.41 GiB**);
+      `make gate` passes (API ALL OK, 4/4 prompts). **Caveat:** the greedy
+      transcript **diverges** from bf16 (semantically equivalent paraphrases) —
+      the lossy-KV argmax flip; not token-identical (see §7.3).
+- [x] bf16 path bitwise-unchanged **at the kernel level** (`qsa_test` 12/12; the
+      fp8 code is gated on non-null scales, and the fused K kernel is bitwise
+      the chain it replaces). ⚠️ the **end-to-end same-binary A/B** is open (§7.1).
+- [x] Memory plan 13.81 → **7.41 GiB/rank** (verified in the boot log).
+- [ ] `make ab` record in `results/` — **not captured** (the run was interrupted
+      after serve_load + bench). Re-run when a full record is wanted.
+- [x] Docs: the `README.md` row and `docs/operations.md` updated.
+- [ ] (Phase B) native FP8-MMA attention — a **separate phase**, not started.
+
+**Performance (C1, same session):** prose 50.2 (serial gather) → 50.7
+(vectorized) → **53.2** (zero-copy K + single-read append), against the bf16 base
+**53.3** — i.e. fp8 is now neutral at C1 with the 1.86x pool. See §7.2.
 
 ## 7. Open items (2026-10-10, post-Phase-A)
 
