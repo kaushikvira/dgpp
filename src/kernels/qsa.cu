@@ -10,6 +10,7 @@
 
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
+#include "kernels/fp8_gemv.cuh"
 #include "kernels/latent_format.hpp"
 #include "kernels/topk_select.cuh"
 
@@ -26,6 +27,18 @@ __device__ inline float2 bf16x2_to_float2_q(uint32_t v) {
   lo.x = static_cast<unsigned short>(v & 0xFFFFu);
   hi.x = static_cast<unsigned short>(v >> 16);
   return __bfloat1622float2(__nv_bfloat162(__nv_bfloat16(lo), __nv_bfloat16(hi)));
+}
+
+// Two e4m3 codes -> two bf16, one hardware e4m3->f16 conversion
+// (fp8_gemv::e4m3x2_to_float2) + one fp32 multiply each + a bf16 rounding: the
+// exact op sequence latent_fp8_decode_bf16 does per code, half the
+// instructions. Bit-identical for every finite e4m3 value (they fit entirely
+// in f16); the only divergence is the NaN payload, which stored K/V codes
+// never carry (the quantizer saturates). The low code lands in the low bf16.
+__device__ __forceinline__ uint32_t decode_fp8x2_bf16(uint16_t codes, float scale) {
+  const float2 v = fp8_gemv::e4m3x2_to_float2(codes);
+  return static_cast<uint32_t>(float_to_bf16_bits(v.x * scale)) |
+         (static_cast<uint32_t>(float_to_bf16_bits(v.y * scale)) << 16);
 }
 
 // Block sum over one value per thread (blockDim <= 1024): warp trees, then
@@ -805,10 +818,18 @@ __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_ro
         const uint8_t* src = (which == 0 ? k8 : v8) + phys * width + kvh * D + c;
         const float sc = (which == 0 ? k_scale : v_scale)[phys * kv_heads + kvh];
         uint16_t* dst = (which == 0 ? kt : vt) + tt * kRowStride + c;
+        // The hardware e4m3 -> f16 pair decode (decode_fp8x2_bf16): eight
+        // 2-code conversions replace sixteen per-byte software decodes. Bitwise
+        // latent_fp8_decode_bf16 for every finite code, so the bf16 smem tiles
+        // and everything downstream are byte-for-byte unchanged.
         const uint4 v4 = *reinterpret_cast<const uint4*>(src);
-        const uint8_t* b = reinterpret_cast<const uint8_t*>(&v4);
+        const uint32_t* c32 = reinterpret_cast<const uint32_t*>(&v4);
+        uint32_t* d32 = reinterpret_cast<uint32_t*>(dst);
 #pragma unroll
-        for (int j = 0; j < 16; ++j) dst[j] = latent_fp8_decode_bf16(b[j], sc);
+        for (int j = 0; j < 4; ++j) {
+          d32[2 * j] = decode_fp8x2_bf16(static_cast<uint16_t>(c32[j] & 0xFFFFu), sc);
+          d32[2 * j + 1] = decode_fp8x2_bf16(static_cast<uint16_t>(c32[j] >> 16), sc);
+        }
       }
       __syncthreads();
       scores_phase(n);

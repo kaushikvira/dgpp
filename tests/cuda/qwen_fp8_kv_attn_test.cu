@@ -29,6 +29,7 @@
 #include "common/test.hpp"
 #include "kda_test_helpers.hpp"
 #include "kernels/dsa.hpp"
+#include "kernels/fp8_gemv.cuh"
 #include "kernels/latent_format.hpp"
 #include "kernels/qsa.hpp"
 
@@ -436,6 +437,54 @@ DGPP_TEST(qwen_fp8_kv_fused_norm_rope_append_matches_chain) {
   require_bitwise("fused K scales", ksA_h.data(), ksB_h.data(), ksA_h.size() * sizeof(float));
   require_bitwise("fused V codes", vcA_h.data(), vcB_h.data(), nbytes);
   std::printf("[fp8-kv] FUSED norm+RoPE+quantize == norm_rope+append (bitwise): K codes, K scales, V codes\n");
+}
+
+// The decode branch's dequant (qsa.cu, the fp8 attention partials) now uses the
+// hardware e4m3 -> f16 pair path (fp8_gemv::e4m3x2_to_float2, 2 codes per
+// instruction) in place of the per-byte software decoder. For the Phase A
+// isolation property to hold, the two must agree BITWISE on every code (the
+// only permitted divergence is the NaN payload, which stored K/V codes never
+// carry), so the bf16 smem tiles and everything downstream are unchanged.
+__global__ void hw_pair_decode_kernel(const uint8_t* codes, uint16_t* hw, uint16_t* sw, int pairs,
+                                      float scale) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= pairs) return;
+  const uint8_t c0 = codes[2 * i], c1 = codes[2 * i + 1];
+  const float2 v =
+      dgpp::fp8_gemv::e4m3x2_to_float2(static_cast<uint16_t>(c0) | (static_cast<uint16_t>(c1) << 8));
+  hw[2 * i] = dgpp::float_to_bf16_bits(v.x * scale);
+  hw[2 * i + 1] = dgpp::float_to_bf16_bits(v.y * scale);
+  sw[2 * i] = dgpp::latent_fp8_decode_bf16(c0, scale);
+  sw[2 * i + 1] = dgpp::latent_fp8_decode_bf16(c1, scale);
+}
+
+DGPP_TEST(qwen_fp8_kv_hw_decode_matches_software_bitwise) {
+  cudaStream_t st = test_stream();
+  const float scales[] = {0.5f, 1.0f, 3.7f, 1.0f / 448.0f};
+  for (float scale : scales) {
+    std::vector<uint8_t> codes(256);
+    for (int i = 0; i < 256; ++i) codes[static_cast<size_t>(i)] = static_cast<uint8_t>(i);
+    DevBuf dc = up(codes);
+    DevBuf hw(256 * 2), sw(256 * 2);
+    hw_pair_decode_kernel<<<2, 128, 0, st>>>(ptr<uint8_t>(dc), mptr<uint16_t>(hw),
+                                             mptr<uint16_t>(sw), 128, scale);
+    DGPP_CUDA_OK(cudaStreamSynchronize(st));
+    const auto h = down<uint16_t>(hw, 256), s = down<uint16_t>(sw, 256);
+    int mismatch = 0, nan_codes = 0;
+    for (int i = 0; i < 256; ++i) {
+      const float hf = dgpp::bf16_bits_to_float(h[static_cast<size_t>(i)]);
+      const float sf = dgpp::bf16_bits_to_float(s[static_cast<size_t>(i)]);
+      if (std::isnan(hf) || std::isnan(sf)) {
+        require(std::isnan(hf) == std::isnan(sf), "the hw and software NaN codes disagree");
+        ++nan_codes;
+      } else if (h[static_cast<size_t>(i)] != s[static_cast<size_t>(i)]) {
+        ++mismatch;
+      }
+    }
+    std::printf("[fp8-kv] hw e4m3x2 decode vs software (scale %.6g): %d/256 mismatches, %d NaN codes\n",
+                scale, mismatch, nan_codes);
+    require(mismatch == 0, "the hardware e4m3 pair decode diverges from the software decoder");
+  }
 }
 
 int main() { return dgpp::test::run_all(); }
