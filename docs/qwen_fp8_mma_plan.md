@@ -203,7 +203,7 @@ Q·Kᵀ loop `:192-194`; the P·V loop `:243-245`). Phase B is a dtype swap of t
 scaffold to E4M3, **not** a new lowering. The bf16 path (scales null) is
 byte-for-byte unchanged; the E4M3 path is a new branch gated on
 `k_scale != nullptr` **and** the `DGPP_QSA_FP8_MMA` toggle (default ON, mirroring
-`DGPP_QSA_WARP` at `layers.cpp:819`). The toggle decouples the E4M3 *attention*
+`DGPP_QSA_WARP` at `layers.cpp:815`). The toggle decouples the E4M3 *attention*
 from the fp8 *pool*: `DGPP_QSA_FP8_MMA=0` keeps the Phase A dequant path (and
 the pool win) while skipping Phase B, so short- and long-context can be A/B'd
 independently and the short-context loss can be switched off without giving up
@@ -295,7 +295,7 @@ switch to the tile-common V rescale.
 | `src/kernels/qsa_warp.cu` | the E4M3 branch (gated on `k_scale != nullptr`): Q A-fragment quantize + `α`; K/V E4M3 smem tiles; `mma m16n8k32 e4m3` for both MMAs; the `α·βᵏ` score + `γ` PV epilogues; P V-weighted quantize + `γ`; PV 32-k padding. Update the `:8-9` doc (the only pin B.1 replaces, §4). bf16 path unchanged. |
 | `src/kernels/qsa.hpp` | **no change** — the `:140-141,155` pins are on the partial kernels and stand (§4); the warp declaration's doc already says tolerance-equal. (`k_scale`/`v_scale` params already exist on `qsa_attn_prefill_warp`.) |
 | `tests/cuda/qwen_fp8_mma_attn_test.cu` | **new**: the §7 study + the kernel band test. |
-| `src/models/qwen/layers.cpp` | read the `DGPP_QSA_FP8_MMA` env (default ON, the `DGPP_QSA_WARP` pattern at `:819`); the E4M3 warp path runs only when the fp8 pool is active **and** the toggle is on. |
+| `src/models/qwen/layers.cpp` | read the `DGPP_QSA_FP8_MMA` env (default ON, the `DGPP_QSA_WARP` pattern at `:815`); the E4M3 warp path runs only when the fp8 pool is active **and** the toggle is on. |
 | `tests/cuda/qwen_fp8_kv_attn_test.cu` | widen the warp-path assertion `0.0625 → 0.10` (the §3 band). |
 | `CMakeLists.txt` | register the new test (implementation step, noted here). |
 
