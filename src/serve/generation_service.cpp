@@ -628,6 +628,24 @@ GenerationService::GenerationService(const ServiceConfig& cfg,
           : cfg_.reasoning_in_content ? "folded into content"
                                       : "on reasoning_content");
   DGPP_LOG_INFO("serve: default chat template kwargs {}", cfg_.default_chat_template_kwargs);
+  // The token-capture instrument (the header's note; the n-gram copy
+  // drafter's Phase 0 study): append one JSON line per retired request.
+  if (const char* dump_path = std::getenv("DGPP_DUMP_TOKENS");
+      dump_path != nullptr && *dump_path != '\0') {
+    token_dump_out_.open(dump_path, std::ios::out | std::ios::app);
+    if (!token_dump_out_) {
+      // A peer rank inherits the head's DGPP_* environment (dgpp-cluster
+      // forwards every DGPP_* knob) and stages no capture — the path may not
+      // exist on its filesystem. A measurement knob must never take a boot
+      // down, so an unusable path disables the instrument loudly instead.
+      DGPP_LOG_WARN("serve: DGPP_DUMP_TOKENS is not writable ({}); the token dump stays off",
+                    dump_path);
+    } else {
+      token_dump_armed_ = true;
+      DGPP_LOG_INFO("serve: dumping prompt and committed token ids to {} (a capture run: "
+                    "the copy and the write perturb latency)", dump_path);
+    }
+  }
   // The SSE tap: tokens and retires ride the scheduler's observer
   // callbacks straight into the request records.
   sched_.set_observer(this);
@@ -2151,6 +2169,7 @@ void GenerationService::route_chat_completions(const HttpRequest& req,
     if (const auto* metadata = optional_field(body, "metadata"))
       record->metadata = dgpp::text::json_text_of(*metadata);
     record->prompt_tokens = static_cast<int>(prompt.size());
+    if (token_dump_armed_) record->prompt_ids = prompt;
     record->parser = std::make_unique<ToolCallParser>(
         markers_,
         [this](const std::vector<int64_t>& ids) {
@@ -2336,6 +2355,7 @@ void GenerationService::route_completions(const HttpRequest& req,
   record->include_usage = include_usage;
   record->include_obfuscation = false;
   record->prompt_tokens = static_cast<int>(ids.size());
+  if (token_dump_armed_) record->prompt_ids = ids;
   record->writer = &w;
   w.set_stream_tag(record->tag);
 
@@ -3262,8 +3282,56 @@ void GenerationService::observe_token_pass(StreamRecord& r, std::chrono::steady_
   r.last_pass_tokens = r.ids.size();
 }
 
+// The token dump's line (the header's DGPP_DUMP_TOKENS note): the exact ids
+// the request carried and committed, with the scheduler's step count and
+// reason. One JSON object per line, built under mutex_ — it reads a live
+// record and must not be built while another thread touches it.
+std::string GenerationService::token_dump_line(
+    const StreamRecord& r, const dgpp::sched::Scheduler::Result& result) const {
+  std::string out = "{\"id\":";
+  append_json_string(&out, r.id);
+  out.append(",\"sched_id\":");
+  append_json_string(&out, r.sched_id);
+  out.append(",\"choice\":");
+  append_json_int(&out, r.choice);
+  out.append(",\"chat\":");
+  out.append(r.chat ? "true" : "false");
+  out.append(",\"stream\":");
+  out.append(r.stream ? "true" : "false");
+  out.append(",\"prompt_tokens\":");
+  append_json_int(&out, r.prompt_tokens);
+  out.append(",\"steps_done\":");
+  append_json_int(&out, result.steps_done);
+  out.append(",\"reason\":");
+  append_json_int(&out, static_cast<int>(result.reason));
+  const auto ids = [&out](std::string_view key, const std::vector<int64_t>& v) {
+    out.push_back(',');
+    append_json_string(&out, key);
+    out.push_back(':');
+    out.push_back('[');
+    for (size_t i = 0; i < v.size(); ++i) {
+      if (i != 0) out.push_back(',');
+      append_json_int(&out, v[i]);
+    }
+    out.push_back(']');
+  };
+  ids("prompt_ids", r.prompt_ids);
+  ids("ids", r.ids);  // committed, a stop string's cut tokens included
+  out.append("}\n");
+  return out;
+}
+
+void GenerationService::write_token_dump(const std::string& line) {
+  // Its own lock, never mutex_: the retiring thread is the only writer per
+  // record and a dozen lines a second is the whole load.
+  std::lock_guard<std::mutex> lock(token_dump_mutex_);
+  token_dump_out_ << line;
+  token_dump_out_.flush();  // a killed capture run keeps every line
+}
+
 void GenerationService::on_retire(const std::string& id,
                                  const Scheduler::Result& result) {
+  std::string dump_line;  // built under mutex_, written after it (the instrument)
   {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& r : records_) {
@@ -3315,9 +3383,11 @@ void GenerationService::on_retire(const std::string& id,
         r->group->counted_pool = true;
         ++stats_.requests_shed_pool;
       }
+      if (token_dump_armed_) dump_line = token_dump_line(*r, result);
       break;
     }
   }
+  if (!dump_line.empty()) write_token_dump(dump_line);
   if (result.reason == Scheduler::Result::Reason::kPoolExhausted)
     DGPP_LOG_WARN("serve: request '{}' cut short at KV pool exhaustion after {} "
                   "tokens (finish_reason length; grow-on-demand shed)",

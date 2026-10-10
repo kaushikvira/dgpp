@@ -18,9 +18,20 @@ agent's summary or memory calls). --mutate-system-at T appends a line to
 the system prompt before turn T (a saved memory injected by the client):
 the turn must miss and the server's INFO line must name the divergence.
 Per request: prompt, cached and computed tokens, TTFT, completion tokens,
-the decode pace, the finish reason, the tool called; a summary per stream
-and per turn; the misses listed. Artifacts: OUT/requests.jsonl, summary.txt.
+the decode pace, the finish reason, the tool called, and the response id;
+a summary per stream and per turn; the misses listed. Artifacts:
+OUT/requests.jsonl, summary.txt.
 Exit status: nonzero when a turn that should have hit did not.
+
+Exact token capture (2026-10-10). The response id recorded here joins the
+turn to the serving process's token dump, which is the ground truth an
+offline drafter study replays (the n-gram copy drafter's Phase 0 gate):
+    DGPP_DUMP_TOKENS=$OUT/tokens.jsonl dgpp-serve ...
+    serve_agentic_streams.py HOST PORT ... --out $OUT
+Each dump line carries that request's exact prompt ids (the rendered
+template) and committed ids, keyed by the same `id` this script writes as
+`response_id` — the tokenizer's real ids, not a re-encoding of the text.
+Only arm the dump for a capture run: it perturbs latency.
 """
 import argparse
 import http.client
@@ -89,7 +100,7 @@ TOOLS = [
 
 def post_stream(body):
     """Streams a chat completion; returns (status, content, reasoning,
-    tool_calls, usage, finish, t_first, t_last, n_deltas)."""
+    tool_calls, usage, finish, rid, t_first, t_last, n_deltas)."""
     conn = http.client.HTTPConnection(args.host, args.port, timeout=1800)
     t0 = time.time()
     conn.request("POST", "/v1/chat/completions", json.dumps(body),
@@ -98,8 +109,8 @@ def post_stream(body):
     if resp.status != 200:
         raw = resp.read().decode("utf-8", "replace")
         conn.close()
-        return resp.status, raw, "", [], None, None, None, None, 0
-    content, reasoning, usage, finish = "", "", None, None
+        return resp.status, raw, "", [], None, None, "", None, None, 0
+    content, reasoning, usage, finish, rid = "", "", None, None, ""
     calls = {}
     t_first = t_last = None
     n_deltas = 0
@@ -118,6 +129,8 @@ def post_stream(body):
                 if payload == "[DONE]":
                     continue
                 ev = json.loads(payload)
+                if ev.get("id") and not rid:
+                    rid = ev["id"]
                 if ev.get("usage"):
                     usage = ev["usage"]
                 for ch in ev.get("choices", []):
@@ -144,7 +157,7 @@ def post_stream(body):
                         finish = ch["finish_reason"]
     conn.close()
     tool_calls = [calls[k] for k in sorted(calls)]
-    return 200, content, reasoning, tool_calls, usage, finish, (t_first or t0) - t0, \
+    return 200, content, reasoning, tool_calls, usage, finish, rid, (t_first or t0) - t0, \
         ((t_last - t_first) if (t_first and t_last) else 0.0), n_deltas
 
 
@@ -167,9 +180,10 @@ def side_request(stream, turn, rng):
             "messages": [{"role": "user", "content": "Summarize in one line: " + words(rng, 120)}],
             "stream": True, "stream_options": {"include_usage": True}}
     t0 = time.time()
-    st, content, reasoning, calls, usage, finish, ttft, dec, nd = post_stream(body)
+    st, content, reasoning, calls, usage, finish, rid, ttft, dec, nd = post_stream(body)
     u = usage or {}
     record({"stream": stream, "kind": "side", "turn": turn, "status": st,
+            "response_id": rid,
             "prompt_tokens": u.get("prompt_tokens", 0),
             "cached_tokens": (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0),
             "computed": u.get("prompt_tokens", 0) - (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0),
@@ -203,7 +217,7 @@ def run_stream(idx):
             body["tools"] = TOOLS
             body["tool_choice"] = "required"
         t0 = time.time()
-        st, content, reasoning, calls, usage, finish, ttft, dec, nd = post_stream(body)
+        st, content, reasoning, calls, usage, finish, rid, ttft, dec, nd = post_stream(body)
         if st != 200:
             with lock:
                 failures.append("%s turn %d: HTTP %s %s" % (name, turn, st, str(content)[:200]))
@@ -213,6 +227,7 @@ def run_stream(idx):
         cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
         expected_hit = turn > 1 and not (args.mutate_system_at and turn == args.mutate_system_at)
         rec = {"stream": name, "kind": "turn", "turn": turn, "status": st,
+               "response_id": rid,
                "prompt_tokens": u.get("prompt_tokens", 0), "cached_tokens": cached,
                "computed": u.get("prompt_tokens", 0) - cached,
                "prev_prompt_tokens": prev_prompt,

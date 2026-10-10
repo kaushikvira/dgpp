@@ -1,5 +1,7 @@
 #pragma once
+#include <fstream>
 #include <future>
+#include <mutex>
 #include <optional>
 #include "serve/file_inputs.hpp"
 
@@ -480,6 +482,9 @@ class GenerationService : public HttpHandler,
     size_t content_span_cursor = 0;
     size_t lps_flushed = 0;    // streaming: entries already sent
     std::vector<int64_t> ids;  // generated so far
+    // The prompt's ids: kept only when the token dump is armed
+    // (DGPP_DUMP_TOKENS — see the instrument at the class's tail).
+    std::vector<int64_t> prompt_ids;
     // Legacy completions: the suffix-diff text path.
     std::string text;          // decoded so far (the suffix-diff base)
     std::string delta;         // unflushed text delta (the ring)
@@ -637,6 +642,27 @@ class GenerationService : public HttpHandler,
   // Engine-thread-only (set once before the loop, read in the observer
   // callbacks, which the scheduler invokes on the engine thread).
   dgpp::sched::SchedulerObserver* audit_ = nullptr;
+
+  // The token-capture instrument (DGPP_DUMP_TOKENS=<path>, 2026-10-10):
+  // one JSON line per retired request carrying the exact prompt and
+  // committed token ids. It is the ground truth an offline drafter study
+  // replays (2026-10-09: how much of our own agentic traffic a suffix
+  // match can copy, the Phase 0 gate of the n-gram copy drafter), so it is
+  // a measurement sink, never a serving feature: unset, no ids are copied
+  // into the records and nothing is written. Each line's `id` is the
+  // response id every chat chunk carries (`chatcmpl-<tag>`), which is how
+  // a client joins its turns to the lines; `ids` are the committed tokens
+  // including the ones a stop string cut from the text (the engine's
+  // transcript, not the visible answer). Arm it only for a capture run:
+  // the copy and the write perturb latency.
+  bool token_dump_armed_ = false;
+  // Guards token_dump_out_ alone and is never taken with mutex_: the line
+  // is built under mutex_ (it reads a live record) and written without it.
+  std::mutex token_dump_mutex_;
+  std::ofstream token_dump_out_;
+  std::string token_dump_line(const StreamRecord& r,
+                              const dgpp::sched::Scheduler::Result& result) const;
+  void write_token_dump(const std::string& line);
 
   // Everything below lives under mutex_ (the one lock, held briefly).
   struct PendingAdmission {

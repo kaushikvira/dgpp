@@ -4530,6 +4530,104 @@ DGPP_TEST(serve_edge_malformedModelCustomOutputTerminatesWithError) {
           stream.find(R"("finish_reason":"tool_calls")") == std::string::npos, "stream emits terminal error and DONE");
 }
 
+DGPP_TEST(serve_tokenDump_capturesExactPromptAndCommittedIds) {
+  // The token-capture instrument (DGPP_DUMP_TOKENS): one JSON line per
+  // retired request with the exact prompt and committed token ids — the
+  // ground truth an offline drafter study replays. The ids must be the
+  // engine's own (fake_token over the prompt's length), never the visible
+  // text re-encoded, and the line must join to the client by its id.
+  std::string directory = "/tmp/dgpp-token-dump-test-XXXXXX";
+  require(mkdtemp(directory.data()) != nullptr, "temporary token dump directory");
+  struct Cleanup {
+    std::string path;
+    ~Cleanup() {
+      unsetenv("DGPP_DUMP_TOKENS");
+      std::error_code ec;
+      std::filesystem::remove_all(path, ec);
+    }
+  } cleanup{directory};
+  const std::string dump = directory + "/tokens.jsonl";
+  require(setenv("DGPP_DUMP_TOKENS", dump.c_str(), 1) == 0, "arm the token dump");
+  {
+    ServiceRig rig;
+    Client client(rig.port());
+    // The legacy route's prompt is exactly its bytes, so "abcde" is five
+    // ids and the fake's early-EOS lengths (len % 4 == 3, == 2) are out.
+    post_completion(client, /*chat=*/false, "");
+    const auto response = client.read_until("\"usage\"", 3000);
+    require(response.find("200 OK") != std::string::npos, "the request is served");
+    std::string line;
+    for (int i = 0; i < 200 && line.empty(); ++i) {
+      // The line is written by on_retire, ahead of the terminal chunk.
+      std::ifstream in(dump);
+      if (in) std::getline(in, line);
+      if (line.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    require(!line.empty(), "the retired request left one dump line");
+    const auto parsed = dgpp::minijson::parse(line);
+    require(parsed.root.is_object() && parsed.root.at("prompt_tokens").as_int() == 5,
+            "the line names the prompt's length");
+    require(parsed.root.at("steps_done").as_int() == 3, "the line names the committed steps");
+    require(!parsed.root.at("chat").as_bool() && !parsed.root.at("stream").as_bool(),
+            "the line names the route");
+    require(parsed.root.at("id").as_string().substr(0, 5) == "cmpl-",
+            "the line joins to the response by its id");
+    const auto& prompt_ids = parsed.root.at("prompt_ids").items();
+    require(prompt_ids.size() == 5, "every prompt id is dumped");
+    for (size_t i = 0; i < prompt_ids.size(); ++i)
+      require(prompt_ids[i].as_int() == static_cast<int64_t>("abcde"[i]),
+              "the prompt's ids are the encoded prompt, in order");
+    const auto& ids = parsed.root.at("ids").items();
+    require(ids.size() == 3, "every committed id is dumped");
+    for (size_t i = 0; i < ids.size(); ++i)
+      require(ids[i].as_int() == fake_token(prompt_ids.size(), static_cast<int>(i)),
+              "the committed ids are the engine's own, not the text's re-encoding");
+    // The agentic bench's own shape: chat + stream. The prompt length is
+    // the template's (so only its relation is asserted), the response id is
+    // the chatcmpl- one the client's chunks carry, and the committed ids
+    // are still the engine's own at that prompt length.
+    Client chat_client(rig.port());
+    post_completion(chat_client, /*chat=*/true,
+                    ",\"stream\":true,\"stream_options\":{\"include_usage\":true}");
+    const auto streamed = chat_client.read_until("[DONE]", 3000);
+    require(streamed.find("200 OK") != std::string::npos, "the chat stream is served");
+    std::string second;
+    for (int i = 0; i < 200 && second.empty(); ++i) {
+      std::ifstream in(dump);
+      std::getline(in, line);
+      std::getline(in, second);
+      if (second.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    require(!second.empty(), "the chat stream leaves its own line");
+    const auto chat = dgpp::minijson::parse(second);
+    require(chat.root.at("id").as_string().substr(0, 9) == "chatcmpl-",
+            "the chat line joins by the id its chunks carry");
+    require(chat.root.at("chat").as_bool() && chat.root.at("stream").as_bool(),
+            "the chat line names its route");
+    const auto& chat_prompt = chat.root.at("prompt_ids").items();
+    require(static_cast<int>(chat_prompt.size()) == chat.root.at("prompt_tokens").as_int(),
+            "the chat line carries every rendered prompt id");
+    const auto& chat_ids = chat.root.at("ids").items();
+    require(static_cast<int>(chat_ids.size()) == chat.root.at("steps_done").as_int(),
+            "the chat line carries every committed id");
+    for (size_t i = 0; i < chat_ids.size(); ++i)
+      require(chat_ids[i].as_int() == fake_token(chat_prompt.size(), static_cast<int>(i)),
+              "the chat's committed ids are the engine's own");
+  }
+  // A peer rank inherits the head's DGPP_* environment (dgpp-cluster forwards
+  // every knob) and stages no capture: a path it cannot open must leave the
+  // service serving, never take the boot down. The instrument self-disables.
+  require(setenv("DGPP_DUMP_TOKENS", "/nonexistent-dir/tokens.jsonl", 1) == 0,
+          "arm the token dump on an unusable path");
+  {
+    ServiceRig rig;
+    Client client(rig.port());
+    post_completion(client, /*chat=*/false, "");
+    require(client.read_until("\"usage\"", 3000).find("200 OK") != std::string::npos,
+            "an unusable dump path still serves");
+  }
+}
+
 namespace {
 
 size_t require_stream_preamble(const std::string& response, bool chat, int choice = 0) {
