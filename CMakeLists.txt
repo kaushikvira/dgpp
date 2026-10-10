@@ -1104,6 +1104,12 @@ target_link_libraries(qwen_fp8_kv_attn_test PRIVATE dgpp_models_qwen dgpp_kernel
 dgpp_set_common(qwen_fp8_kv_attn_test)
 add_test(NAME qwen_fp8_kv_attn_test COMMAND qwen_fp8_kv_attn_test)
 
+add_executable(qwen_fp8_mma_attn_test tests/cuda/qwen_fp8_mma_attn_test.cu)
+target_include_directories(qwen_fp8_mma_attn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(qwen_fp8_mma_attn_test PRIVATE dgpp_models_qwen dgpp_kernels CUDA::cudart Threads::Threads)
+dgpp_set_common(qwen_fp8_mma_attn_test)
+add_test(NAME qwen_fp8_mma_attn_test COMMAND qwen_fp8_mma_attn_test)
+
 add_executable(qwen_ple_test tests/cuda/qwen_ple_test.cu)
 target_include_directories(qwen_ple_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(qwen_ple_test PRIVATE dgpp_models_qwen dgpp_kernels CUDA::cudart Threads::Threads)

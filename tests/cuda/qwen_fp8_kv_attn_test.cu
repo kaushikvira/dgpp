@@ -248,7 +248,9 @@ DGPP_TEST(qwen_fp8_kv_attention_sample_match) {
               "match(<=2^-4) %.2f%%  match(<=2^-3) %.2f%%\n",
               n, s.l2_rel, s.max_abs, match_frac(0.0625), match_frac(0.125));
   // Necessary-condition bound: the output is a weighted average of V rows each
-  // within 2^-4 relative, so the output's l2_rel cannot exceed 2^-4.
+  // within 2^-4 relative, so the output's l2_rel cannot exceed 2^-4. This test
+  // runs the PARTIAL kernel over bf16 caches (the e4m3 round-trip is on the
+  // host), so the FP8-MMA path (DGPP_QSA_FP8_MMA) does not touch it.
   require(s.l2_rel <= 0.0625,
           "fp8 attention output l2_rel exceeds the 2^-4 necessary-condition bound");
 }
@@ -366,7 +368,11 @@ DGPP_TEST(qwen_fp8_kv_real_path_matches_bf16) {
     const Stats sw = compare_abs_rel(gwf.data(), rwf.data(), n, 0.0);
     std::printf("[fp8-kv] REAL PATH warp prefill kernel vs bf16: l2_rel %.4f  max_abs %.4g\n",
                 sw.l2_rel, sw.max_abs);
-    require(sw.l2_rel <= 0.0625, "fp8 real-path warp prefill l2_rel exceeds the 2^-4 bound");
+    // The warp prefill kernel runs the FP8-MMA path by default (plan §5): P is
+    // e4m3-quantized too (V-weighted, plan §2.3), so the band is the FP8-MMA
+    // one (~0.10), not the V-only 2^-4 bound. DGPP_QSA_FP8_MMA=0 restores the
+    // Phase A dequant (~0.037).
+    require(sw.l2_rel <= 0.10, "fp8 real-path warp prefill l2_rel exceeds the FP8-MMA band");
   }
 }
 

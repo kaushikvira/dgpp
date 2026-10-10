@@ -811,6 +811,15 @@ void QwenQsaLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows& row
   // (kernels/qsa_warp.cu), which writes c_out directly -- the shape and the
   // bf16-probability numerics SGLang's sparse GQA prefill kernel runs.
   // DGPP_QSA_WARP=0 keeps the partial kernels + combine.
+  //
+  // FP8-MMA attention (plan docs/qwen_fp8_mma_plan.md): when the pool is e4m3
+  // (cache.k_scale / v_scale non-null), the warp kernel runs the Q.K^T and P.V
+  // products on the FP8 tensor cores (mma.sync.m16n8k32.e4m3) directly on the
+  // raw codes -- Q per-row, K/V per-(slot, kv-head) scales folded in the score
+  // epilogue, the V-weighted P absorbed into a per-row power-of-two gamma so the
+  // beta^v cancels (plan §2.3). Default ON; DGPP_QSA_FP8_MMA=0 falls back to
+  // the Phase A in-kernel dequant (bf16 mma) while keeping the fp8 pool.
+  // The toggle is read in the kernel wrapper (qsa_warp.cu), not here.
   static const bool warp_attn = [] {
     const char* e = std::getenv("DGPP_QSA_WARP");
     return !(e != nullptr && e[0] == '0');

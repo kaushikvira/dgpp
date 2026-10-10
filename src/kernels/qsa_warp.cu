@@ -20,9 +20,22 @@
 // is the tensor cores'. Tolerance-equal to qsa_attn_prefill_partial +
 // dsa_attn_combine (qsa_test), not bitwise -- the same class as SGLang's
 // kernel, which also rounds P to bf16.
+//
+// FP8-MMA path (docs/qwen_fp8_mma_plan.md, Phase B): when the fp8 pool is
+// active (k_scale != nullptr) and DGPP_QSA_FP8_MMA is on (default), the stored
+// E4M3 K/V codes are fed straight to the tensor cores (mma m16n8k32 e4m3) with
+// no bf16 dequant: Q is quantized per-row (scale alpha), the score epilogue
+// applies alpha*beta^k (rank-1, plan §2.2), and the V-weighted probability
+// P*beta^v is quantized per-row (power-of-two scale gamma, §2.3) for the PV
+// mma, whose epilogue applies gamma. l still sums the unrounded P. The path is
+// tolerance-equal (the plan §3 band, l2_rel <= 0.10) to the bf16 warp path,
+// not bitwise. DGPP_QSA_FP8_MMA=0 keeps the Phase A in-kernel dequant.
 #include "kernels/qsa.hpp"
 
+#include <cuda_fp8.h>
+
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 
 #include "common/cuda_check.hpp"
@@ -41,6 +54,10 @@ constexpr int kStageElems = 2 * kTileTok * kRow;  // K then V
 #endif
 constexpr int kStages = DGPP_QSA_WARP_STAGES;
 constexpr size_t kSmem = size_t(kStages) * kStageElems * 2;  // bytes
+// The E4M3 tiles: raw 1 B/elem codes, no row padding (8-byte cp.async and the
+// 4-byte B-fragment loads are aligned). K then V, 256 B/token each.
+constexpr int kRow8 = kD;                 // bytes per e4m3 token row
+constexpr size_t kStage8 = 2 * kTileTok * kRow8;  // bytes, one e4m3 stage
 
 __device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* p) {
   const unsigned a = static_cast<unsigned>(__cvta_generic_to_shared(p));
@@ -66,13 +83,37 @@ __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool vali
 __device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
   return static_cast<uint32_t>(float_to_bf16_bits(lo)) | (static_cast<uint32_t>(float_to_bf16_bits(hi)) << 16);
 }
+__device__ __forceinline__ void cp_async8(void* dst, const void* src, bool valid) {
+  const unsigned d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+  const int bytes = valid ? 8 : 0;  // 0: zero-fill
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n" ::"r"(d), "l"(src), "r"(bytes));
+}
+// The E4M3 mma (the fp8_gemm.cu / dsa.cu asset): m16n8k32, 4 e4m3 per A
+// register, 4 e4m3 per B register.
+__device__ __forceinline__ void mma_e4m3(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+  asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
+               "{%8,%9}, {%0,%1,%2,%3};\n"
+               : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+// Four floats -> four E4M3 codes, low to high (the mma A/B fragment order).
+__device__ __forceinline__ uint32_t pack4_e4m3(float a, float b, float c, float d) {
+  const uint32_t lo = __nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3);
+  const uint32_t hi = __nv_cvt_float2_to_fp8x2(make_float2(c, d), __NV_SATFINITE, __NV_E4M3);
+  return lo | (hi << 16);
+}
+// The power-of-two P scale (plan §5.1): 2^ceil(log2(x)), the fp8_block recipe.
+__device__ __forceinline__ float pow2_ceil(float x) {
+  return dgpp::e8m0_byte_to_float(dgpp::e8m0_ceil_log2_byte(x));
+}
 
 __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
     const uint16_t* __restrict__ q, int64_t q_row_stride, const uint16_t* __restrict__ k_cache,
     const uint16_t* __restrict__ v_cache, const float* __restrict__ k_scale,
     const float* __restrict__ v_scale, const int32_t* __restrict__ req_ids, const int32_t* __restrict__ topk,
     int topk_stride, const int32_t* __restrict__ counts, int local_heads, int kv_heads, int block_tokens,
-    const int32_t* __restrict__ block_tables, int blocks_per_request, float scale, float* __restrict__ out) {
+    const int32_t* __restrict__ block_tables, int blocks_per_request, float scale, float* __restrict__ out,
+    int fp8_mma) {
   extern __shared__ __align__(16) uint16_t sm[];
   const int64_t r = blockIdx.x;
   const int kvh = blockIdx.y;
@@ -85,21 +126,71 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
   const int32_t* toks = topk + r * topk_stride;
   const int32_t* bt = block_tables + static_cast<int64_t>(req_ids[r]) * blocks_per_request;
   const float sl2 = scale * 1.4426950408889634f;
+  const bool e8 = fp8_mma && k_scale != nullptr;  // the FP8-MMA path (plan §5)
 
-  // Q A-fragments, 16 k-steps x 4 registers; rows past the group are zero.
+  // Q A-fragments: bf16 16 k-steps x 4 registers; the E4M3 path quantizes the
+  // same rows to 8 k-steps x 4 registers (4 e4m3 each, the m16n8k32 layout)
+  // with the per-row scale alpha (plan §2.1). Rows past the group are zero.
   uint32_t qa[16][4];
+  float alpha0 = 1.f, alpha1 = 1.f;  // E4M3 Q scales, rows g, g + 8
   {
     const uint16_t* q0 = q + r * q_row_stride + static_cast<int64_t>(h0) * kD;
     const bool v0 = g < group, v1 = g + 8 < group;
+    if (e8) {
+      // alpha = absmax/448 over the row's 256 dims (this lane's 64, then the
+      // quad's), the fp8_quantize_rows_kernel recipe done in-warp.
+      float am0 = 0.f, am1 = 0.f;
 #pragma unroll
-    for (int ks = 0; ks < 16; ++ks) {
-      const int c = ks * 16 + 2 * t;
-      qa[ks][0] = v0 ? *reinterpret_cast<const uint32_t*>(q0 + g * kD + c) : 0u;
-      qa[ks][1] = v1 ? *reinterpret_cast<const uint32_t*>(q0 + (g + 8) * kD + c) : 0u;
-      qa[ks][2] = v0 ? *reinterpret_cast<const uint32_t*>(q0 + g * kD + c + 8) : 0u;
-      qa[ks][3] = v1 ? *reinterpret_cast<const uint32_t*>(q0 + (g + 8) * kD + c + 8) : 0u;
+      for (int ks = 0; ks < 8; ++ks) {
+        const int base = ks * 32;
+        const int dims[8] = {base + 4 * t, base + 4 * t + 1, base + 4 * t + 2, base + 4 * t + 3,
+                             base + 16 + 4 * t, base + 16 + 4 * t + 1, base + 16 + 4 * t + 2, base + 16 + 4 * t + 3};
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          if (v0) am0 = fmaxf(am0, fabsf(bf16_bits_to_float(q0[g * kD + dims[j]])));
+          if (v1) am1 = fmaxf(am1, fabsf(bf16_bits_to_float(q0[(g + 8) * kD + dims[j]])));
+        }
+      }
+#pragma unroll
+      for (int o = 1; o <= 2; o <<= 1) {
+        am0 = fmaxf(am0, __shfl_xor_sync(0xffffffffu, am0, o));
+        am1 = fmaxf(am1, __shfl_xor_sync(0xffffffffu, am1, o));
+      }
+      alpha0 = am0 > 0.f ? am0 / 448.f : 1.f;
+      alpha1 = am1 > 0.f ? am1 / 448.f : 1.f;
+      // Pack e4m3(q/alpha) into the m16n8k32 A-fragment (4 e4m3 per register:
+      // a0 = row g k 4t..4t+3, a1 = row g+8, a2/a3 = k +16; the oracle in
+      // qwen_fp8_mma_attn_test pins this mapping, plan §11).
+#pragma unroll
+      for (int ks = 0; ks < 8; ++ks) {
+        const int base = ks * 32;
+        float a[8], b[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const int d = (j < 4) ? base + 4 * t + j : base + 16 + 4 * t + (j - 4);
+          a[j] = v0 ? bf16_bits_to_float(q0[g * kD + d]) / alpha0 : 0.f;
+          b[j] = v1 ? bf16_bits_to_float(q0[(g + 8) * kD + d]) / alpha1 : 0.f;
+        }
+        qa[ks][0] = pack4_e4m3(a[0], a[1], a[2], a[3]);
+        qa[ks][1] = pack4_e4m3(b[0], b[1], b[2], b[3]);
+        qa[ks][2] = pack4_e4m3(a[4], a[5], a[6], a[7]);
+        qa[ks][3] = pack4_e4m3(b[4], b[5], b[6], b[7]);
+      }
+    } else {
+#pragma unroll
+      for (int ks = 0; ks < 16; ++ks) {
+        const int c = ks * 16 + 2 * t;
+        qa[ks][0] = v0 ? *reinterpret_cast<const uint32_t*>(q0 + g * kD + c) : 0u;
+        qa[ks][1] = v1 ? *reinterpret_cast<const uint32_t*>(q0 + (g + 8) * kD + c) : 0u;
+        qa[ks][2] = v0 ? *reinterpret_cast<const uint32_t*>(q0 + g * kD + c + 8) : 0u;
+        qa[ks][3] = v1 ? *reinterpret_cast<const uint32_t*>(q0 + (g + 8) * kD + c + 8) : 0u;
+      }
     }
   }
+
+  // The tile's per-token fp8 scales (lanes 0-15 resolve their token); the
+  // E4M3 epilogues broadcast them with shfl. Set by stage().
+  float my_ks = 0.f, my_vs = 0.f;
 
   // Stage a tile: 16 tokens x (K, V) x 32 16-byte chunks = 1024 chunks, 32 per lane.
   auto stage = [&](int tile, int buf) {
@@ -114,6 +205,30 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
       const int64_t phys = static_cast<int64_t>(bt[tok / block_tokens]) * block_tokens + tok % block_tokens;
       my_phys = phys;
       my_off = phys * width + static_cast<int64_t>(kvh) * kD;
+    }
+    if (e8) {
+      // FP8-MMA: copy the raw e4m3 codes (8 B/chunk, no dequant) into the
+      // 256 B/token smem tiles; the mma below reads the codes directly.
+      // Invalid tokens zero-fill (the PV padding lanes must stay 0).
+      const uint8_t* k8 = reinterpret_cast<const uint8_t*>(k_cache);
+      const uint8_t* v8 = reinterpret_cast<const uint8_t*>(v_cache);
+      uint8_t* kt8 = reinterpret_cast<uint8_t*>(sm) + buf * kStage8;
+      uint8_t* vt8 = kt8 + kTileTok * kRow8;
+      my_ks = 0.f;
+      my_vs = 0.f;
+      if (lane < kTileTok && base + lane < cnt) {
+        my_ks = k_scale[my_phys * kv_heads + kvh];
+        my_vs = v_scale[my_phys * kv_heads + kvh];
+      }
+#pragma unroll
+      for (int i = 0; i < 16; ++i) {  // token i, lane = its 8-byte chunk
+        const int64_t off = __shfl_sync(0xffffffffu, my_off, i) + lane * 8;
+        const bool valid = base + i < cnt;
+        cp_async8(kt8 + i * kRow8 + lane * 8, k8 + off, valid);
+        cp_async8(vt8 + i * kRow8 + lane * 8, v8 + off, valid);
+      }
+      asm volatile("cp.async.commit_group;\n" ::);
+      return;
     }
     if (k_scale != nullptr) {
       // fp8 cache: vectorized gather (8 codes per lane, one 8-byte load — the
@@ -182,29 +297,63 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
       asm volatile("cp.async.wait_group 0;\n" ::);
     }
     __syncwarp();
-    const uint16_t* kt = sm + buf * kStageElems;
-    const uint16_t* vt = kt + kTileTok * kRow;
     // S = Q K^T: two n8 tiles (tokens 0-7, 8-15).
     float sc[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
-#pragma unroll
-    for (int ks = 0; ks < 16; ++ks) {
-      uint32_t b[4];
-      ldsm_x4(b, kt + ((lane & 7) + ((lane >> 4) << 3)) * kRow + ks * 16 + ((lane >> 3) & 1) * 8);
-      mma_bf16(sc[0], qa[ks], b[0], b[1]);
-      mma_bf16(sc[1], qa[ks], b[2], b[3]);
-    }
     // Mask tokens past the list, scale into the exp2 domain, row maxima over the quad.
     const int n = min(kTileTok, cnt - it * kTileTok);
     float mx0 = -INFINITY, mx1 = -INFINITY;
+    if (e8) {
+      // E4M3 Q K^T: 8 k-steps x 2 n8 token tiles on the raw K codes; the score
+      // epilogue applies alpha*beta^k (rank-1, plan §2.2) in the exp2 domain.
+      const uint8_t* kt8 = reinterpret_cast<const uint8_t*>(sm) + buf * kStage8;
 #pragma unroll
-    for (int j = 0; j < 2; ++j) {
+      for (int ks = 0; ks < 8; ++ks) {
+        const int kb = ks * 32;
 #pragma unroll
-      for (int e = 0; e < 2; ++e) {
-        const int col = j * 8 + 2 * t + e;
-        sc[j][e] = col < n ? sc[j][e] * sl2 : -INFINITY;
-        sc[j][2 + e] = col < n ? sc[j][2 + e] * sl2 : -INFINITY;
-        mx0 = fmaxf(mx0, sc[j][e]);
-        mx1 = fmaxf(mx1, sc[j][2 + e]);
+        for (int j = 0; j < 2; ++j) {
+          const uint8_t* krow = kt8 + (j * 8 + g) * kRow8 + kb + 4 * t;
+          const uint32_t b0 = *reinterpret_cast<const uint32_t*>(krow);
+          const uint32_t b1 = *reinterpret_cast<const uint32_t*>(krow + 16);
+          mma_e4m3(sc[j], qa[ks], b0, b1);
+        }
+      }
+      const float bk0 = __shfl_sync(0xffffffffu, my_ks, 2 * t);
+      const float bk1 = __shfl_sync(0xffffffffu, my_ks, 2 * t + 1);
+      const float bk8 = __shfl_sync(0xffffffffu, my_ks, 8 + 2 * t);
+      const float bk9 = __shfl_sync(0xffffffffu, my_ks, 8 + 2 * t + 1);
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        const float bka = j ? bk8 : bk0, bkb = j ? bk9 : bk1;
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          const int col = j * 8 + 2 * t + e;
+          const float s2a = sl2 * alpha0 * (e ? bkb : bka);
+          const float s2b = sl2 * alpha1 * (e ? bkb : bka);
+          sc[j][e] = col < n ? sc[j][e] * s2a : -INFINITY;
+          sc[j][2 + e] = col < n ? sc[j][2 + e] * s2b : -INFINITY;
+          mx0 = fmaxf(mx0, sc[j][e]);
+          mx1 = fmaxf(mx1, sc[j][2 + e]);
+        }
+      }
+    } else {
+      const uint16_t* kt = sm + buf * kStageElems;
+#pragma unroll
+      for (int ks = 0; ks < 16; ++ks) {
+        uint32_t b[4];
+        ldsm_x4(b, kt + ((lane & 7) + ((lane >> 4) << 3)) * kRow + ks * 16 + ((lane >> 3) & 1) * 8);
+        mma_bf16(sc[0], qa[ks], b[0], b[1]);
+        mma_bf16(sc[1], qa[ks], b[2], b[3]);
+      }
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          const int col = j * 8 + 2 * t + e;
+          sc[j][e] = col < n ? sc[j][e] * sl2 : -INFINITY;
+          sc[j][2 + e] = col < n ? sc[j][2 + e] * sl2 : -INFINITY;
+          mx0 = fmaxf(mx0, sc[j][e]);
+          mx1 = fmaxf(mx1, sc[j][2 + e]);
+        }
       }
     }
 #pragma unroll
@@ -226,23 +375,114 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
     }
     l0 = l0 * a0 + p[0][0] + p[0][1] + p[1][0] + p[1][1];
     l1 = l1 * a1 + p[0][2] + p[0][3] + p[1][2] + p[1][3];
-    // P as the A-fragment over k = the tile's 16 tokens.
-    const uint32_t pa[4] = {pack_bf16(p[0][0], p[0][1]), pack_bf16(p[0][2], p[0][3]),
-                            pack_bf16(p[1][0], p[1][1]), pack_bf16(p[1][2], p[1][3])};
+    if (e8) {
+      // V-weighted P (w = P*beta^v, plan §2.3) -> per-row power-of-two gamma,
+      // e4m3 codes. l above already summed the unrounded P (the DSA pin).
+      const float bv0 = __shfl_sync(0xffffffffu, my_vs, 2 * t);
+      const float bv1 = __shfl_sync(0xffffffffu, my_vs, 2 * t + 1);
+      const float bv2 = __shfl_sync(0xffffffffu, my_vs, 8 + 2 * t);
+      const float bv3 = __shfl_sync(0xffffffffu, my_vs, 8 + 2 * t + 1);
+      const float w0[4] = {p[0][0] * bv0, p[0][1] * bv1, p[1][0] * bv2, p[1][1] * bv3};
+      const float w1[4] = {p[0][2] * bv0, p[0][3] * bv1, p[1][2] * bv2, p[1][3] * bv3};
+      float am0 = fmaxf(fmaxf(fabsf(w0[0]), fabsf(w0[1])), fmaxf(fabsf(w0[2]), fabsf(w0[3])));
+      float am1 = fmaxf(fmaxf(fabsf(w1[0]), fabsf(w1[1])), fmaxf(fabsf(w1[2]), fabsf(w1[3])));
 #pragma unroll
-    for (int d = 0; d < 32; ++d) {
-      acc[d][0] *= a0;
-      acc[d][1] *= a0;
-      acc[d][2] *= a1;
-      acc[d][3] *= a1;
-    }
-    // O += P V: 16 x4.trans loads, two n8 dim tiles each.
+      for (int o = 1; o <= 2; o <<= 1) {
+        am0 = fmaxf(am0, __shfl_xor_sync(0xffffffffu, am0, o));
+        am1 = fmaxf(am1, __shfl_xor_sync(0xffffffffu, am1, o));
+      }
+      const float gamma0 = am0 > 0.f ? pow2_ceil(am0 / 448.f) : 1.f;
+      const float gamma1 = am1 > 0.f ? pow2_ceil(am1 / 448.f) : 1.f;
+      // e4m3(w/gamma) gathered into the m16n8k32 A-fragment via a shared-memory
+      // exchange (a shfl of the encoded codes gets its operand register clobbered
+      // by the compiler before the pack, even at -O0). Each lane writes its 8
+      // codes (4 row g + 4 row g+8); token k lives in lane (g<<2)|((k&7)>>1)
+      // register (k>>3)*2+(k&1). Padding k 16..31 is 0 (§5.1).
+      __shared__ uint8_t smem_p[32 * 8];
+      {
+        const uint8_t c0a = float_to_fp8_e4m3_bits(w0[0] / gamma0),
+                     c0b = float_to_fp8_e4m3_bits(w0[1] / gamma0),
+                     c0c = float_to_fp8_e4m3_bits(w0[2] / gamma0),
+                     c0d = float_to_fp8_e4m3_bits(w0[3] / gamma0);
+        const uint8_t c1a = float_to_fp8_e4m3_bits(w1[0] / gamma1),
+                     c1b = float_to_fp8_e4m3_bits(w1[1] / gamma1),
+                     c1c = float_to_fp8_e4m3_bits(w1[2] / gamma1),
+                     c1d = float_to_fp8_e4m3_bits(w1[3] / gamma1);
+        smem_p[lane * 8 + 0] = c0a; smem_p[lane * 8 + 1] = c0b;
+        smem_p[lane * 8 + 2] = c0c; smem_p[lane * 8 + 3] = c0d;
+        smem_p[lane * 8 + 4] = c1a; smem_p[lane * 8 + 5] = c1b;
+        smem_p[lane * 8 + 6] = c1c; smem_p[lane * 8 + 7] = c1d;
+      }
+      __syncwarp();
+      auto pcode = [&](int tok, int rowoff) -> uint32_t {
+        const int ln = (tok & 7) >> 1, reg = (tok >> 3) * 2 + (tok & 1);
+        return smem_p[((g << 2) | ln) * 8 + rowoff * 4 + reg];
+      };
+      const uint32_t pa[4] = {(static_cast<uint32_t>(pcode(4 * t, 0))) |
+                              (static_cast<uint32_t>(pcode(4 * t + 1, 0)) << 8) |
+                              (static_cast<uint32_t>(pcode(4 * t + 2, 0)) << 16) |
+                              (static_cast<uint32_t>(pcode(4 * t + 3, 0)) << 24),
+                              (static_cast<uint32_t>(pcode(4 * t, 1))) |
+                              (static_cast<uint32_t>(pcode(4 * t + 1, 1)) << 8) |
+                              (static_cast<uint32_t>(pcode(4 * t + 2, 1)) << 16) |
+                              (static_cast<uint32_t>(pcode(4 * t + 3, 1)) << 24),
+                              0u, 0u};
 #pragma unroll
-    for (int dp = 0; dp < 16; ++dp) {
-      uint32_t b[4];
-      ldsm_x4_t(b, vt + ((lane & 7) + ((lane >> 3) & 1) * 8) * kRow + dp * 16 + (lane >> 4) * 8);
-      mma_bf16(acc[dp * 2], pa, b[0], b[1]);
-      mma_bf16(acc[dp * 2 + 1], pa, b[2], b[3]);
+      for (int d = 0; d < 32; ++d) {
+        acc[d][0] *= a0;
+        acc[d][1] *= a0;
+        acc[d][2] *= a1;
+        acc[d][3] *= a1;
+      }
+      // O += P V: 32 n8 dim tiles. B = V (k=tok, n=dim): b0 = V[tok 4t..4t+3][dim]
+      // (four strided 8-bit loads off the token-major tile), b1 = 0 (the
+      // padding k 16..31, §5.1). The mma yields (1/gamma)*(P V); scale by
+      // gamma on the add (§2.3: beta^v cancels, one copy in P, one in V).
+      const uint8_t* vt8 =
+          reinterpret_cast<const uint8_t*>(sm) + buf * kStage8 + kTileTok * kRow8;
+#pragma unroll
+      for (int c = 0; c < 8; ++c) {
+        float pv[4][4];
+#pragma unroll
+        for (int d = 0; d < 4; ++d) {
+          pv[d][0] = pv[d][1] = pv[d][2] = pv[d][3] = 0.f;
+          const int dim = c * 4 + d;  // n8 dim tile (dim values dim*8..dim*8+7)
+          const int ncol = dim * 8 + g;
+          const uint32_t b0 = static_cast<uint32_t>(vt8[(4 * t) * kRow8 + ncol]) |
+                              (static_cast<uint32_t>(vt8[(4 * t + 1) * kRow8 + ncol]) << 8) |
+                              (static_cast<uint32_t>(vt8[(4 * t + 2) * kRow8 + ncol]) << 16) |
+                              (static_cast<uint32_t>(vt8[(4 * t + 3) * kRow8 + ncol]) << 24);
+          mma_e4m3(pv[d], pa, b0, 0u);
+        }
+#pragma unroll
+        for (int d = 0; d < 4; ++d) {
+          const int dim = c * 4 + d;
+          acc[dim][0] += gamma0 * pv[d][0];
+          acc[dim][1] += gamma0 * pv[d][1];
+          acc[dim][2] += gamma1 * pv[d][2];
+          acc[dim][3] += gamma1 * pv[d][3];
+        }
+      }
+    } else {
+      // P as the A-fragment over k = the tile's 16 tokens.
+      const uint16_t* vt = sm + buf * kStageElems + kTileTok * kRow;
+      const uint32_t pa[4] = {pack_bf16(p[0][0], p[0][1]), pack_bf16(p[0][2], p[0][3]),
+                              pack_bf16(p[1][0], p[1][1]), pack_bf16(p[1][2], p[1][3])};
+#pragma unroll
+      for (int d = 0; d < 32; ++d) {
+        acc[d][0] *= a0;
+        acc[d][1] *= a0;
+        acc[d][2] *= a1;
+        acc[d][3] *= a1;
+      }
+      // O += P V: 16 x4.trans loads, two n8 dim tiles each.
+#pragma unroll
+      for (int dp = 0; dp < 16; ++dp) {
+        uint32_t b[4];
+        ldsm_x4_t(b, vt + ((lane & 7) + ((lane >> 3) & 1) * 8) * kRow + dp * 16 + (lane >> 4) * 8);
+        mma_bf16(acc[dp * 2], pa, b[0], b[1]);
+        mma_bf16(acc[dp * 2 + 1], pa, b[2], b[3]);
+      }
     }
     __syncwarp();  // this buffer's reads done before the next stage() overwrites it
   }
@@ -285,12 +525,19 @@ void qsa_attn_prefill_warp(const uint16_t* q, int64_t q_row_stride, const uint16
     return true;
   }();
   (void)opted;
+  // The FP8-MMA toggle (plan §5): default ON. It decouples the E4M3 attention
+  // from the fp8 pool -- =0 keeps the Phase A in-kernel dequant (and the pool
+  // win) so short/long context can be A/B'd independently.
+  static const int fp8_mma = [] {
+    const char* e = std::getenv("DGPP_QSA_FP8_MMA");
+    return !(e != nullptr && e[0] == '0');
+  }();
   const dim3 grid(static_cast<unsigned>(rows), static_cast<unsigned>(kv_heads));
   qsa_attn_prefill_warp_kernel<<<grid, 32, kSmem, stream>>>(q, q_row_stride, k_cache, v_cache, k_scale,
                                                               v_scale, req_ids, topk,
                                                               topk_stride, counts, local_heads, kv_heads,
                                                               block_tokens, block_tables, blocks_per_request,
-                                                              scale, out);
+                                                              scale, out, fp8_mma);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
