@@ -846,58 +846,155 @@ __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_ro
   };
 
   if (k_scale != nullptr) {
-    // fp8 cache: vectorized gather (16 codes per 16-byte load) of the e4m3
-    // codes + per-(row, kv-head) scale, dequantized to bf16 in the smem
-    // tiles; the scores / PV phases below are unchanged (they read bf16 from
-    // kt / vt). The bf16 path is untouched (k_scale null). The 16-byte loads
-    // are as the uint4 bf16 loads were: the rows and the chunks are 16-byte
-    // aligned (width and D are multiples of 16, c is a multiple of 16).
+    // C.3a: the fp8 gather pipelined the way the bf16 async path does. The
+    // raw e4m3 codes (D bytes/token: 256 at D=256, half the bf16 tile's 528
+    // B/row) are cp.async'd into the raw-code smem tiles kt8 / vt8 (the same
+    // smem the bf16 tiles use, so the block's smem budget and occupancy are
+    // unchanged), and the decode moves to the consumer (scores_phase_fp8 /
+    // pv_phase_fp8). The load latency is no longer serialized behind the
+    // decode: tile t+1's codes are issued under tile t's scores / PV, exactly
+    // as the bf16 issue_rows pipeline does. The decode is the same op sequence
+    // (decode_fp8x2_bf16 + the per-(row, kv-head) scale, row for MX=0 and the
+    // per-32-dim-block e8m0 for MX=1), so the bf16 values and everything
+    // downstream are byte-for-byte the serial form's. The 16-byte cp.async
+    // copies are as the uint4 loads were: D and the chunk offsets are
+    // multiples of 16, so the smem destinations are 16-byte aligned.
     const uint8_t* k8 = reinterpret_cast<const uint8_t*>(k_cache);
     const uint8_t* v8 = reinterpret_cast<const uint8_t*>(v_cache);
-    constexpr int kFp8ChunksPerRow = D / 16;
-    for (int t0 = t_begin; t0 < t_end; t0 += kQsaTile) {
-      const int n = min(kQsaTile, t_end - t0);
-      resolve(t0, n, phys_rows);
-      __syncthreads();
-      for (int idx = static_cast<int>(threadIdx.x); idx < n * kFp8ChunksPerRow * 2;
-           idx += static_cast<int>(blockDim.x)) {
-        const int which = idx / (n * kFp8ChunksPerRow);
-        const int rem = idx - which * (n * kFp8ChunksPerRow);
-        const int tt = rem / kFp8ChunksPerRow;
-        const int c = (rem - tt * kFp8ChunksPerRow) * 16;
-        const int64_t phys = phys_rows[tt];
-        const uint8_t* src = (which == 0 ? k8 : v8) + phys * width + kvh * D + c;
-        float sc;
-        if (which == 0) {
-          // C.1a (MX): the K codes are block-quantized (32-dim blocks, e8m0
-          // plane). This 16-code chunk is exactly half of one 32-dim block
-          // (c is a multiple of 16), so the block index c / 32 is constant
-          // per load. V stays row-quantized (the PV gamma epilogue).
-          sc = (mx && k_bscale != nullptr)
-                   ? e8m0_byte_to_float(k_bscale[phys * (kv_heads * 8) + kvh * 8 + c / 32])
-                   : k_scale[phys * kv_heads + kvh];
-        } else {
-          sc = v_scale[phys * kv_heads + kvh];
-        }
-        uint16_t* dst = (which == 0 ? kt : vt) + tt * kRowStride + c;
-        // The hardware e4m3 -> f16 pair decode (decode_fp8x2_bf16): eight
-        // 2-code conversions replace sixteen per-byte software decodes. Bitwise
-        // latent_fp8_decode_bf16 for every finite code, so the bf16 smem tiles
-        // and everything downstream are byte-for-byte unchanged.
-        const uint4 v4 = *reinterpret_cast<const uint4*>(src);
-        const uint32_t* c32 = reinterpret_cast<const uint32_t*>(&v4);
-        uint32_t* d32 = reinterpret_cast<uint32_t*>(dst);
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          d32[2 * j] = decode_fp8x2_bf16(static_cast<uint16_t>(c32[j] & 0xFFFFu), sc);
-          d32[2 * j + 1] = decode_fp8x2_bf16(static_cast<uint16_t>(c32[j] >> 16), sc);
-        }
+    uint8_t* kt8 = reinterpret_cast<uint8_t*>(kt);  // [kQsaTile][D] raw e4m3 K codes
+    uint8_t* vt8 = reinterpret_cast<uint8_t*>(vt);  // [kQsaTile][D] raw e4m3 V codes
+    constexpr int kFp8VecPerRow = D / 16;  // 16-byte chunks per row
+    // One matrix's raw-code rows of a tile as a cp.async group (16 B/copy).
+    const auto issue_rows_fp8 = [&](int n, const int64_t* phys, const uint8_t* cache8,
+                                    uint8_t* dst) {
+      const int total = n * kFp8VecPerRow;
+      for (int idx = static_cast<int>(threadIdx.x); idx < total; idx += static_cast<int>(blockDim.x)) {
+        const int tt = idx / kFp8VecPerRow;
+        const int c8 = (idx - tt * kFp8VecPerRow) * 16;
+        const uint8_t* src = cache8 + phys[tt] * width + kvh * D + c8;
+        const unsigned d = static_cast<unsigned>(__cvta_generic_to_shared(dst + tt * D + c8));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(src));
       }
+      asm volatile("cp.async.commit_group;\n" ::);
+    };
+    // The tile's scores out of kt8: decode the e4m3 codes in-register (the
+    // hardware e4m3->f16 pair decode, decode_fp8x2_bf16) and apply the scale,
+    // then the same xor-tree / max / store the bf16 scores_phase does. The
+    // scale is per-(row, kv-head): the row scale for MX=0, the per-32-dim-block
+    // e8m0 for MX=1 (the block index (g * kDslice) / 32 is constant per lane,
+    // kDslice < 32). It is the same for the warp's kHpw heads (one kvh), so it
+    // is loaded once per row and hoisted out of the head loop.
+    const auto scores_phase_fp8 = [&](int n, const int64_t* phys) {
+#pragma unroll
+      for (int j = 0; j < kHpw; ++j) {
+        float partial[kQsaTile];
+#pragma unroll
+        for (int tt = 0; tt < kQsaTile; ++tt) {
+          float acc = 0.f;
+          if (tt < n) {
+            const float sc = (mx && k_bscale != nullptr)
+                                 ? e8m0_byte_to_float(
+                                       k_bscale[phys[tt] * (kv_heads * 8) + kvh * 8 +
+                                                   (g * kDslice) / 32])
+                                 : k_scale[phys[tt] * kv_heads + kvh];
+            const uint32_t* k32 =
+                reinterpret_cast<const uint32_t*>(kt8 + tt * D + g * kDslice);
+#pragma unroll
+            for (int p = 0; p < kDslice / 4; ++p) {
+              const uint32_t c = k32[p];
+              const uint32_t lo = decode_fp8x2_bf16(static_cast<uint16_t>(c & 0xFFFFu), sc);
+              const uint32_t hi = decode_fp8x2_bf16(static_cast<uint16_t>(c >> 16), sc);
+              acc += qreg[j][4 * p + 0] * bf16_bits_to_float(static_cast<uint16_t>(lo & 0xFFFFu));
+              acc += qreg[j][4 * p + 1] * bf16_bits_to_float(static_cast<uint16_t>(lo >> 16));
+              acc += qreg[j][4 * p + 2] * bf16_bits_to_float(static_cast<uint16_t>(hi & 0xFFFFu));
+              acc += qreg[j][4 * p + 3] * bf16_bits_to_float(static_cast<uint16_t>(hi >> 16));
+            }
+          }
+          partial[tt] = acc;
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+          for (int tt = 0; tt < kQsaTile; ++tt)
+            partial[tt] += __shfl_xor_sync(~0u, partial[tt], off);
+        }
+        float tm = -INFINITY;
+        float* srow = scores + (hl * kHpw + j) * scores_stride;
+#pragma unroll
+        for (int tt = 0; tt < kQsaTile; ++tt) {
+          if (tt < n) {
+            const float score = partial[tt] * scale;
+            if (g == 0) srow[tt] = score;
+            tm = fmaxf(tm, score);
+          }
+        }
+        tile_max[j] = tm;
+      }
+    };
+    // The tile's PV out of vt8: the same rescale / l / P*V the bf16 pv_phase
+    // does, with the V codes decoded in-register (V stays row-quantized).
+    const auto pv_phase_fp8 = [&](int n, const int64_t* phys) {
+#pragma unroll
+      for (int j = 0; j < kHpw; ++j) {
+        const int hrow = hl * kHpw + j;
+        const float* srow = scores + hrow * scores_stride;
+        const float m_new = fmaxf(m_reg[j], tile_max[j]);
+        const float rescale = expf(m_reg[j] - m_new);
+#pragma unroll
+        for (int i = 0; i < kDslice; ++i) creg[j][i] *= rescale;
+        if (g == 0) {
+          float ladd = 0.0f;
+          for (int tt = 0; tt < n; ++tt) ladd += expf(srow[tt] - m_new);
+          l[hrow] = l[hrow] * rescale + ladd;
+        }
+        for (int tt = 0; tt < n; ++tt) {
+          const float p = round_bf16(expf(srow[tt] - m_new));
+          const float sc = v_scale[phys[tt] * kv_heads + kvh];
+          const uint32_t* v32 =
+              reinterpret_cast<const uint32_t*>(vt8 + tt * D + g * kDslice);
+#pragma unroll
+          for (int p2 = 0; p2 < kDslice / 4; ++p2) {
+            const uint32_t c = v32[p2];
+            const uint32_t lo = decode_fp8x2_bf16(static_cast<uint16_t>(c & 0xFFFFu), sc);
+            const uint32_t hi = decode_fp8x2_bf16(static_cast<uint16_t>(c >> 16), sc);
+            creg[j][4 * p2 + 0] += p * bf16_bits_to_float(static_cast<uint16_t>(lo & 0xFFFFu));
+            creg[j][4 * p2 + 1] += p * bf16_bits_to_float(static_cast<uint16_t>(lo >> 16));
+            creg[j][4 * p2 + 2] += p * bf16_bits_to_float(static_cast<uint16_t>(hi & 0xFFFFu));
+            creg[j][4 * p2 + 3] += p * bf16_bits_to_float(static_cast<uint16_t>(hi >> 16));
+          }
+        }
+        m_reg[j] = m_new;
+      }
+    };
+    // The tile loop: issue tile t+1's raw codes under tile t's compute (the
+    // bf16 async path's shape, verbatim).
+    int n = min(kQsaTile, t_end - t_begin);
+    int64_t* phys_cur = phys_rows;
+    int64_t* phys_nxt = phys_next;
+    resolve(t_begin, n, phys_cur);
+    __syncthreads();
+    issue_rows_fp8(n, phys_cur, k8, kt8);
+    issue_rows_fp8(n, phys_cur, v8, vt8);
+    for (int t0 = t_begin; t0 < t_end; t0 += kQsaTile) {
+      const int t1 = t0 + kQsaTile;
+      const bool has_next = t1 < t_end;
+      const int n1 = has_next ? min(kQsaTile, t_end - t1) : 0;
+      if (has_next) resolve(t1, n1, phys_nxt);
+      asm volatile("cp.async.wait_group 1;\n" ::);  // this tile's K rows landed
       __syncthreads();
-      scores_phase(n);
+      scores_phase_fp8(n, phys_cur);
+      __syncthreads();  // every warp is done with kt8
+      if (has_next) issue_rows_fp8(n1, phys_nxt, k8, kt8);  // under this tile's PV
+      if (has_next)
+        asm volatile("cp.async.wait_group 1;\n" ::);  // this tile's V rows landed
+      else
+        asm volatile("cp.async.wait_group 0;\n" ::);
       __syncthreads();
-      pv_phase(n);
-      __syncthreads();
+      pv_phase_fp8(n, phys_cur);
+      __syncthreads();  // every warp is done with vt8 and scores
+      if (has_next) issue_rows_fp8(n1, phys_nxt, v8, vt8);  // under the next tile's resolve + scores
+      n = n1;
+      int64_t* tmp = phys_cur; phys_cur = phys_nxt; phys_nxt = tmp;
     }
   } else if (async_gather) {
     int n = min(kQsaTile, t_end - t_begin);

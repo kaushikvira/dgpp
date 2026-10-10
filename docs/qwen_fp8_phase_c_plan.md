@@ -249,22 +249,34 @@ FA3's second FP8 technique; cheapest accuracy per engineering dollar.
 
 Two separate, independent defects:
 
-* **C.3a (cheap, do first)**: the fp8 branch of `attn_partial_kernel` gathers with plain
-  global `uint4` loads + in-register decode (`qsa.cu:818-832`), which **bypasses the
-  `issue_rows` cp.async pipeline** (`qsa.cu:720`) the bf16 branch uses — the known Phase A
-  penalty. Fix: cp.async the raw 16 B of codes into the tile, decode on the consumer side
-  (or better, keep codes raw and let C.3b's mma eat them). Also measure
-  `DGPP_QSA_WARP_STAGES=1 vs 2` (`qsa_warp.cu:53`, the 2-stage path already exists at
-  `:286-289`, default 1) — free latency hiding if smem allows.
-* **C.3b (the real work)**: scores are SIMT — `acc += qreg[j][i] * bf16_bits_to_float(krow[i])`
-  plus a 5-level shuffle tree per head over 32 tokens (`qsa.cu:737-760`). Move QKᵀ/PV onto
-  the mma like B.1. Design constraints: the decode tile is 32 tokens/block with
-  `kHpw` heads per warp and one **row** of Q per head (the mma is m16 — 15/16 rows of the
-  A tile are wasted unless the block batches ≥ 16 query rows, i.e. this pays off for
-  **prefill-partial** (`T ≥ 128`, the `qsa_attn_prefill_partial` shape) and for
-  **verify/decode with 16+ tokens**, i.e. MTP-4 × 4 slots only if the scheduler batches
-  rows). Pre-registered go/no-go: **only implement where the m16 tile is ≥ 50 % full**;
-  otherwise keep SIMT + fix C.3a and record B.2 as NO-GO for pure decode.
+* **C.3a (cheap, do first) — implemented, pending A/B.** The fp8 branch of
+  `attn_partial_kernel` gathered with plain global `uint4` loads + in-register decode
+  (`qsa.cu:818-832`), which **bypassed the `issue_rows` cp.async pipeline** (`qsa.cu:720`)
+  the bf16 branch uses — the known Phase A penalty (the ~9 % C4 prose gap vs bf16).
+  **Fix (this change):** cp.async the raw e4m3 codes (256 B/token at D=256, half the bf16
+  tile's 528 B/row) into the raw-code smem tiles `kt8`/`vt8` (the same smem the bf16 tiles
+  use, so the block's smem budget and occupancy are unchanged), and decode on the consumer
+  side (`scores_phase_fp8`/`pv_phase_fp8`, the hardware e4m3→f16 pair decode + the per-
+  (row, kv-head) scale, row for `MX=0` and the per-32-dim-block e8m0 for `MX=1`). Tile t+1's
+  codes are issued under tile t's scores / PV, exactly the bf16 `issue_rows` shape, so the
+  load latency is no longer serialized behind the decode. Bitwise the serial form (same
+  codes, same scales, same op order); the bf16 branch is untouched. The prefill-partial
+  kernel (`qsa_prefill.cu`, the `DGPP_QSA_WARP=0` long-prefill fallback) is left on its
+  serial gather: the deployed long-prefill default is the warp kernel (already cp.async),
+  so that fallback is not on the measured path. `DGPP_QSA_WARP_STAGES` stays 1: the warp
+  kernel's fp8 stage is 8 KiB (raw codes) vs 16.5 KiB (bf16, padded), but the smem
+  allocation is the bf16 size (`kSmem = kStages·16896` B), so 2 stages = 33 KiB → ~3 blocks/SM
+  vs 1 stage's ~6; residency already hides the gather, so 2 stages is a bad trade. Not
+  flipped.
+* **C.3b (the real work) — NO-GO for decode, verified.** The m16 A-tile gate is ≥ 50 %
+  full. The decode kernel (`attn_partial_kernel`) is one **query row** per block per head
+  (grid `(rows, n_split, local_heads/hpb)`; `rows` is 1 for standard decode, ≤ 4 for
+  MTP-4 × 4 slots), so the m16 tile is **1/16 = 6.25 %** full (standard decode) or
+  **4/16 = 25 %** (MTP-4 × 4) — both far below the 50 % gate; 15/16 (or 12/16) rows are
+  wasted. The only shape that fills the tile is **prefill-partial** (`T ≥ 128`, the
+  `qsa_attn_prefill_partial` shape, ≥ 16 query rows per block), which is already on the
+  warp kernel's mma (B.1) by default. **Verdict: keep decode SIMT + the C.3a cp.async
+  restore; record B.2 as NO-GO for pure decode.** Do not implement C.3b.
 * Acceptance: prose C1/C2/C4 within ±2 %, long-prefill TTFT better than the C.0 baseline,
   `l2_rel` unchanged (C.3 is a plumbing change — same math as B.1/C.1).
 
@@ -278,8 +290,8 @@ Two separate, independent defects:
 | C.1b | block scales for PV (32-token k-step or keep γ) | error split says PV is worth the tile change | ~0.5 day, likely skipped |
 | C.2.0 | host incoherent-processing study | ≥ 1.3× error reduction, else drop | ~2 h |
 | C.2 | H after RoPE on Q + K append | prose C1 within 1 % | ~0.5 day |
-| C.3a | cp.async restore in the fp8 decode gather + warp stages 1 vs 2 | C1/C2/C4 within ±2 % | ~2 h |
-| C.3b | decode/prefill-partial mma | ≥ 50 % m16 tile fill on the real shapes | ~1-2 days |
+| C.3a | cp.async restore in the fp8 decode gather + warp stages 1 vs 2 — **implemented, pending A/B** | C1/C2/C4 within ±2 % | ~2 h |
+| C.3b | decode/prefill-partial mma — **NO-GO for decode** (m16 tile 6.25 % / 25 % full, < 50 % gate) | — | — |
 
 Housekeeping on this branch regardless: **push `feat/qwen-fp8-mma-attn`** (it is local-only
 through `3c6f41d6`), and keep `121a` in the arch flag (§1). The C.0 harness is already in
