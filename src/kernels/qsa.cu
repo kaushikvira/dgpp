@@ -697,23 +697,33 @@ __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_ro
   };
 
   if (k_scale != nullptr) {
-    // fp8 cache: serial gather of the e4m3 codes + the per-(row, kv-head)
-    // scale, dequantized to bf16 in the smem tiles; the scores / PV phases
-    // below are unchanged (they read bf16 from kt / vt). The bf16 path is
-    // untouched (k_scale null).
+    // fp8 cache: vectorized gather (16 codes per 16-byte load) of the e4m3
+    // codes + per-(row, kv-head) scale, dequantized to bf16 in the smem
+    // tiles; the scores / PV phases below are unchanged (they read bf16 from
+    // kt / vt). The bf16 path is untouched (k_scale null). The 16-byte loads
+    // are as the uint4 bf16 loads were: the rows and the chunks are 16-byte
+    // aligned (width and D are multiples of 16, c is a multiple of 16).
     const uint8_t* k8 = reinterpret_cast<const uint8_t*>(k_cache);
     const uint8_t* v8 = reinterpret_cast<const uint8_t*>(v_cache);
+    constexpr int kFp8ChunksPerRow = D / 16;
     for (int t0 = t_begin; t0 < t_end; t0 += kQsaTile) {
       const int n = min(kQsaTile, t_end - t0);
       resolve(t0, n, phys_rows);
       __syncthreads();
-      for (int idx = static_cast<int>(threadIdx.x); idx < n * D; idx += static_cast<int>(blockDim.x)) {
-        const int tt = idx / D;
-        const int e = idx - tt * D;
+      for (int idx = static_cast<int>(threadIdx.x); idx < n * kFp8ChunksPerRow * 2;
+           idx += static_cast<int>(blockDim.x)) {
+        const int which = idx / (n * kFp8ChunksPerRow);
+        const int rem = idx - which * (n * kFp8ChunksPerRow);
+        const int tt = rem / kFp8ChunksPerRow;
+        const int c = (rem - tt * kFp8ChunksPerRow) * 16;
         const int64_t phys = phys_rows[tt];
-        const int64_t cbase = phys * width + kvh * D + e;
-        kt[tt * kRowStride + e] = latent_fp8_decode_bf16(k8[cbase], k_scale[phys * kv_heads + kvh]);
-        vt[tt * kRowStride + e] = latent_fp8_decode_bf16(v8[cbase], v_scale[phys * kv_heads + kvh]);
+        const uint8_t* src = (which == 0 ? k8 : v8) + phys * width + kvh * D + c;
+        const float sc = (which == 0 ? k_scale : v_scale)[phys * kv_heads + kvh];
+        uint16_t* dst = (which == 0 ? kt : vt) + tt * kRowStride + c;
+        const uint4 v4 = *reinterpret_cast<const uint4*>(src);
+        const uint8_t* b = reinterpret_cast<const uint8_t*>(&v4);
+#pragma unroll
+        for (int j = 0; j < 16; ++j) dst[j] = latent_fp8_decode_bf16(b[j], sc);
       }
       __syncthreads();
       scores_phase(n);

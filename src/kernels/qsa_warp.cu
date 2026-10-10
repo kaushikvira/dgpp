@@ -116,9 +116,11 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
       my_off = phys * width + static_cast<int64_t>(kvh) * kD;
     }
     if (k_scale != nullptr) {
-      // fp8 cache: serial dequant-gather into the smem tiles as bf16; the
+      // fp8 cache: vectorized gather (8 codes per lane, one 8-byte load — the
+      // lane already covers 8 of a token's kD elements) of the e4m3 codes +
+      // per-(row, kv-head) scale, dequantized to bf16 in the smem tiles; the
       // ldmatrix / mma below are unchanged (they read bf16). k_cache / v_cache
-      // are the e4m3 code planes (1 B/elem; `off` is an element index).
+      // are the code planes (1 B/elem; `off` is an element index = byte offset).
       const uint8_t* k8 = reinterpret_cast<const uint8_t*>(k_cache);
       const uint8_t* v8 = reinterpret_cast<const uint8_t*>(v_cache);
 #pragma unroll
@@ -128,10 +130,24 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
         const bool valid = base + i < cnt;
         const float ks = k_scale[p * kv_heads + kvh];
         const float vs = v_scale[p * kv_heads + kvh];
+        uint16_t* kdst = kt + i * kRow + lane * 8;
+        uint16_t* vdst = vt + i * kRow + lane * 8;
+        if (valid) {
+          const uint2 k2 = *reinterpret_cast<const uint2*>(k8 + off);
+          const uint2 v2 = *reinterpret_cast<const uint2*>(v8 + off);
+          const uint8_t* kb = reinterpret_cast<const uint8_t*>(&k2);
+          const uint8_t* vb = reinterpret_cast<const uint8_t*>(&v2);
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-          kt[i * kRow + lane * 8 + j] = valid ? latent_fp8_decode_bf16(k8[off + j], ks) : uint16_t(0);
-          vt[i * kRow + lane * 8 + j] = valid ? latent_fp8_decode_bf16(v8[off + j], vs) : uint16_t(0);
+          for (int j = 0; j < 8; ++j) {
+            kdst[j] = latent_fp8_decode_bf16(kb[j], ks);
+            vdst[j] = latent_fp8_decode_bf16(vb[j], vs);
+          }
+        } else {
+#pragma unroll
+          for (int j = 0; j < 8; ++j) {
+            kdst[j] = 0;
+            vdst[j] = 0;
+          }
         }
       }
       return;

@@ -103,23 +103,27 @@ __global__ void attn_prefill_partial_kernel(const uint16_t* __restrict__ q, int6
         *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
       }
     } else {
-      // fp8 cache: dequant the e4m3 codes + per-(row, kv-head) scale to bf16
-      // in the smem tiles; the math below is unchanged (reads bf16).
+      // fp8 cache: vectorized gather (16 codes per 16-byte load) of the e4m3
+      // codes + per-(row, kv-head) scale, dequantized to bf16 in the smem
+      // tiles; the math below is unchanged (reads bf16).
       const uint8_t* k8 = reinterpret_cast<const uint8_t*>(k_cache);
       const uint8_t* v8 = reinterpret_cast<const uint8_t*>(v_cache);
-      for (int idx = threadIdx.x; idx < n * D * 2; idx += blockDim.x) {
-        const int which = idx / (n * D);
-        const int rem = idx - which * (n * D);
-        const int tt = rem / D;
-        const int e = rem - tt * D;
+      constexpr int kFp8ChunksPerRow = D / 16;
+      for (int idx = threadIdx.x; idx < n * kFp8ChunksPerRow * 2; idx += blockDim.x) {
+        const int which = idx / (n * kFp8ChunksPerRow);
+        const int rem = idx - which * (n * kFp8ChunksPerRow);
+        const int tt = rem / kFp8ChunksPerRow;
+        const int c = (rem - tt * kFp8ChunksPerRow) * 16;
         const int64_t tok = toks[t0 + tt];
         const int32_t blk = bt[tok / block_tokens];
         const int64_t phys = static_cast<int64_t>(blk) * block_tokens + tok % block_tokens;
-        const int64_t cb = phys * width + kvh * D + e;
-        uint16_t* dst = (which == 0 ? kt : vt) + tt * kRowStride + e;
-        *dst = (which == 0)
-                   ? latent_fp8_decode_bf16(k8[cb], k_scale[phys * kv_heads + kvh])
-                   : latent_fp8_decode_bf16(v8[cb], v_scale[phys * kv_heads + kvh]);
+        const uint8_t* src = (which == 0 ? k8 : v8) + phys * width + kvh * D + c;
+        const float sc = (which == 0 ? k_scale : v_scale)[phys * kv_heads + kvh];
+        uint16_t* dst = (which == 0 ? kt : vt) + tt * kRowStride + c;
+        const uint4 v4 = *reinterpret_cast<const uint4*>(src);
+        const uint8_t* b = reinterpret_cast<const uint8_t*>(&v4);
+#pragma unroll
+        for (int j = 0; j < 16; ++j) dst[j] = latent_fp8_decode_bf16(b[j], sc);
       }
     }
     __syncthreads();
