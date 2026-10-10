@@ -4,7 +4,13 @@ Branch: `feat/qwen-fp8-mma-attn` (stacked on the shipped Phase A,
 `docs/qwen_fp8_kv_plan.md`). Scope: **Qwen3.8-Flash-Next only** (the QSA
 kernels + the Qwen serve family). GLM / MiMo / DSV4 are out of scope.
 
-**Status (2026-10-10): plan only. No kernel, test, or `CMakeLists.txt` change.**
+**Status (2026-10-10): B.1 is implemented and committed** (`2047831d`) — the E4M3
+branch of `qsa_attn_prefill_warp` + the `DGPP_QSA_FP8_MMA` toggle + the new
+`tests/cuda/qwen_fp8_mma_attn_test.cu`. Measured: projected study `l2_rel 0.0491`,
+A-fragment oracle `max diff 0`, E4M3 warp kernel vs bf16 `0.0551` (band 0.10);
+22/22 tests pass on a forced recompile; the bf16 lane is bitwise-unchanged.
+**B.2 (decode/short-prefill) is not started** (§6). The rest of this doc is the
+plan as written; §0-§3 (the numerics proof) are unchanged.
 Phase A is done and is the base: the QSA K/V cache is stored as FP8 E4M3
 (1 B/elem) + a per-(slot, kv-head) fp32 scale, and the three attention kernels
 **dequantize to bf16 in-kernel** before the existing math
