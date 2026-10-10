@@ -37,6 +37,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <stdexcept>
+#include <type_traits>
 
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
@@ -124,6 +125,13 @@ __device__ __forceinline__ float pow2_ceil(float x) {
   return dgpp::e8m0_byte_to_float(dgpp::e8m0_ceil_log2_byte(x));
 }
 
+// One instantiation per math mode so each branch gets its own register
+// allocation and code footprint: MODE 0 = the bf16 path (pure bf16 cache, or the
+// fp8 pool dequantized to bf16 in-kernel), MODE 1 = the E4M3 path (raw codes on
+// the tensor cores, row-scale or the C.1a block-scale sub-variant). The unified
+// single kernel was register-capped at 255 by the E4M3 branch's appetite, which
+// cost the bf16 branch occupancy/IPC; the split lets each mode compile lean.
+template <int MODE>
 __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
     const uint16_t* __restrict__ q, int64_t q_row_stride, const uint16_t* __restrict__ k_cache,
     const uint16_t* __restrict__ v_cache, const float* __restrict__ k_scale,
@@ -143,8 +151,9 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
   const int32_t* toks = topk + r * topk_stride;
   const int32_t* bt = block_tables + static_cast<int64_t>(req_ids[r]) * blocks_per_request;
   const float sl2 = scale * 1.4426950408889634f;
-  const bool e8 = fp8_mma && k_scale != nullptr;  // the FP8-MMA path (plan §5)
-  const bool e8mx = e8 && mx && k_bscale != nullptr;  // C.1a: block-scaled QK^T
+  // MODE 1 = the FP8-MMA path (plan §5); MODE 0 = the bf16 path (pure or fp8
+  // dequant). C.1a (e8mx) is the block-scaled QK^T sub-variant, MODE 1 only.
+  const bool e8mx = (MODE == 1) && mx && k_bscale != nullptr;
 
   // Q A-fragments: bf16 16 k-steps x 4 registers; the E4M3 path quantizes the
   // same rows to 8 k-steps x 4 registers (4 e4m3 each, the m16n8k32 layout)
@@ -155,6 +164,7 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
   {
     const uint16_t* q0 = q + r * q_row_stride + static_cast<int64_t>(h0) * kD;
     const bool v0 = g < group, v1 = g + 8 < group;
+    if constexpr (MODE == 1) {
     if (e8mx) {
       // C.1a: 8 per-32-dim-block absmaxes (one per k-step) for rows g, g+8. The
       // lane's 8 dims in k-step ks all fall in block ks, so a 2-level quad
@@ -205,7 +215,7 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
         qa[ks][2] = pack4_e4m3(a[4], a[5], a[6], a[7]);
         qa[ks][3] = pack4_e4m3(b[4], b[5], b[6], b[7]);
       }
-    } else if (e8) {
+    } else {
       // alpha = absmax/448 over the row's 256 dims (this lane's 64, then the
       // quad's), the fp8_quantize_rows_kernel recipe done in-warp.
       float am0 = 0.f, am1 = 0.f;
@@ -245,6 +255,7 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
         qa[ks][2] = pack4_e4m3(a[4], a[5], a[6], a[7]);
         qa[ks][3] = pack4_e4m3(b[4], b[5], b[6], b[7]);
       }
+      }
     } else {
 #pragma unroll
       for (int ks = 0; ks < 16; ++ks) {
@@ -279,7 +290,7 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
       my_phys = phys;
       my_off = phys * width + static_cast<int64_t>(kvh) * kD;
     }
-    if (e8) {
+    if constexpr (MODE == 1) {
       // FP8-MMA: copy the raw e4m3 codes (8 B/chunk, no dequant) into the
       // 256 B/token smem tiles; the mma below reads the codes directly.
       // Invalid tokens zero-fill (the PV padding lanes must stay 0).
@@ -314,7 +325,7 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
       }
       asm volatile("cp.async.commit_group;\n" ::);
       return;
-    }
+    } else {
     if (k_scale != nullptr) {
       // fp8 cache: vectorized gather (8 codes per lane, one 8-byte load — the
       // lane already covers 8 of a token's kD elements) of the e4m3 codes +
@@ -366,6 +377,7 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
       cp_async16(vt + i * kRow + lane * 8, v_cache + off, valid);
     }
     asm volatile("cp.async.commit_group;\n" ::);
+    }
   };
 
   float acc[32][4];
@@ -432,7 +444,7 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
           mx1 = fmaxf(mx1, sc[j][2 + e]);
         }
       }
-    } else if (e8) {
+    } else if (MODE == 1) {
       // E4M3 Q K^T: 8 k-steps x 2 n8 token tiles on the raw K codes; the score
       // epilogue applies alpha*beta^k (rank-1, plan §2.2) in the exp2 domain.
       const uint8_t* kt8 = reinterpret_cast<const uint8_t*>(sm) + buf * kStage8;
@@ -505,7 +517,7 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
     }
     l0 = l0 * a0 + p[0][0] + p[0][1] + p[1][0] + p[1][1];
     l1 = l1 * a1 + p[0][2] + p[0][3] + p[1][2] + p[1][3];
-    if (e8) {
+    if (MODE == 1) {
       // V-weighted P (w = P*beta^v, plan §2.3) -> per-row power-of-two gamma,
       // e4m3 codes. l above already summed the unrounded P (the DSA pin).
       const float bv0 = __shfl_sync(0xffffffffu, my_vs, 2 * t);
@@ -648,17 +660,27 @@ void qsa_attn_prefill_warp(const uint16_t* q, int64_t q_row_stride, const uint16
   if (!qsa_warp_supported(kD, local_heads, kv_heads))
     throw std::invalid_argument("qsa_attn_prefill_warp: dim 256, <= 16 query heads per KV head");
   static const bool opted = [] {  // once per process, thread-safe (TP ranks may share one)
-    DGPP_CUDA_OK(cudaFuncSetAttribute(qsa_attn_prefill_warp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+    // Both MODE instantiations get the smem + carveout (the bf16 and E4M3 paths
+    // share the kSmem budget; the E4M3 raw-code tiles fit within it).
+    DGPP_CUDA_OK(cudaFuncSetAttribute(qsa_attn_prefill_warp_kernel<0>,
+                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
                                       static_cast<int>(kSmem)));
     // All of L1 as shared memory: residency here is bounded by the 33.8 KB stages.
-    DGPP_CUDA_OK(cudaFuncSetAttribute(qsa_attn_prefill_warp_kernel,
+    DGPP_CUDA_OK(cudaFuncSetAttribute(qsa_attn_prefill_warp_kernel<0>,
+                                      cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    DGPP_CUDA_OK(cudaFuncSetAttribute(qsa_attn_prefill_warp_kernel<1>,
+                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      static_cast<int>(kSmem)));
+    DGPP_CUDA_OK(cudaFuncSetAttribute(qsa_attn_prefill_warp_kernel<1>,
                                       cudaFuncAttributePreferredSharedMemoryCarveout, 100));
     return true;
   }();
   (void)opted;
   // The FP8-MMA toggle (plan §5): default ON. It decouples the E4M3 attention
   // from the fp8 pool -- =0 keeps the Phase A in-kernel dequant (and the pool
-  // win) so short/long context can be A/B'd independently.
+  // win) so short/long context can be A/B'd independently. It selects the MODE
+  // template (1 = the E4M3 tensor-core path, 0 = the bf16 / dequant path), so
+  // each branch compiles lean (its own register allocation and footprint).
   static const int fp8_mma = [] {
     const char* e = std::getenv("DGPP_QSA_FP8_MMA");
     return !(e != nullptr && e[0] == '0');
@@ -667,11 +689,19 @@ void qsa_attn_prefill_warp(const uint16_t* q, int64_t q_row_stride, const uint16
   // (not latched) so a test can setenv between runs; production sets it once.
   const int mx = qsa_fp8_mx();
   const dim3 grid(static_cast<unsigned>(rows), static_cast<unsigned>(kv_heads));
-  qsa_attn_prefill_warp_kernel<<<grid, 32, kSmem, stream>>>(q, q_row_stride, k_cache, v_cache, k_scale,
-                                                              v_scale, req_ids, topk,
-                                                              topk_stride, counts, local_heads, kv_heads,
-                                                              block_tokens, block_tables, blocks_per_request,
-                                                              scale, out, fp8_mma, k_bscale, mx);
+  const auto launch = [&](auto mode_tag) {
+    constexpr int MODE = decltype(mode_tag)::value;
+    qsa_attn_prefill_warp_kernel<MODE><<<grid, 32, kSmem, stream>>>(q, q_row_stride, k_cache, v_cache,
+                                                                    k_scale, v_scale, req_ids, topk,
+                                                                    topk_stride, counts, local_heads,
+                                                                    kv_heads, block_tokens,
+                                                                    block_tables, blocks_per_request,
+                                                                    scale, out, fp8_mma, k_bscale, mx);
+  };
+  if (fp8_mma)
+    launch(std::integral_constant<int, 1>{});
+  else
+    launch(std::integral_constant<int, 0>{});
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
