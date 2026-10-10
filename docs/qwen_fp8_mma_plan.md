@@ -9,7 +9,9 @@ branch of `qsa_attn_prefill_warp` + the `DGPP_QSA_FP8_MMA` toggle + the new
 `tests/cuda/qwen_fp8_mma_attn_test.cu`. Measured: projected study `l2_rel 0.0491`,
 A-fragment oracle `max diff 0`, E4M3 warp kernel vs bf16 `0.0551` (band 0.10);
 22/22 tests pass on a forced recompile; the bf16 lane is bitwise-unchanged.
-**B.2 (decode/short-prefill) is not started** (§6). The rest of this doc is the
+**B.2 (decode/short-prefill) is not started** (§6) — the remaining Phase B/C work is
+planned in `docs/qwen_fp8_phase_c_plan.md` (measurement gate C.0, MXFP8 block scales C.1,
+incoherent rotation C.2, decode C.3). The rest of this doc is the
 plan as written; §0-§3 (the numerics proof) are unchanged.
 
 **e5m2 operand study (2026-10-10): NO-GO for both Q and P.** A host study
