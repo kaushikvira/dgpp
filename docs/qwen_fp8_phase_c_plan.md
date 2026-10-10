@@ -70,6 +70,23 @@ dequant path's error instead of 1.5× above it.
   the m16 A-tile, decode stays SIMT and C.3a (cp.async restore + warp stages) is the whole
   of B.2. Challenge it if the scheduler starts batching ≥ 16 query rows per block.
 
+Owner-signed (2026-10-10, before the night runs):
+
+* **Verifier model** = `vllm-rtx5090/Qwen3.8-27B` for both the author and the adversarial
+  pass. Chosen for speed / a single free endpoint; accepted cost: the checker shares the
+  author's blind spots.
+* **`DGPP_QSA_FP8_MX` rollout**: enabled by default **if the accuracy bar is met and prose
+  C1/C2/C4 stay within +2 %** of the `DGPP_QSA_FP8_MMA=1` baseline (a ≤ 2 % perf cost is
+  acceptable in exchange for a real accuracy gain). Never enabled without a measured
+  record, so the code lands default-OFF first.
+* **Accuracy bar** = **`l2_rel ≤ 0.035`** — at or under the Phase A dequant path's 0.0360
+  (today's E4M3 path: 0.0551 warp / 0.0491 projected). With this bar C.2 (Hadamard) stays
+  optional: dropped unless it buys ≥ 1.3×.
+* **Push policy**: both repos — the `dgpp` branch as each work item lands, and
+  `dgpp-gateway` master including the owner's two earlier commits.
+* **Lane**: restarts are authorized overnight; the lane is left **up, default config, knob
+  unset, `make smoke` green** between work items and at the end of the night.
+
 ## 2. C.0 — Measurement gate (do this first; ~1 h, no kernel work)
 
 Outcome: a real prefill number for B.1 on/off, and a harness that stays useful for C.1-C.3.
