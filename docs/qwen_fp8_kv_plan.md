@@ -391,26 +391,42 @@ The fp8 penalty number (prose C1/C2/C4 `50.2/78.8/110.9` vs the bf16 base
 different session/binary. Boot `bf16kv` with *this* binary and run the same
 `serve_load` to get the true delta. Until then the ~5–12 % is unproven.
 
-### 7.2 Remove the fp8 penalties (goal: NEUTRAL at short context)
+### 7.2 Remove the fp8 penalties — DONE (2026-10-10); fp8 is neutral at C1
 
-The vectorized gather (commits `18573bdf`) moved prose 50.2 → 50.7 (+0.9 %,
-noise) — so **byte-throughput was not the bottleneck**. What is left:
+The vectorized gather (`18573bdf`) moved prose 50.2 → 50.7 (+0.9 %, noise), so
+byte-throughput was not the bottleneck. The real penalties were the **append**
+and the **K double-staging**; commit `7b2f1dee` removed both and recovered the
+whole gap:
 
-1. **`kv_append_kernel` fp8 quantize: only `kv_heads` threads active**
-   (`src/kernels/qsa.cu`: `if (h >= kv_heads) return;`). At TP=2 that is 2 of
-   256 threads, each running a serial 256-element absmax loop + a serial
-   256-element encode loop, for both K and V. Fix: block/warp reduction for the
-   absmax + all threads encoding. Runs on **every** append (every decode step,
-   every prefill row).
-2. **The attention fp8 gather is not pipelined.** The bf16 path issues cp.async
-   groups for tile *t+1* under tile *t*'s scores/PV (4 wait points); the fp8
-   path serializes `resolve → load+dequant → scores → pv` with no overlap
-   (`qsa.cu`, the `k_scale != nullptr` branch vs the `async_gather` branch). Two
-   ways: stage the codes in a smem buffer via cp.async and dequant from it
-   (needs extra smem, double-buffered), or cp.async the codes into the tile's
-   byte region and dequant in place backwards. Both restore the overlap.
-3. **Redundant scale reads:** `k_scale[phys*kv_heads+kvh]` is re-read per
-   16-code chunk (16×/row). Hoist to one register per row. Minor.
+| fp8 build | prose C1 (tok/s) |
+|---|---|
+| serial gather | 50.2 |
+| vectorized gather | 50.7 |
+| **+ zero-copy (fused K, single-read append)** | **53.2** |
+| bf16 base | 53.3 |
+
+**1. FIXED — `kv_append_kernel` fp8 quantize: only `kv_heads` threads active.**
+Rewritten cooperatively: the block stages the token's K/V rows in smem **once**
+(the old per-head form read every row *twice* — an absmax pass then an encode
+pass), one warp per head reduces the absmax, all threads encode. `k == nullptr`
+skips the K half. Runs on every append.
+
+**2. FIXED — the K went through two bf16 buffers.**
+`gemm → k_ → qsa_norm_rope_bf16 → kn_ → append → cache` held a full bf16 K
+round trip per token per layer. `qsa_norm_rope_append_fp8` fuses norm + RoPE +
+quantize + paged scatter into one kernel writing the cache directly, so `kn_` is
+gone (the fp8 QSA path no longer allocates or touches it). **Bitwise the
+chain** it replaces (`qwen_fp8_kv_fused_norm_rope_append_matches_chain`).
+
+Still open (minor / long-context):
+
+- **The attention fp8 gather is not pipelined.** The bf16 path issues cp.async
+  groups for tile *t+1* under tile *t*'s scores/PV (4 wait points); the fp8 path
+  serializes `resolve → load+dequant → scores → pv`. At short context this is not
+  measurable (C1 is already neutral), so it is only worth doing if a long-context
+  run shows it.
+- **Redundant scale reads:** `k_scale[phys*kv_heads+kvh]` is re-read per 16-code
+  chunk (16×/row). Hoist to one register per row. Minor.
 
 ### 7.3 The expectation "fp8 faster than bf16" is context-dependent
 
