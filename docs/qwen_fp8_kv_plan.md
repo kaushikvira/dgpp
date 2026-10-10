@@ -378,3 +378,45 @@ Gate order: unit → parity → memory → bench → A/B.
       `kv_dtype` knob.
 - [ ] (Phase B) native FP8-MMA attention merged, within its tolerance band,
       decode-neutral-or-faster vs Phase A.
+
+## 7. Open items (2026-10-10, post-Phase-A)
+
+Phase A is merged and fp8 is the gateway's base lane. Two things remain, plus a
+gap in the evidence.
+
+### 7.1 Measure a CLEAN same-binary A/B (do this first)
+
+The fp8 penalty number (prose C1/C2/C4 `50.2/78.8/110.9` vs the bf16 base
+`53.3/82.9/126.4`) is **confounded**: the bf16 base is a curated record from a
+different session/binary. Boot `bf16kv` with *this* binary and run the same
+`serve_load` to get the true delta. Until then the ~5–12 % is unproven.
+
+### 7.2 Remove the fp8 penalties (goal: NEUTRAL at short context)
+
+The vectorized gather (commits `18573bdf`) moved prose 50.2 → 50.7 (+0.9 %,
+noise) — so **byte-throughput was not the bottleneck**. What is left:
+
+1. **`kv_append_kernel` fp8 quantize: only `kv_heads` threads active**
+   (`src/kernels/qsa.cu`: `if (h >= kv_heads) return;`). At TP=2 that is 2 of
+   256 threads, each running a serial 256-element absmax loop + a serial
+   256-element encode loop, for both K and V. Fix: block/warp reduction for the
+   absmax + all threads encoding. Runs on **every** append (every decode step,
+   every prefill row).
+2. **The attention fp8 gather is not pipelined.** The bf16 path issues cp.async
+   groups for tile *t+1* under tile *t*'s scores/PV (4 wait points); the fp8
+   path serializes `resolve → load+dequant → scores → pv` with no overlap
+   (`qsa.cu`, the `k_scale != nullptr` branch vs the `async_gather` branch). Two
+   ways: stage the codes in a smem buffer via cp.async and dequant from it
+   (needs extra smem, double-buffered), or cp.async the codes into the tile's
+   byte region and dequant in place backwards. Both restore the overlap.
+3. **Redundant scale reads:** `k_scale[phys*kv_heads+kvh]` is re-read per
+   16-code chunk (16×/row). Hoist to one register per row. Minor.
+
+### 7.3 The expectation "fp8 faster than bf16" is context-dependent
+
+fp8 KV is a **memory** optimization. At short context the K/V is **< 0.1 %** of
+the bytes a decode step streams (weights dominate ~6.2 GB/token per rank), so
+fp8 can at best be **neutral** on prose C1/C2 — never faster. It becomes a
+*speed* win only at long context, where the K/V is a real fraction of the
+read traffic (at 128K it is a meaningful slice). So: target **neutral at short
+context** (removing 7.2's penalties), and expect the win at long context.
