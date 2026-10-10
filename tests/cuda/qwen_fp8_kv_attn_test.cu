@@ -487,4 +487,58 @@ DGPP_TEST(qwen_fp8_kv_hw_decode_matches_software_bitwise) {
   }
 }
 
+// C.1a (a): the block-scale quantizer, host check. For realistic bf16 rows,
+// compute the 8 per-32-dim-block e8m0 scales (the append's recipe) and the
+// dequant round-trip error, and prove the power-of-two ceiling-round cannot
+// overflow (|x|/scale <= 448) and beats the row-scale baseline. No bit-
+// exactness required -- this isolates the quantizer from the tensor core.
+DGPP_TEST(qwen_fp8_kv_block_scale_quantizer) {
+  const int dim = 256, rows = 4096;
+  const auto data = random_bf16_normal(7, static_cast<int64_t>(rows) * dim, 1.0f);
+  double row_num = 0, row_den = 0, blk_num = 0, blk_den = 0;
+  long overflow = 0;  // elements where |x|/block_scale > 448 (must be 0)
+  double blk_max_rel = 0, row_max_rel = 0;
+  for (int r = 0; r < rows; ++r) {
+    const uint16_t* row = data.data() + static_cast<size_t>(r) * dim;
+    float rabs = 0.f;
+    for (int j = 0; j < dim; ++j) rabs = std::max(rabs, std::fabs(dgpp::bf16_bits_to_float(row[j])));
+    const float rsc = rabs > 0.f ? rabs / 448.f : 1.f;
+    float bsc[8];
+    for (int b = 0; b < 8; ++b) {
+      float babs = 0.f;
+      for (int j = 0; j < 32; ++j)
+        babs = std::max(babs, std::fabs(dgpp::bf16_bits_to_float(row[32 * b + j])));
+      const uint8_t byt = dgpp::latent_fp8_block_scale_byte(babs);
+      bsc[b] = babs > 0.f ? dgpp::e8m0_byte_to_float(byt) : 1.f;
+    }
+    for (int j = 0; j < dim; ++j) {
+      const float x = dgpp::bf16_bits_to_float(row[j]);
+      const int b = j / 32;
+      const float rc = dgpp::fp8_e4m3_bits_to_float(dgpp::float_to_fp8_e4m3_bits(x / rsc));
+      const float rd = rc * rsc;
+      row_num += static_cast<double>(x - rd) * (x - rd);
+      row_den += static_cast<double>(x) * x;
+      row_max_rel =
+          std::max(row_max_rel, static_cast<double>(std::fabs(x - rd) / std::max(std::fabs(x), 1e-30f)));
+      const float bc = dgpp::fp8_e4m3_bits_to_float(dgpp::float_to_fp8_e4m3_bits(x / bsc[b]));
+      const float bd = bc * bsc[b];
+      blk_num += static_cast<double>(x - bd) * (x - bd);
+      blk_den += static_cast<double>(x) * x;
+      blk_max_rel =
+          std::max(blk_max_rel, static_cast<double>(std::fabs(x - bd) / std::max(std::fabs(x), 1e-30f)));
+      if (std::fabs(x) / bsc[b] > 448.f + 1e-6f) ++overflow;
+    }
+  }
+  const double row_l2 = std::sqrt(row_num / std::max(row_den, 1e-30));
+  const double blk_l2 = std::sqrt(blk_num / std::max(blk_den, 1e-30));
+  std::printf("[fp8-kv] block-scale quantizer (n=%d rows x 256): row l2_rel %.4f  block l2_rel %.4f  "
+              "improvement %.3fx  max_rel row %.4f block %.4f  overflow %ld\n",
+              rows, row_l2, blk_l2, row_l2 / std::max(blk_l2, 1e-30), row_max_rel, blk_max_rel,
+              overflow);
+  require(overflow == 0, "block-scale ceiling-round overflowed: |x|/scale > 448");
+  require(blk_l2 < row_l2, "block scales did not beat the row-scale baseline");
+  require(blk_max_rel <= 0.0625 + 1e-6,
+          "block-scale per-element rel error exceeds the 2^-4 mantissa bound");
+}
+
 int main() { return dgpp::test::run_all(); }

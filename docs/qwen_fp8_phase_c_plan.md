@@ -118,12 +118,18 @@ scales per 256-dim row (one per 32 values)**, applied by `kind::mxf8f6f4` inside
   applies the pair product per k-block, so the scales no longer have to factor out of the
   sum. That is the whole point: the current per-row scale lets one outlier in a 256-dim
   row cost 3 effective bits for the entire row. Expect `l2_rel` **0.049 → ~0.02**.
-* **Pool layout** (`kv_pool.hpp/.cpp`): scale plane becomes **8 bytes of E8M0 per
-  (slot, kv-head)** instead of 1 float per (slot, kv-head) — 32 B/token/layer vs 16 B
-  today. Cost: +1.5 % on the KV rows → pool **7.41 → ~7.52 GiB/rank**, ratio to bf16
-  **1.86× → 1.83×**. Update `layer_scale_bytes()`, `init/view/reset_all`,
-  `copy_block_contents` (prefix-cache block copy — `kv_pool.cpp:142`) and the
-  memory-plan label.
+* **Pool layout** (`kv_pool.hpp/.cpp`), **decision (1): the block-scale plane is
+  additive — the fp32 row scale stays.** Per (slot, kv-head) row the pool keeps
+  today's fp32 row scale **and** gains **8 bytes of E8M0 block scales** (one per 32 of
+  the 256-dim row): **260 B → 268 B/row** (256 codes + 4 fp32 scale + 8 e8m0).
+  Rationale: keeps `DGPP_QSA_FP8_MX=0` bit-identical to the current binary (the A/B is
+  *same-binary*, the only trustworthy shape) and leaves the `DGPP_QSA_FP8_MMA=0` dequant
+  path untouched; it costs only 8 B on a 260 B row → pool **~7.41 → ~7.64 GiB/rank**,
+  ratio to bf16 **1.86× → ~1.81×** (still the fp8 win). Unlock: if the A/B shows the MX
+  path wins, a later change may drop the fp32 plane. Update `layer_block_scale_bytes()`,
+  `init/view/reset_all`, `copy_block_contents` (prefix-cache block copy — `kv_pool.cpp`;
+  a missed copy silently corrupts cached prefixes) and the memory-plan label.
+  **Implemented (C.1a), pending GPU.**
 * **Write path**: `kv_append_kernel`'s fp8 branch and `qsa_norm_rope_append_fp8` must
   reduce **8 per-block absmaxes** instead of one row absmax. The fused kernel already runs
   one warp per head for the absmax; the block form is a segmented warp reduce (8 × 32-lane
@@ -206,7 +212,7 @@ Two separate, independent defects:
 |---|---|---|---|
 | C.0 | prefill measurement harness + B.1 A/B record | prefill win ≥ 10 % at ≥ 16k, else C.1 motivation = accuracy only | ~1 h |
 | C.1.0 | SF-fragment oracle (`scale_vec::1X` lane/byte map) | oracle max diff 0 — **hard blocker for C.1** | ~2 h |
-| C.1a | block scales for QKᵀ (pool + append + warp read) | `l2_rel ≤ 0.035`, gate green | ~1 day |
+| C.1a | block scales for QKᵀ (pool + append + warp read) — **implemented, pending GPU** | `l2_rel ≤ 0.035`, gate green | ~1 day |
 | C.1b | block scales for PV (32-token k-step or keep γ) | error split says PV is worth the tile change | ~0.5 day, likely skipped |
 | C.2.0 | host incoherent-processing study | ≥ 1.3× error reduction, else drop | ~2 h |
 | C.2 | H after RoPE on Q + K append | prose C1 within 1 % | ~0.5 day |

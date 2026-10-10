@@ -1100,7 +1100,8 @@ add_test(NAME qsa_test COMMAND qsa_test)
 
 add_executable(qwen_fp8_kv_attn_test tests/cuda/qwen_fp8_kv_attn_test.cu)
 target_include_directories(qwen_fp8_kv_attn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
-target_link_libraries(qwen_fp8_kv_attn_test PRIVATE dgpp_models_qwen dgpp_kernels CUDA::cudart Threads::Threads)
+# dgpp_models_qwen_layers: the C.1a block-copy test drives QwenKvPool directly.
+target_link_libraries(qwen_fp8_kv_attn_test PRIVATE dgpp_models_qwen_layers dgpp_models_qwen dgpp_kernels CUDA::cudart Threads::Threads)
 dgpp_set_common(qwen_fp8_kv_attn_test)
 add_test(NAME qwen_fp8_kv_attn_test COMMAND qwen_fp8_kv_attn_test)
 
@@ -1109,6 +1110,14 @@ target_include_directories(qwen_fp8_mma_attn_test PRIVATE ${CMAKE_CURRENT_SOURCE
 target_link_libraries(qwen_fp8_mma_attn_test PRIVATE dgpp_models_qwen dgpp_kernels CUDA::cudart Threads::Threads)
 dgpp_set_common(qwen_fp8_mma_attn_test)
 add_test(NAME qwen_fp8_mma_attn_test COMMAND qwen_fp8_mma_attn_test)
+
+# C.1a (d): the prefix-cache block copy carries the MXFP8 block-scale plane.
+# A .cpp test (QwenKvPool's header chain does not compile under nvcc).
+add_executable(qwen_fp8_block_copy_test tests/cuda/qwen_fp8_block_copy_test.cpp)
+target_include_directories(qwen_fp8_block_copy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(qwen_fp8_block_copy_test PRIVATE dgpp_models_qwen_layers dgpp_models_qwen dgpp_kernels CUDA::cudart Threads::Threads)
+dgpp_set_common(qwen_fp8_block_copy_test)
+add_test(NAME qwen_fp8_block_copy_test COMMAND qwen_fp8_block_copy_test)
 
 add_executable(qwen_fp8_mxfp8_sf_test tests/cuda/qwen_fp8_mxfp8_sf_test.cu)
 target_include_directories(qwen_fp8_mxfp8_sf_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
