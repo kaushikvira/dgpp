@@ -100,8 +100,10 @@ __device__ __forceinline__ void mma_e4m3(float (&c)[4], const uint32_t (&a)[4], 
 // 2^(sfa-127) * 2^(sfb-127) to this k-block's dot inside the tensor core. The
 // selector operands are PAIRS of .b16 registers interleaved after each scale
 // register ({sfa} {sel,sel} {sfb} {sel,sel}, the mxf4nvf4 4X form in
-// moe_w4a4.cu); all four are 0 for scale_vec::1X. sfa byte0 = A row g,
-// byte1 = A row g+8; sfb byte0 = B col 2t, byte1 = B col 2t+1 (this k-block).
+// moe_w4a4.cu); all four are 0 for scale_vec::1X. Probe-verified map (the doc's
+// "Probe evidence"): only byte 0 of each register is read. sfa byte0 = A row g
+// (thread (g,0)) or row g+8 (thread (g,1)); sfb byte0 = B col g (thread (g,0)).
+// Bytes 1-3 are ignored -- fill 0x7f (2^0 neutral).
 __device__ __forceinline__ void mma_e4m3_sf(float (&c)[4], const uint32_t (&a)[4], uint32_t b0,
                                             uint32_t b1, uint32_t sfa, uint32_t sfb) {
   asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
@@ -259,7 +261,8 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
   // E4M3 epilogues broadcast them with shfl. Set by stage().
   float my_ks = 0.f, my_vs = 0.f;
   // C.1a: the tile's 16 tokens' K block scales (8 e8m0 bytes each), set by
-  // stage() for the block-scaled QK^T mma (SFB byte0 = token 2t, byte1 = 2t+1).
+  // stage() for the block-scaled QK^T mma (SFB byte0 = token (j*8 + g) for
+  // k-step ks; the probe-verified map reads only byte 0, per thread (g,0)).
   __shared__ uint8_t smem_ksf[16 * 8];
 
   // Stage a tile: 16 tokens x (K, V) x 32 16-byte chunks = 1024 chunks, 32 per lane.
@@ -395,18 +398,26 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
       // (Q block scale qsf[ks], K block scale from smem_ksf), so the score
       // epilogue is just the exp2-domain scale -- no alpha*beta^k rank-1.
       const uint8_t* kt8 = reinterpret_cast<const uint8_t*>(sm) + buf * kStage8;
+      // Probe-verified SF map (docs/qwen_fp8_mxfp8_sf_layout.md): only byte 0 of
+      // each register is read (sel=0). sfa byte0 = this thread's own A row's
+      // block scale -- thread (g,0) -> row g (qsf byte0), thread (g,1) -> row
+      // g+8 (qsf byte1); t in {2,3} carry no A scale (defensively row g / g+8).
+      // sfb byte0 = B col g's block scale = K token (j*8 + g) for this k-step
+      // (the token index is g, not 2t/2t+1). Bytes 1-3 = 0x7f (2^0 neutral).
+      const uint32_t sfa_hi = 0x7F7F7F00u;  // bytes 1-3 neutral
 #pragma unroll
       for (int ks = 0; ks < 8; ++ks) {
         const int kb = ks * 32;
-        const uint32_t sfa = qsf[ks];
+        const uint32_t sfa_lo = qsf[ks] & 0xFF;  // row g's e8m0 byte
+        const uint32_t sfa_hi_b = (qsf[ks] >> 8) & 0xFF;  // row g+8's e8m0 byte
+        const uint32_t sfa = ((t == 1 || t == 3) ? sfa_hi_b : sfa_lo) | sfa_hi;
 #pragma unroll
         for (int j = 0; j < 2; ++j) {
           const uint8_t* krow = kt8 + (j * 8 + g) * kRow8 + kb + 4 * t;
           const uint32_t b0 = *reinterpret_cast<const uint32_t*>(krow);
           const uint32_t b1 = *reinterpret_cast<const uint32_t*>(krow + 16);
-          // SFB byte0 = K block scale of token (j*8 + 2t), byte1 = token (j*8 + 2t+1).
-          const uint32_t sfb = static_cast<uint32_t>(smem_ksf[(j * 8 + 2 * t) * 8 + ks]) |
-                               (static_cast<uint32_t>(smem_ksf[(j * 8 + 2 * t + 1) * 8 + ks]) << 8);
+          // SFB byte0 = K block scale of token (j*8 + g) for this k-step.
+          const uint32_t sfb = static_cast<uint32_t>(smem_ksf[(j * 8 + g) * 8 + ks]) | sfa_hi;
           mma_e4m3_sf(sc[j], qa[ks], b0, b1, sfa, sfb);
         }
       }
