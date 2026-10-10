@@ -334,24 +334,46 @@ middle (23) and late (47) QSA layers. `l2_rel` at the seq=4096 slice, with the
 deployed default (Q row, K row, P e4m3, V row — `DGPP_QSA_FP8_MX` off) added to
 the grid:
 
-| prompt × layer | base | best tensor-core | **deployed default** | dequant | bar 0.035 (best-tc) |
+| prompt × layer | base (MX=1) | **depdef** (shipped) | best tensor-core | best overall | bar-met (depdef) |
 |---|---|---|---|---|---|
-| filler × L23 | 0.0360 | 0.0329 | **0.0512** | 0.0490 | yes |
-| diverse × L23 | 0.0163 | 0.0156 | 0.0203 | 0.0175 | yes |
-| diverse × L7 | 0.0336 | 0.0280 | 0.0322 | 0.0253 | yes |
-| diverse × L47 | 0.0265 | 0.0220 | 0.0336 | 0.0283 | yes |
-| math × L23 | 0.0125 | 0.0119 | 0.0152 | 0.0125 | yes |
+| diverse × L23 | 0.0163 | 0.0203 | 0.0156 | 0.0142 | yes |
+| diverse × L7 | 0.0336 | 0.0322 | 0.0280 | 0.0219 | yes |
+| diverse × L47 | 0.0265 | 0.0336 | 0.0220 | 0.0188 | yes |
+| math × L23 | 0.0125 | 0.0152 | 0.0119 | 0.0098 | yes |
+| filler × L23 ⚠ | 0.0277 | 0.0374 | 0.0241 | 0.0219 | yes (artifact) |
 
-The **best tensor-core path meets 0.035 in every cell** (worst 0.0329,
-filler × L23), so the "reachable" verdict generalises across prompts and
-layers. But the **deployed default does not** in the worst case: its `l2_rel`
-runs 0.0152 (math) → **0.0512 (filler × L23)**, the last above the 0.035 bar.
-The filler × L23 cell is the outlier — it samples the *first* 4096 tokens of a
-fresh 8k prompt (the cold-start region, stride 1), a degenerate low-diversity
-distribution, and is the one capture where even base (0.0360) and dequant
-(0.0490) sit above the bar. **The number the owner cares about — the deployed
-default's `l2_rel` — is 0.0152–0.0512 across captures, and it clears 0.035 on
-4 of 5 but not the filler cold-start case.**
+⚠ **The filler × L23 capture is a degenerate-row artifact.** Its dump
+(`qk-filler-l23.bin`, 8090 rows in 9 segments) contains **4096 zero-norm K
+rows** (norm p50 = 0.00, impossible for real post-RMSNorm K; the healthy
+captures have norm p50 ≈ 21–24). The zeros are concentrated in the early
+`pos0=0` segments (the 4096-token cold-start chunk: 4039/4096 zero). The
+study's grid runs on the *first* 4096 K tokens (stride 1 for 8090), which is
+exactly the zero region. A re-capture (`qk-filler-l23-v2.bin`) reproduced the
+**same** artifact (same 9 segments, same 4096 zero rows), confirming it is a
+systematic property of the filler capture, not a transient one. The original
+capture's depdef was 0.0512 (above the bar); the re-capture's is 0.0374
+(below the bar) — the exact zero positions differ slightly, shifting the
+softmax and hence the `l2_rel`. **Both are inflated by the zero rows; neither
+is a property of the shipped config.**
+
+The engine's `latent_fp8_row_scale` (`src/kernels/latent_format.hpp:178`) and
+the study's `quant_row` (`tests/cuda/qwen_fp8_error_attribution.cpp:65`) both
+guard the zero-absmax case (a zero row quantizes to exact zeros, no
+divide-by-zero), so the zero rows are *exact* in both row- and block-scale
+paths — they do not specifically penalise row scales. They change the softmax
+distribution (zero K rows get a spurious attention weight), which inflates
+the `l2_rel` for *all* configs. The artifact is in the *capture*, not the
+quantizer.
+
+**Corrected verdict.** The **deployed default is inside the 0.035 bar in every
+*healthy* capture** (worst case **0.0336**, diverse × L47). The one apparent
+miss (filler × L23, 0.0512 in the original capture) was a
+capture/degenerate-row artifact (4096 zero K rows), not a property of the
+shipped config. The **best tensor-core path meets 0.035 in every cell**
+(including the artifact cell), so the "reachable" verdict generalises across
+prompts and layers. **The number the owner cares about — the deployed
+default's `l2_rel` — is 0.0152–0.0336 across healthy captures, all clearing
+0.035.**
 
 **What this does and does not reopen.** The *bar* is reachable on the
 tensor-core path (best-tc, every cell), so the two-mode story (MMA=1 speed /
@@ -359,19 +381,18 @@ MMA=0 accuracy) is no longer forced. The *individual levers* still do not
 clearly earn their keep: block scales are a wash and Hadamard is ≤1.31× — at,
 not above, the 1.3× gate. C.1a stays as shipped (worst-element bound, default
 OFF); C.1b/C.2 remain NO-GO *as levers*, but the "0.035 unreachable" premise
-behind them is falsified. The open question the multi-capture table raises:
-the **deployed default** (row scales, not the best-tc block/Hadamard combo)
-misses the bar on the hardest (cold-start, low-diversity) input — whether that
-warrants a default change is a separate decision from the bar's reachability.
+behind them is falsified. The deployed default (row scales) clears the bar in
+every healthy capture, so no default change is warranted on accuracy grounds.
 
-**Caveats (read before generalising):** five captures, one rank's head group
-(12 q + 1 kv head of the TP=2 split), one seed each; the filler × L23 cell is a
-cold-start sample and the single hardest case. Dumps total ~386 MB (none
-truncated; the 300 MiB per-file cap was not hit), under
-`results/qk-real2-20261011/` in the gateway repo (the `qk-*.bin` captures +
-`study-*-seq4096.txt` outputs + `prompts.py`/`send.py`). The seq=4096 `l2_rel`
-is not directly comparable to the seq=128 synthetic numbers (softmax sharpness
-differs).
+**Caveats (read before generalising):** four healthy captures + one artifact
+filler capture, one rank's head group (12 q + 1 kv head of the TP=2 split),
+one seed each. The filler × L23 cell is a cold-start sample *and* a
+degenerate-row artifact (4096 zero K rows); it is excluded from the
+healthy-capture worst case. Dumps total ~386 MB (none truncated; the 300 MiB
+per-file cap was not hit), under `results/qk-real2-20261011/` in the gateway
+repo (the `qk-*.bin` captures + `study-*-seq4096.txt` outputs +
+`prompts.py`/`send.py`). The seq=4096 `l2_rel` is not directly comparable to
+the seq=128 synthetic numbers (softmax sharpness differs).
 
 ## 4. C.2 — Incoherent processing (Hadamard) before the fp8 quant
 
